@@ -8,12 +8,18 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             label: Windows
+            args: ""
           - os: macos-latest
-            label: macOS
+            label: macOS-ARM
+            args: "--target aarch64-apple-darwin"
+          - os: macos-latest
+            label: macOS-Intel
+            args: "--target x86_64-apple-darwin"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +31,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install dependencies
         run: npm install
@@ -36,5 +44,6 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MINT Exam IDE ${{ github.ref_name }}"
-          releaseBody: "Installers for Windows and macOS"
+          releaseBody: "Installers for Windows and macOS (ARM + Intel)"
           releaseDraft: true
+          args: ${{ matrix.args }}

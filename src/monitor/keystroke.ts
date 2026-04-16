@@ -1,0 +1,81 @@
+import { invoke } from "@tauri-apps/api/core";
+
+interface InputEvent {
+  inputType: string;
+  text: string;
+  from: number;
+  to: number;
+}
+
+const PASTE_THRESHOLD = 30; // chars — above this, flag as significant paste
+const BURST_WINDOW_MS = 100; // time window for burst detection
+const BURST_CHAR_THRESHOLD = 20; // chars in burst window = suspicious
+
+let lastInputTime = 0;
+let burstBuffer: { time: number; chars: number }[] = [];
+
+export function handleEditorInput(event: InputEvent): void {
+  const now = performance.now();
+  const timeDelta = lastInputTime > 0 ? now - lastInputTime : 0;
+  lastInputTime = now;
+
+  if (event.inputType === "insertFromPaste") {
+    const charCount = event.text.length;
+    const eventType = charCount > PASTE_THRESHOLD ? "paste_large" : "paste";
+    const preview = event.text.length > 100
+      ? event.text.substring(0, 100).replace(/\n/g, "\\n") + "..."
+      : event.text.replace(/\n/g, "\\n");
+
+    invoke("log_editor_event", {
+      eventType,
+      detail: `Pasted ${charCount} chars: ${preview}`,
+      charCount,
+      timeDeltaMs: timeDelta,
+    });
+    return;
+  }
+
+  // Burst detection: track rapid character input
+  burstBuffer.push({ time: now, chars: event.text.length });
+  burstBuffer = burstBuffer.filter((b) => now - b.time < BURST_WINDOW_MS);
+
+  const totalBurstChars = burstBuffer.reduce((sum, b) => sum + b.chars, 0);
+
+  if (totalBurstChars > BURST_CHAR_THRESHOLD) {
+    invoke("log_editor_event", {
+      eventType: "input_burst",
+      detail: `Rapid input detected: ${totalBurstChars} chars in ${BURST_WINDOW_MS}ms`,
+      charCount: totalBurstChars,
+      timeDeltaMs: timeDelta,
+    });
+    burstBuffer = [];
+  }
+}
+
+// Periodic summary of typing activity
+let typedChars = 0;
+let typingStartTime = 0;
+
+export function trackTyping(charCount: number): void {
+  if (typedChars === 0) {
+    typingStartTime = Date.now();
+  }
+  typedChars += charCount;
+}
+
+export function flushTypingSummary(): void {
+  if (typedChars > 0) {
+    const duration = (Date.now() - typingStartTime) / 1000;
+    const wpm = duration > 0 ? Math.round((typedChars / 5) / (duration / 60)) : 0;
+    invoke("log_editor_event", {
+      eventType: "typing_summary",
+      detail: `Typed ${typedChars} chars in ${duration.toFixed(1)}s (~${wpm} WPM)`,
+      charCount: typedChars,
+      timeDeltaMs: duration * 1000,
+    });
+    typedChars = 0;
+  }
+}
+
+// Flush typing summary every 30 seconds
+setInterval(flushTypingSummary, 30000);

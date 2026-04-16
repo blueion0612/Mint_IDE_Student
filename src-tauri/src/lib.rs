@@ -624,7 +624,7 @@ fn create_encrypted_video_zip(rec_dir: &std::path::Path, zip_path: &std::path::P
         if let Ok(entries) = std::fs::read_dir(rec_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map(|e| e == "mp4").unwrap_or(false) {
+                if path.extension().map(|e| e == "mp4" || e == "mov").unwrap_or(false) {
                     let options = SimpleFileOptions::default()
                         .compression_method(zip::CompressionMethod::Stored)
                         .with_aes_encryption(AesMode::Aes256, password);

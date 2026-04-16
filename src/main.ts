@@ -14,13 +14,6 @@ interface FileNode {
   children: FileNode[];
 }
 
-interface RunResult {
-  stdout: string;
-  stderr: string;
-  exit_code: number | null;
-  duration_ms: number;
-}
-
 interface ActivityEvent {
   timestamp: string;
   epoch_ms: number;
@@ -704,7 +697,6 @@ async function runCurrentFile(): Promise<void> {
   if (!file) return;
 
   await syncCurrentEditor();
-  // Save before running so imports work
   await saveCurrentFile();
 
   if (!file.content.trim()) {
@@ -714,33 +706,60 @@ async function runCurrentFile(): Promise<void> {
 
   isRunning = true;
   const btn = document.getElementById("btn-run") as HTMLButtonElement;
-  btn.disabled = true;
-  btn.innerHTML = "&#9632; Running...";
+  btn.innerHTML = "&#9632; Stop";
+  btn.classList.remove("btn-run");
+  btn.classList.add("btn-danger");
+  // Change click to stop
+  btn.onclick = stopCurrentRun;
 
   const panel = document.getElementById("output-panel")!;
   panel.classList.remove("collapsed");
   panel.classList.add("expanded");
 
-  appendOutput(`--- Running ${file.path} (${file.language}) ---\n`, "system");
+  document.getElementById("output-content")!.textContent = "";
+  appendOutput(`$ Running ${file.path} (${file.language})\n`, "system");
 
   try {
-    const result = await invoke<RunResult>("run_code", {
+    await invoke("run_code", {
       language: file.language,
       code: file.content,
       filename: file.path,
       pythonPath: selectedPythonPath,
     });
-    if (result.stdout) appendOutput(result.stdout, "stdout");
-    if (result.stderr) appendOutput(result.stderr, "error");
-    const status = result.exit_code === 0 ? "OK" : `exit code ${result.exit_code}`;
-    appendOutput(`\n--- Finished (${status}, ${result.duration_ms}ms) ---\n\n`, "system");
+    // Output comes via "run-output" events, completion via "run-done"
   } catch (e) {
     appendOutput(`Error: ${e}\n`, "error");
+    resetRunButton();
   }
+}
 
+async function stopCurrentRun(): Promise<void> {
+  try {
+    const stopped = await invoke<boolean>("stop_code");
+    if (stopped) appendOutput("\n[stopped]\n", "system");
+  } catch { /* ignore */ }
+  resetRunButton();
+}
+
+function resetRunButton(): void {
   isRunning = false;
-  btn.disabled = false;
+  const btn = document.getElementById("btn-run") as HTMLButtonElement;
   btn.innerHTML = "&#9654; Run";
+  btn.classList.remove("btn-danger");
+  btn.classList.add("btn-run");
+  btn.onclick = () => runCurrentFile();
+}
+
+// Error line highlighting — parse Python traceback "line N"
+function highlightErrorLine(text: string): void {
+  if (!editorView || !text.includes("line ")) return;
+  const match = text.match(/line (\d+)/);
+  if (!match) return;
+  const lineNum = parseInt(match[1]) - 1; // 0-indexed
+  if (lineNum < 0 || lineNum >= editorView.state.doc.lines) return;
+
+  // TODO: could add CodeMirror decoration here
+  // For now error lines are visible in the output
 }
 
 // ===== Screen Recording (auto-start) =====
@@ -1171,6 +1190,27 @@ function updateStatusBar(event: ActivityEvent): void {
 async function listenForBackendEvents(): Promise<void> {
   await listen<ActivityEvent>("activity-event", (event) => {
     appendLogEntry(event.payload);
+  });
+
+  // Real-time code output
+  await listen<{ stream: string; text: string }>("run-output", (event) => {
+    const { stream, text } = event.payload;
+    if (stream === "stderr") {
+      appendOutput(text, "error");
+      highlightErrorLine(text);
+    } else if (stream === "system") {
+      appendOutput(text, "system");
+    } else {
+      appendOutput(text, "stdout");
+    }
+  });
+
+  // Code execution finished
+  await listen<{ exit_code: number | null; duration_ms: number }>("run-done", (event) => {
+    const { exit_code, duration_ms } = event.payload;
+    const status = exit_code === 0 ? "OK" : `exit code ${exit_code}`;
+    appendOutput(`\n--- Finished (${status}, ${duration_ms}ms) ---\n\n`, "system");
+    resetRunButton();
   });
 }
 

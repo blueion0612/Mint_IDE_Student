@@ -21,12 +21,19 @@ impl ScreenRecorder {
         std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create dir: {}", e))?;
 
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let filename = format!("exam_recording_{}.mp4", timestamp);
+        let ext = if cfg!(target_os = "macos") { "mov" } else { "mp4" };
+        let filename = format!("exam_recording_{}.{}", timestamp, ext);
         let output_path = dir.join(&filename);
         let output_str = output_path.to_string_lossy().to_string();
 
-        let ffmpeg = find_ffmpeg()?;
-        let child = build_ffmpeg_command(&ffmpeg, &output_str)?;
+        // macOS uses built-in screencapture (no FFmpeg needed)
+        // Windows/Linux use FFmpeg
+        let child = if cfg!(target_os = "macos") {
+            build_ffmpeg_command("", &output_str)?
+        } else {
+            let ffmpeg = find_ffmpeg()?;
+            build_ffmpeg_command(&ffmpeg, &output_str)?
+        };
 
         self.process = Some(child);
         self.output_path = Some(output_path.clone());
@@ -35,12 +42,17 @@ impl ScreenRecorder {
 
     pub fn stop(&mut self) -> Result<String, String> {
         if let Some(mut child) = self.process.take() {
-            if let Some(ref mut stdin) = child.stdin {
-                use std::io::Write;
-                let _ = stdin.write_all(b"q");
-                let _ = stdin.flush();
+            // macOS screencapture: SIGTERM to stop gracefully
+            // Windows FFmpeg: send 'q' to stdin
+            if cfg!(target_os = "macos") {
+                let _ = child.kill();
+            } else {
+                if let Some(ref mut stdin) = child.stdin {
+                    use std::io::Write;
+                    let _ = stdin.write_all(b"q");
+                    let _ = stdin.flush();
+                }
             }
-            // Give FFmpeg a moment to finalize the file
             std::thread::sleep(std::time::Duration::from_millis(500));
 
             match child.wait() {
@@ -176,37 +188,89 @@ fn build_ffmpeg_command(ffmpeg: &str, output_path: &str) -> Result<Child, String
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    Command::new(ffmpeg)
-        .args([
-            "-y", "-f", "gdigrab", "-framerate", "5",
-            "-i", "desktop",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            output_path,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("Failed to start FFmpeg: {}", e))
+    // Strategy: try GPU-accelerated first, fall back to CPU
+    // 1. ddagrab (DXGI GPU capture) + h264_nvenc (NVIDIA GPU encode) — near zero CPU
+    // 2. ddagrab + h264_qsv (Intel QuickSync) — near zero CPU
+    // 3. ddagrab + h264_amf (AMD AMF) — near zero CPU
+    // 4. ddagrab + libx264 ultrafast — GPU capture, CPU encode
+    // 5. gdigrab + libx264 ultrafast — CPU everything (last resort)
+
+    let strategies: Vec<Vec<String>> = vec![
+        // ddagrab + NVIDIA NVENC
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_nvenc",
+            "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // ddagrab + Intel QuickSync
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_qsv",
+            "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // ddagrab + AMD AMF
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_amf",
+            "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // ddagrab + CPU (libx264) — 2fps, half resolution for low CPU usage
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=2,scale=iw/2:ih/2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
+            "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // gdigrab + CPU — ultra-low spec fallback: 2fps, half res, max compression
+        vec![
+            "-y", "-f", "gdigrab", "-framerate", "2", "-i", "desktop",
+            "-vf", "scale=iw/2:ih/2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path,
+        ].into_iter().map(String::from).collect(),
+    ];
+
+    for (i, args) in strategies.iter().enumerate() {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        match Command::new(ffmpeg)
+            .args(&arg_refs)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Give it a moment to see if it crashes immediately
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        // Process exited immediately — this strategy failed, try next
+                        continue;
+                    }
+                    Ok(None) => {
+                        // Still running — success!
+                        eprintln!("Recording strategy #{} succeeded", i + 1);
+                        return Ok(child);
+                    }
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Err("All recording strategies failed. Is FFmpeg installed?".to_string())
 }
 
 #[cfg(target_os = "macos")]
-fn build_ffmpeg_command(ffmpeg: &str, output_path: &str) -> Result<Child, String> {
-    Command::new(ffmpeg)
-        .args([
-            "-y", "-f", "avfoundation", "-framerate", "5",
-            "-capture_cursor", "1", "-i", "1:none",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            output_path,
-        ])
+fn build_ffmpeg_command(_ffmpeg: &str, output_path: &str) -> Result<Child, String> {
+    // Use macOS built-in screencapture — no FFmpeg needed.
+    // -v = video mode, -C = capture cursor
+    // screencapture runs until killed (we send SIGTERM on stop)
+    Command::new("screencapture")
+        .args(["-v", "-C", output_path])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to start FFmpeg: {}", e))
+        .map_err(|e| format!("Failed to start screen recording: {}", e))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]

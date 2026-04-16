@@ -211,15 +211,17 @@ fn build_ffmpeg_command(ffmpeg: &str, output_path: &str) -> Result<Child, String
             "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_amf",
             "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", output_path,
         ].into_iter().map(String::from).collect(),
-        // ddagrab + CPU (libx264)
+        // ddagrab + CPU (libx264) — 2fps, half resolution for low CPU usage
         vec![
-            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "libx264",
-            "-preset", "ultrafast", "-crf", "32", "-pix_fmt", "yuv420p", output_path,
+            "-y", "-filter_complex", "ddagrab=framerate=2,scale=iw/2:ih/2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
+            "-pix_fmt", "yuv420p", output_path,
         ].into_iter().map(String::from).collect(),
-        // gdigrab + CPU (fallback for old FFmpeg or no DXGI)
+        // gdigrab + CPU — ultra-low spec fallback: 2fps, half res, max compression
         vec![
-            "-y", "-f", "gdigrab", "-framerate", "5", "-i", "desktop",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
+            "-y", "-f", "gdigrab", "-framerate", "2", "-i", "desktop",
+            "-vf", "scale=iw/2:ih/2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path,
         ].into_iter().map(String::from).collect(),
     ];

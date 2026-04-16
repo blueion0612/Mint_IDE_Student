@@ -111,6 +111,7 @@ async function initializeApp(): Promise<void> {
 
   document.getElementById("btn-sidebar-new-file")!.addEventListener("click", () => promptNewFile(""));
   document.getElementById("btn-sidebar-new-folder")!.addEventListener("click", () => promptNewFolder(""));
+  document.getElementById("btn-sidebar-new-notebook")!.addEventListener("click", () => promptNewNotebook(""));
   document.getElementById("btn-sidebar-import")!.addEventListener("click", () => importExternalFile(""));
 
   const session = `${studentId}_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, "")}`;
@@ -474,6 +475,7 @@ function showContextMenu(x: number, y: number, path: string, isDir: boolean): vo
   const items: MenuItem[] = isDir
     ? [
         { type: "action", label: "New File", action: () => promptNewFile(path) },
+        { type: "action", label: "New Notebook", action: () => promptNewNotebook(path) },
         { type: "action", label: "New Folder", action: () => promptNewFolder(path) },
         { type: "action", label: "Add File...", action: () => importExternalFile(path) },
         { type: "separator" },
@@ -540,6 +542,25 @@ async function promptNewFolder(parentDir: string): Promise<void> {
     setTimeout(() => startRenameInSidebar(path), 50);
   } catch (e) {
     alert(`Failed to create folder: ${e}`);
+  }
+}
+
+async function promptNewNotebook(parentDir: string): Promise<void> {
+  const name = await findUniqueName(parentDir, "notebook", ".ipynb");
+  const path = parentDir ? `${parentDir}/${name}` : name;
+  const emptyNotebook = JSON.stringify({
+    cells: [{ cell_type: "code", source: [""], metadata: {}, outputs: [], execution_count: null }],
+    metadata: { kernelspec: { display_name: "Python 3", language: "python", name: "python3" }, language_info: { name: "python" } },
+    nbformat: 4, nbformat_minor: 5,
+  }, null, 1);
+  try {
+    await invoke("ws_write_file", { path, content: emptyNotebook });
+    if (parentDir) expandedDirs.add(parentDir);
+    await refreshFileTree();
+    await openFileByPath(path);
+    setTimeout(() => startRenameInSidebar(path), 50);
+  } catch (e) {
+    alert(`Failed to create notebook: ${e}`);
   }
 }
 

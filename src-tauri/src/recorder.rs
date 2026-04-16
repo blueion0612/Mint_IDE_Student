@@ -188,20 +188,73 @@ fn build_ffmpeg_command(ffmpeg: &str, output_path: &str) -> Result<Child, String
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    Command::new(ffmpeg)
-        .args([
-            "-y", "-f", "gdigrab", "-framerate", "5",
-            "-i", "desktop",
+    // Strategy: try GPU-accelerated first, fall back to CPU
+    // 1. ddagrab (DXGI GPU capture) + h264_nvenc (NVIDIA GPU encode) — near zero CPU
+    // 2. ddagrab + h264_qsv (Intel QuickSync) — near zero CPU
+    // 3. ddagrab + h264_amf (AMD AMF) — near zero CPU
+    // 4. ddagrab + libx264 ultrafast — GPU capture, CPU encode
+    // 5. gdigrab + libx264 ultrafast — CPU everything (last resort)
+
+    let strategies: Vec<Vec<String>> = vec![
+        // ddagrab + NVIDIA NVENC
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_nvenc",
+            "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // ddagrab + Intel QuickSync
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_qsv",
+            "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // ddagrab + AMD AMF
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_amf",
+            "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // ddagrab + CPU (libx264)
+        vec![
+            "-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "libx264",
+            "-preset", "ultrafast", "-crf", "32", "-pix_fmt", "yuv420p", output_path,
+        ].into_iter().map(String::from).collect(),
+        // gdigrab + CPU (fallback for old FFmpeg or no DXGI)
+        vec![
+            "-y", "-f", "gdigrab", "-framerate", "5", "-i", "desktop",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            output_path,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("Failed to start FFmpeg: {}", e))
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path,
+        ].into_iter().map(String::from).collect(),
+    ];
+
+    for (i, args) in strategies.iter().enumerate() {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        match Command::new(ffmpeg)
+            .args(&arg_refs)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Give it a moment to see if it crashes immediately
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        // Process exited immediately — this strategy failed, try next
+                        continue;
+                    }
+                    Ok(None) => {
+                        // Still running — success!
+                        eprintln!("Recording strategy #{} succeeded", i + 1);
+                        return Ok(child);
+                    }
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Err("All recording strategies failed. Is FFmpeg installed?".to_string())
 }
 
 #[cfg(target_os = "macos")]

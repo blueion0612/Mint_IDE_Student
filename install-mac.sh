@@ -1,5 +1,6 @@
 #!/bin/bash
-# MINT Exam IDE — macOS one-line installer
+# MINT Exam IDE — macOS Full Installer
+# Installs all dependencies + the IDE app
 # Usage: curl -sL https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-mac.sh | bash
 
 set -e
@@ -14,58 +15,98 @@ echo "  MINT Exam IDE Installer"
 echo "=============================="
 echo ""
 
-# --- 1. Check & Install FFmpeg ---
-echo "[1/4] Checking FFmpeg..."
+# ─── Helper ───
+check() { command -v "$1" &>/dev/null; }
+ok()    { echo "  [OK] $1"; }
+miss()  { echo "  [--] $1 — will install"; NEED_INSTALL=1; }
 
-if command -v ffmpeg &>/dev/null; then
-    echo "  FFmpeg found: $(which ffmpeg)"
-else
-    echo "  FFmpeg not found. Installing..."
+NEED_INSTALL=0
 
-    if command -v brew &>/dev/null; then
-        echo "  Installing via Homebrew..."
-        brew install ffmpeg
-    else
-        echo "  Homebrew not found. Installing Homebrew first..."
+# ─── 1. Check all dependencies ───
+echo "[1/5] Checking dependencies..."
+
+check python3 && ok "Python3 ($(python3 --version 2>&1))" || miss "Python3"
+check node    && ok "Node.js ($(node --version 2>&1))"     || miss "Node.js"
+check gcc     && ok "GCC ($(gcc --version 2>&1 | head -1))" || miss "GCC (Xcode Command Line Tools)"
+check javac   && ok "JDK ($(javac -version 2>&1))"         || miss "JDK"
+check ffmpeg  && ok "FFmpeg"                                 || miss "FFmpeg"
+echo ""
+
+# ─── 2. Install missing dependencies ───
+if [ "$NEED_INSTALL" -eq 1 ]; then
+    echo "[2/5] Installing missing dependencies..."
+
+    # Xcode Command Line Tools (provides gcc, g++, make, git)
+    if ! check gcc; then
+        echo "  Installing Xcode Command Line Tools (gcc, g++, git)..."
+        echo "  A popup may appear — click 'Install' and wait."
+        xcode-select --install 2>/dev/null || true
+        # Wait for installation
+        echo "  Waiting for Xcode CLT installation..."
+        until check gcc; do sleep 5; done
+        echo "  Xcode CLT installed!"
+    fi
+
+    # Homebrew
+    if ! check brew; then
+        echo "  Installing Homebrew..."
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-        # Add brew to PATH for this session
+        # Add to PATH
         if [ -f "/opt/homebrew/bin/brew" ]; then
             eval "$(/opt/homebrew/bin/brew shellenv)"
         elif [ -f "/usr/local/bin/brew" ]; then
             eval "$(/usr/local/bin/brew shellenv)"
         fi
-
-        echo "  Installing FFmpeg..."
-        brew install ffmpeg
     fi
 
-    if command -v ffmpeg &>/dev/null; then
-        echo "  FFmpeg installed successfully!"
-    else
-        echo ""
-        echo "  [WARNING] FFmpeg installation failed."
-        echo "  Screen recording will not work."
-        echo "  You can install it later: brew install ffmpeg"
-        echo "  (or download the Lite version which doesn't need FFmpeg)"
-        echo ""
+    # Install missing packages via Homebrew
+    BREW_PKGS=""
+    check python3 || BREW_PKGS="$BREW_PKGS python"
+    check node    || BREW_PKGS="$BREW_PKGS node"
+    check javac   || BREW_PKGS="$BREW_PKGS openjdk"
+    check ffmpeg  || BREW_PKGS="$BREW_PKGS ffmpeg"
+
+    if [ -n "$BREW_PKGS" ]; then
+        echo "  brew install$BREW_PKGS"
+        brew install $BREW_PKGS
     fi
+
+    # Java symlink (Homebrew openjdk needs this)
+    if [ -d "$(brew --prefix openjdk 2>/dev/null)/libexec/openjdk.jdk" ] 2>/dev/null; then
+        sudo ln -sfn "$(brew --prefix openjdk)/libexec/openjdk.jdk" /Library/Java/JavaVirtualMachines/openjdk.jdk 2>/dev/null || true
+    fi
+
+    echo ""
+    echo "  Dependencies installed!"
+else
+    echo "[2/5] All dependencies already installed. Skipping."
 fi
 
-# --- 2. Detect architecture ---
-echo "[2/4] Detecting system..."
+# ─── 3. Verify ───
+echo "[3/5] Verifying..."
+WARNINGS=""
+check python3 && ok "python3" || WARNINGS="$WARNINGS python3"
+check node    && ok "node"    || WARNINGS="$WARNINGS node"
+check gcc     && ok "gcc"     || WARNINGS="$WARNINGS gcc"
+check javac   && ok "javac"   || WARNINGS="$WARNINGS javac"
+check ffmpeg  && ok "ffmpeg"  || WARNINGS="$WARNINGS ffmpeg"
+
+if [ -n "$WARNINGS" ]; then
+    echo ""
+    echo "  [WARNING] These tools failed to install:$WARNINGS"
+    echo "  Some languages may not work. You can install them manually later."
+fi
+echo ""
+
+# ─── 4. Download & Install App ───
+echo "[4/5] Downloading MINT Exam IDE..."
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then
     DMG_PATTERN="aarch64.dmg"
-    echo "  Apple Silicon (M1/M2/M3/M4)"
 else
     DMG_PATTERN="x64.dmg"
-    echo "  Intel Mac"
 fi
-
-# --- 3. Download & Install ---
-echo "[3/4] Downloading latest version..."
 
 DMG_URL=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" | \
     grep "browser_download_url.*${DMG_PATTERN}" | \
@@ -78,50 +119,40 @@ if [ -z "$DMG_URL" ]; then
     exit 1
 fi
 
-echo "  $(basename "$DMG_URL")"
 TMPDIR=$(mktemp -d)
 DMG_PATH="$TMPDIR/mint-ide.dmg"
-
 curl -L "$DMG_URL" -o "$DMG_PATH" --progress-bar
 
-echo "[4/4] Installing..."
+echo "[5/5] Installing app..."
 MOUNT_POINT=$(hdiutil attach "$DMG_PATH" -nobrowse -quiet | tail -1 | awk '{print $NF}')
 
-# Find and copy .app
 APP_FOUND=$(find "$MOUNT_POINT" -name "*.app" -maxdepth 1 | head -1)
 if [ -n "$APP_FOUND" ]; then
     APP_NAME=$(basename "$APP_FOUND" .app)
     rm -rf "$INSTALL_DIR/$APP_NAME.app"
     cp -R "$APP_FOUND" "$INSTALL_DIR/"
 else
-    echo "  Error: No .app found in DMG"
+    echo "  Error: No .app found"
     hdiutil detach "$MOUNT_POINT" -quiet
     exit 1
 fi
 
 hdiutil detach "$MOUNT_POINT" -quiet
-
-# Remove quarantine — bypasses Gatekeeper
 xattr -cr "$INSTALL_DIR/$APP_NAME.app"
-
 rm -rf "$TMPDIR"
 
-# --- Done ---
+# ─── Done ───
 echo ""
 echo "=============================="
 echo "  Installation complete!"
 echo "=============================="
 echo ""
-echo "  App: $INSTALL_DIR/$APP_NAME.app"
-if command -v ffmpeg &>/dev/null; then
-    echo "  FFmpeg: $(which ffmpeg)"
-    echo "  Screen recording: enabled"
-else
-    echo "  FFmpeg: not installed"
-    echo "  Screen recording: disabled (install FFmpeg to enable)"
-fi
-echo ""
-echo "  Opening $APP_NAME..."
+echo "  App:     $INSTALL_DIR/$APP_NAME.app"
+echo "  Python:  $(python3 --version 2>&1 || echo 'not found')"
+echo "  Node.js: $(node --version 2>&1 || echo 'not found')"
+echo "  GCC:     $(gcc --version 2>&1 | head -1 || echo 'not found')"
+echo "  Java:    $(javac -version 2>&1 || echo 'not found')"
+echo "  FFmpeg:  $(ffmpeg -version 2>&1 | head -1 || echo 'not found')"
 echo ""
 
 open "$INSTALL_DIR/$APP_NAME.app"

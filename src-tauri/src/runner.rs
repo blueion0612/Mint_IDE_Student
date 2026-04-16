@@ -71,11 +71,36 @@ fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>)
     let path = write_file(dir, filename, code)?;
     let path_str = path.to_string_lossy().to_string();
     if let Some(py) = python_path {
-        run_cmd(py, &[&path_str], dir)
-    } else {
-        run_cmd("python3", &[&path_str], dir)
-            .or_else(|_| run_cmd("python", &[&path_str], dir))
+        return run_cmd(py, &[&path_str], dir);
     }
+
+    // Try common names
+    for cmd in ["python", "python3"] {
+        if let Ok(r) = run_cmd(cmd, &[&path_str], dir) {
+            return Ok(r);
+        }
+    }
+
+    // Windows: search common install locations
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let base = std::path::PathBuf::from(local).join("Programs").join("Python");
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let py = entry.path().join("python.exe");
+                    if py.exists() {
+                        let py_str = py.to_string_lossy().to_string();
+                        if let Ok(r) = run_cmd(&py_str, &[&path_str], dir) {
+                            return Ok(r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err("Python not found. Please install Python and ensure it is in your PATH.".to_string())
 }
 
 fn run_node(dir: &Path, code: &str, filename: &str) -> Result<(String, String, Option<i32>), String> {

@@ -159,13 +159,42 @@ fn detect_pythons() -> Result<Vec<PythonInfo>, String> {
         }
     }
 
-    // 2. Common venv locations
+    // 2. Conda base installs
     let home = dirs::home_dir().unwrap_or_default();
+    let conda_bases = [
+        home.join("anaconda3"),
+        home.join("miniconda3"),
+        home.join("Anaconda3"),
+        home.join("Miniconda3"),
+        home.join("miniforge3"),
+        home.join("mambaforge"),
+    ];
+
+    for base in &conda_bases {
+        let py = if cfg!(windows) {
+            base.join("python.exe")
+        } else {
+            base.join("bin").join("python")
+        };
+        if py.exists() {
+            let name = base.file_name().unwrap().to_string_lossy().to_string();
+            if let Some(mut info) = probe_python(&py.to_string_lossy()) {
+                info.label = format!("conda: {} (base)", name);
+                results.push(info);
+            }
+        }
+    }
+
+    // 3. Conda envs + virtualenvs
     let search_dirs = [
         home.join("envs"),
         home.join(".virtualenvs"),
         home.join("anaconda3").join("envs"),
         home.join("miniconda3").join("envs"),
+        home.join("Anaconda3").join("envs"),
+        home.join("Miniconda3").join("envs"),
+        home.join("miniforge3").join("envs"),
+        home.join("mambaforge").join("envs"),
     ];
 
     for dir in &search_dirs {
@@ -174,14 +203,19 @@ fn detect_pythons() -> Result<Vec<PythonInfo>, String> {
                 let p = entry.path();
                 if !p.is_dir() { continue; }
                 let py = if cfg!(windows) {
-                    p.join("Scripts").join("python.exe")
+                    p.join("python.exe")  // conda envs on Windows: envs/name/python.exe
                 } else {
                     p.join("bin").join("python")
                 };
+                // Also check Scripts/ for conda on Windows
+                let py = if py.exists() { py } else if cfg!(windows) {
+                    p.join("Scripts").join("python.exe")
+                } else { py };
+
                 if py.exists() {
                     let name = p.file_name().unwrap().to_string_lossy().to_string();
                     if let Some(mut info) = probe_python(&py.to_string_lossy()) {
-                        info.label = format!("venv: {}", name);
+                        info.label = format!("env: {}", name);
                         results.push(info);
                     }
                 }

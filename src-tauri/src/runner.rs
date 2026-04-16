@@ -54,10 +54,17 @@ fn write_file(dir: &Path, name: &str, content: &str) -> Result<std::path::PathBu
 }
 
 fn run_cmd(cmd: &str, args: &[&str], cwd: &Path) -> Result<(String, String, Option<i32>), String> {
-    let output = Command::new(cmd)
-        .args(args)
-        .current_dir(cwd)
-        .output()
+    let mut command = Command::new(cmd);
+    command.args(args).current_dir(cwd);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command.output()
         .map_err(|e| format!("Failed to run '{}': {}. Is it installed?", cmd, e))?;
 
     Ok((

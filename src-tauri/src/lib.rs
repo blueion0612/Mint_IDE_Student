@@ -48,16 +48,17 @@ fn log_editor_event(
 // ===== Code Execution =====
 
 #[tauri::command]
-async fn run_code(
+fn run_code(
     app_handle: tauri::AppHandle,
-    state: State<'_, AppState>,
-    ws: State<'_, WorkspaceState>,
+    state: State<AppState>,
+    ws: State<WorkspaceState>,
+    process: State<runner::RunningProcess>,
     language: String,
     code: String,
     filename: String,
     python_path: Option<String>,
-) -> Result<runner::RunResult, String> {
-    // If workspace is active, write to actual file first so imports work
+) -> Result<(), String> {
+    // Save file to workspace so imports work
     if let Ok(guard) = ws.lock() {
         if let Some(ref workspace) = *guard {
             let _ = workspace.write_file(&filename, &code);
@@ -73,21 +74,32 @@ async fn run_code(
     state.activity_log.lock().unwrap().add_event(event.clone());
     let _ = app_handle.emit("activity-event", &event);
 
-    // Run from workspace directory if available
     let cwd = ws.lock().ok()
         .and_then(|g| g.as_ref().map(|w| w.root_path()));
-    let result = runner::execute_code(&language, &code, &filename, cwd.as_deref(), python_path.as_deref());
 
-    let result_detail = if result.exit_code == Some(0) {
-        format!("{} completed successfully in {}ms", filename, result.duration_ms)
-    } else {
-        format!("{} exited with code {:?} in {}ms", filename, result.exit_code, result.duration_ms)
-    };
-    let result_event = ActivityEvent::new("code_run_result", &result_detail, None, Some(result.duration_ms as f64));
-    state.activity_log.lock().unwrap().add_event(result_event.clone());
-    let _ = app_handle.emit("activity-event", &result_event);
+    runner::execute_code_streaming(
+        &language, &code, &filename,
+        cwd.as_deref(),
+        python_path.as_deref(),
+        app_handle,
+        (*process).clone(),
+    );
 
-    Ok(result)
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_code(process: State<runner::RunningProcess>) -> bool {
+    runner::stop_process(&process)
+}
+
+#[tauri::command]
+fn pip_install_packages(
+    app_handle: tauri::AppHandle,
+    packages: Vec<String>,
+    python_path: Option<String>,
+) {
+    runner::pip_install(&packages, python_path.as_deref(), app_handle);
 }
 
 // ===== Screen Recording =====
@@ -682,12 +694,15 @@ pub fn run() {
         .manage(Mutex::new(ScreenRecorder::new()) as RecorderState)
         .manage(Mutex::new(None::<Workspace>) as WorkspaceState)
         .manage(new_known_writes())
+        .manage(runner::new_running_process())
         .invoke_handler(tauri::generate_handler![
             get_activity_log,
             clear_activity_log,
             export_activity_log,
             log_editor_event,
             run_code,
+            stop_code,
+            pip_install_packages,
             start_recording,
             stop_recording,
             is_recording,

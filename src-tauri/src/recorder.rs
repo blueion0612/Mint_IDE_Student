@@ -173,6 +173,9 @@ fn walkdir_simple(dir: &std::path::Path, depth: u32) -> Vec<String> {
 
 #[cfg(target_os = "windows")]
 fn build_ffmpeg_command(ffmpeg: &str, output_path: &str) -> Result<Child, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
     Command::new(ffmpeg)
         .args([
             "-y", "-f", "gdigrab", "-framerate", "5",
@@ -184,6 +187,7 @@ fn build_ffmpeg_command(ffmpeg: &str, output_path: &str) -> Result<Child, String
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("Failed to start FFmpeg: {}", e))
 }

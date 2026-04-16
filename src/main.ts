@@ -131,14 +131,14 @@ async function initializeApp(): Promise<void> {
     timeDeltaMs: null,
   });
 
-  startAutoRecording();
+  // Screen recording disabled in Lite build
 }
 
 // ===== Toolbar =====
 function buildToolbar(): void {
   const toolbar = document.getElementById("toolbar")!;
   toolbar.innerHTML = `
-    <span class="toolbar-title">MINT Exam IDE</span>
+    <span class="toolbar-title">MINT Exam IDE <small style="color:#6c7086">Lite</small></span>
     <div class="toolbar-group">
       <select id="lang-selector" class="lang-select">
         <option value="python">Python</option>
@@ -153,10 +153,6 @@ function buildToolbar(): void {
     <div class="toolbar-group">
       <button class="btn btn-run" id="btn-run">&#9654; Run</button>
       <button class="btn" id="btn-save">Save</button>
-    </div>
-    <div class="toolbar-separator"></div>
-    <div class="toolbar-group">
-      <span class="rec-indicator" id="rec-indicator">&#9679; REC</span>
     </div>
     <div class="toolbar-separator"></div>
     <div class="toolbar-group">

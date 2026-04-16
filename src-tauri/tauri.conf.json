@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
-  "productName": "MINT Exam IDE",
+  "productName": "MINT Exam IDE Lite",
   "version": "1.0.0",
   "identifier": "com.mint.exam-ide",
   "build": {

@@ -57,6 +57,7 @@ fn run_cmd(cmd: &str, args: &[&str], cwd: &Path) -> Result<(String, String, Opti
     let output = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
+        .env("PYTHONUNBUFFERED", "1")  // real-time output for Python
         .output()
         .map_err(|e| format!("Failed to run '{}': {}. Is it installed?", cmd, e))?;
 
@@ -70,24 +71,41 @@ fn run_cmd(cmd: &str, args: &[&str], cwd: &Path) -> Result<(String, String, Opti
 fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>) -> Result<(String, String, Option<i32>), String> {
     let path = write_file(dir, filename, code)?;
     let path_str = path.to_string_lossy().to_string();
+
+    // If user explicitly selected a Python path, use it
     if let Some(py) = python_path {
         return run_cmd(py, &[&path_str], dir);
     }
 
-    // Try common names
-    for cmd in ["python", "python3"] {
+    // Try common command names (works if Python is in PATH)
+    // "py" is the Windows Python Launcher — handles version selection
+    let candidates = if cfg!(target_os = "windows") {
+        vec!["python", "python3", "py"]
+    } else {
+        vec!["python3", "python"]
+    };
+
+    for cmd in &candidates {
         if let Ok(r) = run_cmd(cmd, &[&path_str], dir) {
             return Ok(r);
         }
     }
 
-    // Windows: search common install locations
+    // Windows: search common install locations directly
     #[cfg(target_os = "windows")]
     {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let base = std::path::PathBuf::from(local).join("Programs").join("Python");
-            if let Ok(entries) = std::fs::read_dir(&base) {
-                for entry in entries.flatten() {
+        let search_bases: Vec<std::path::PathBuf> = [
+            std::env::var("LOCALAPPDATA").ok().map(|v| std::path::PathBuf::from(v).join("Programs").join("Python")),
+            std::env::var("PROGRAMFILES").ok().map(|v| std::path::PathBuf::from(v).join("Python")),
+            Some(std::path::PathBuf::from("C:\\Python3")),
+        ].into_iter().flatten().collect();
+
+        for base in &search_bases {
+            if let Ok(entries) = std::fs::read_dir(base) {
+                // Sort descending to prefer newer versions
+                let mut dirs: Vec<_> = entries.flatten().collect();
+                dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+                for entry in dirs {
                     let py = entry.path().join("python.exe");
                     if py.exists() {
                         let py_str = py.to_string_lossy().to_string();
@@ -95,6 +113,18 @@ fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>)
                             return Ok(r);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // macOS: check common homebrew/system paths
+    #[cfg(target_os = "macos")]
+    {
+        for p in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"] {
+            if std::path::Path::new(p).exists() {
+                if let Ok(r) = run_cmd(p, &[&path_str], dir) {
+                    return Ok(r);
                 }
             }
         }

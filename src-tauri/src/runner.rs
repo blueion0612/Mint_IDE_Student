@@ -91,9 +91,29 @@ fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>)
         }
     }
 
-    // Windows: search common install locations directly
+    // Windows: search common install locations + Conda
     #[cfg(target_os = "windows")]
     {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+
+        // Direct conda base installs
+        let conda_directs: Vec<std::path::PathBuf> = [
+            format!("{}\\anaconda3\\python.exe", home),
+            format!("{}\\miniconda3\\python.exe", home),
+            format!("{}\\Anaconda3\\python.exe", home),
+            format!("{}\\Miniconda3\\python.exe", home),
+        ].into_iter().map(std::path::PathBuf::from).collect();
+
+        for py in &conda_directs {
+            if py.exists() {
+                let py_str = py.to_string_lossy().to_string();
+                if let Ok(r) = run_cmd(&py_str, &[&path_str], dir) {
+                    return Ok(r);
+                }
+            }
+        }
+
+        // Standard Python installs
         let search_bases: Vec<std::path::PathBuf> = [
             std::env::var("LOCALAPPDATA").ok().map(|v| std::path::PathBuf::from(v).join("Programs").join("Python")),
             std::env::var("PROGRAMFILES").ok().map(|v| std::path::PathBuf::from(v).join("Python")),
@@ -102,7 +122,6 @@ fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>)
 
         for base in &search_bases {
             if let Ok(entries) = std::fs::read_dir(base) {
-                // Sort descending to prefer newer versions
                 let mut dirs: Vec<_> = entries.flatten().collect();
                 dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
                 for entry in dirs {
@@ -118,10 +137,30 @@ fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>)
         }
     }
 
-    // macOS: check common homebrew/system paths
+    // macOS: check homebrew, system, and Conda paths
     #[cfg(target_os = "macos")]
     {
-        for p in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"] {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mac_paths = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3",
+        ];
+        let conda_paths = [
+            format!("{}/anaconda3/bin/python", home),
+            format!("{}/miniconda3/bin/python", home),
+            format!("{}/miniforge3/bin/python", home),
+            format!("{}/mambaforge/bin/python", home),
+        ];
+
+        for p in mac_paths {
+            if std::path::Path::new(p).exists() {
+                if let Ok(r) = run_cmd(p, &[&path_str], dir) {
+                    return Ok(r);
+                }
+            }
+        }
+        for p in &conda_paths {
             if std::path::Path::new(p).exists() {
                 if let Ok(r) = run_cmd(p, &[&path_str], dir) {
                     return Ok(r);

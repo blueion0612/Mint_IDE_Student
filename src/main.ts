@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { createEditor, setLanguage, type SupportedLanguage } from "./editor/setup";
 import { handleEditorInput, flushTypingSummary } from "./monitor/keystroke";
 import { recordTransaction, setCurrentFile, markNextInputSource, getEditHistoryJSON } from "./monitor/edithistory";
+import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook } from "./editor/notebook";
 
 // ===== Types =====
 interface FileNode {
@@ -316,7 +317,7 @@ function iconForExt(name: string): string {
   const ext = name.split(".").pop()?.toLowerCase() || "";
   const map: Record<string, string> = {
     py: "Py", js: "JS", ts: "TS", java: "Jv", c: "C", cpp: "C+", h: "H",
-    hpp: "H+", json: "{}", txt: "Tx", md: "Md",
+    hpp: "H+", json: "{}", txt: "Tx", md: "Md", ipynb: "Nb",
   };
   return map[ext] || "??";
 }
@@ -344,7 +345,13 @@ async function openFileByPath(path: string): Promise<void> {
   setCurrentFile(path);
   const selector = document.getElementById("lang-selector") as HTMLSelectElement;
   if (selector) selector.value = file.language;
-  mountEditor(file);
+
+  if (path.endsWith(".ipynb")) {
+    mountNotebookView(file);
+  } else {
+    clearNotebook();
+    mountEditor(file);
+  }
   renderTabs();
   refreshFileTree();
 }
@@ -365,9 +372,14 @@ async function saveCurrentFile(): Promise<void> {
 }
 
 async function syncCurrentEditor(): Promise<void> {
-  if (activeFilePath && editorView) {
-    const file = openFiles.find((f) => f.path === activeFilePath);
-    if (file) file.content = editorView.state.doc.toString();
+  if (!activeFilePath) return;
+  const file = openFiles.find((f) => f.path === activeFilePath);
+  if (!file) return;
+
+  if (isNotebookActive() && activeFilePath.endsWith(".ipynb")) {
+    file.content = getNotebookJSON();
+  } else if (editorView) {
+    file.content = editorView.state.doc.toString();
   }
 }
 
@@ -434,6 +446,17 @@ function mountEditor(file: OpenFile): void {
       recordTransaction(changes, userEvent);
     },
   );
+}
+
+function mountNotebookView(file: OpenFile): void {
+  const container = document.getElementById("editor-container")!;
+  container.innerHTML = "";
+  editorView = null;
+
+  mountNotebook(container, file.content, file.path, () => {
+    file.modified = true;
+    renderTabs();
+  });
 }
 
 // ===== Context Menu =====
@@ -1166,6 +1189,7 @@ function langFromExtension(name: string): SupportedLanguage | null {
   const map: Record<string, SupportedLanguage> = {
     py: "python", js: "javascript", ts: "typescript", java: "java",
     c: "c", cpp: "cpp", cc: "cpp", cxx: "cpp", h: "c", hpp: "cpp",
+    ipynb: "python",
   };
   return ext ? map[ext] ?? null : null;
 }

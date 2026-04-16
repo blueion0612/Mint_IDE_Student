@@ -1,84 +1,243 @@
 use serde::Serialize;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tauri::{AppHandle, Emitter};
 
-#[derive(Debug, Serialize)]
-pub struct RunResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: Option<i32>,
-    pub duration_ms: u64,
+/// Event sent to frontend for each line of output
+#[derive(Debug, Clone, Serialize)]
+pub struct RunOutputLine {
+    pub stream: String, // "stdout", "stderr", "system"
+    pub text: String,
 }
 
-/// Runs code and returns the output.
-/// If workspace_dir is provided, files are written there (so imports work).
-/// Otherwise uses a temp directory.
-pub fn execute_code(language: &str, code: &str, filename: &str, workspace_dir: Option<&str>, python_path: Option<&str>) -> RunResult {
+/// Shared handle to the running process so it can be stopped
+pub type RunningProcess = Arc<Mutex<Option<Child>>>;
+
+pub fn new_running_process() -> RunningProcess {
+    Arc::new(Mutex::new(None))
+}
+
+/// Execute code with real-time streaming output via events.
+/// Returns immediately — output comes through "run-output" events.
+pub fn execute_code_streaming(
+    language: &str,
+    code: &str,
+    filename: &str,
+    workspace_dir: Option<&str>,
+    python_path: Option<&str>,
+    app_handle: AppHandle,
+    process_handle: RunningProcess,
+) {
     let work_dir = workspace_dir
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("mint-exam-ide"));
     let _ = std::fs::create_dir_all(&work_dir);
 
-    let start = Instant::now();
+    let lang = language.to_string();
+    let code = code.to_string();
+    let fname = filename.to_string();
+    let py_path = python_path.map(|s| s.to_string());
+    let dir = work_dir.clone();
 
-    let result = match language {
-        "python" => run_python(&work_dir, code, filename, python_path),
-        "javascript" => run_node(&work_dir, code, filename),
-        "typescript" => run_node(&work_dir, code, filename),
-        "c" => run_c(&work_dir, code, filename),
-        "cpp" => run_cpp(&work_dir, code, filename),
-        "java" => run_java(&work_dir, code, filename),
-        _ => Err(format!("Unsupported language: {}", language)),
-    };
+    thread::spawn(move || {
+        let start = std::time::Instant::now();
 
-    let duration_ms = start.elapsed().as_millis() as u64;
+        // Write file
+        let file_path = dir.join(&fname);
+        if let Some(parent) = file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&file_path, &code).is_err() {
+            emit_line(&app_handle, "system", "Failed to write file\n");
+            emit_done(&app_handle, None, 0);
+            return;
+        }
 
-    match result {
-        Ok((stdout, stderr, code)) => RunResult { stdout, stderr, exit_code: code, duration_ms },
-        Err(e) => RunResult { stdout: String::new(), stderr: e, exit_code: None, duration_ms },
+        // Build command
+        let result = match lang.as_str() {
+            "python" => build_python_cmd(&dir, &fname, py_path.as_deref()),
+            "javascript" | "typescript" => build_node_cmd(&dir, &fname),
+            "c" => build_and_run_c(&dir, &fname, &app_handle),
+            "cpp" => build_and_run_cpp(&dir, &fname, &app_handle),
+            "java" => build_and_run_java(&dir, &fname, &app_handle),
+            _ => {
+                emit_line(&app_handle, "stderr", &format!("Unsupported language: {}\n", lang));
+                emit_done(&app_handle, None, 0);
+                return;
+            }
+        };
+
+        let (cmd, args) = match result {
+            Some(v) => v,
+            None => return, // compile error already emitted
+        };
+
+        // Spawn with piped stdout/stderr
+        let child = Command::new(&cmd)
+            .args(&args)
+            .current_dir(&dir)
+            .env("PYTHONUNBUFFERED", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                emit_line(&app_handle, "stderr", &format!("Failed to run '{}': {}. Is it installed?\n", cmd, e));
+                emit_done(&app_handle, None, 0);
+                return;
+            }
+        };
+
+        // Store process handle for Stop button
+        {
+            let mut guard = process_handle.lock().unwrap();
+            *guard = None; // will set after taking stdout/stderr
+        }
+
+        // Stream stdout
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        // Now store the child for stop
+        {
+            let mut guard = process_handle.lock().unwrap();
+            *guard = Some(child);
+        }
+
+        let ah1 = app_handle.clone();
+        let ah2 = app_handle.clone();
+
+        let t1 = thread::spawn(move || {
+            if let Some(out) = stdout {
+                let reader = BufReader::new(out);
+                for line in reader.lines() {
+                    if let Ok(l) = line {
+                        emit_line(&ah1, "stdout", &format!("{}\n", l));
+                    }
+                }
+            }
+        });
+
+        let t2 = thread::spawn(move || {
+            if let Some(err) = stderr {
+                let reader = BufReader::new(err);
+                for line in reader.lines() {
+                    if let Ok(l) = line {
+                        emit_line(&ah2, "stderr", &format!("{}\n", l));
+                    }
+                }
+            }
+        });
+
+        t1.join().ok();
+        t2.join().ok();
+
+        // Wait for process to finish
+        let exit_code = {
+            let mut guard = process_handle.lock().unwrap();
+            if let Some(ref mut child) = *guard {
+                child.wait().ok().and_then(|s| s.code())
+            } else {
+                None
+            }
+        };
+
+        // Clear handle
+        {
+            let mut guard = process_handle.lock().unwrap();
+            *guard = None;
+        }
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        emit_done(&app_handle, exit_code, elapsed);
+    });
+}
+
+/// Stop the currently running process
+pub fn stop_process(process_handle: &RunningProcess) -> bool {
+    let mut guard = process_handle.lock().unwrap();
+    if let Some(ref mut child) = *guard {
+        let _ = child.kill();
+        *guard = None;
+        true
+    } else {
+        false
     }
 }
 
-fn write_file(dir: &Path, name: &str, content: &str) -> Result<std::path::PathBuf, String> {
-    let path = dir.join(name);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut file = std::fs::File::create(&path)
-        .map_err(|e| format!("Failed to create file: {}", e))?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("Failed to write file: {}", e))?;
-    Ok(path)
+/// pip install packages
+pub fn pip_install(
+    packages: &[String],
+    python_path: Option<&str>,
+    app_handle: AppHandle,
+) {
+    let py = find_python(python_path);
+    let pkgs = packages.to_vec();
+
+    thread::spawn(move || {
+        let py_cmd = match py {
+            Some(p) => p,
+            None => {
+                emit_line(&app_handle, "stderr", "Python not found\n");
+                return;
+            }
+        };
+
+        emit_line(&app_handle, "system", &format!("$ {} -m pip install {}\n", py_cmd, pkgs.join(" ")));
+
+        let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string(), "--user".to_string()];
+        args.extend(pkgs);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+        let child = Command::new(&py_cmd)
+            .args(&arg_refs)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        match child {
+            Ok(mut c) => {
+                if let Some(out) = c.stdout.take() {
+                    let reader = BufReader::new(out);
+                    for line in reader.lines().flatten() {
+                        emit_line(&app_handle, "stdout", &format!("{}\n", line));
+                    }
+                }
+                let status = c.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                emit_line(&app_handle, "system", &format!("[pip exit {}]\n", status));
+            }
+            Err(e) => {
+                emit_line(&app_handle, "stderr", &format!("pip failed: {}\n", e));
+            }
+        }
+    });
 }
 
-fn run_cmd(cmd: &str, args: &[&str], cwd: &Path) -> Result<(String, String, Option<i32>), String> {
-    let output = Command::new(cmd)
-        .args(args)
-        .current_dir(cwd)
-        .env("PYTHONUNBUFFERED", "1")  // real-time output for Python
-        .output()
-        .map_err(|e| format!("Failed to run '{}': {}. Is it installed?", cmd, e))?;
+// ===== Helpers =====
 
-    Ok((
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code(),
-    ))
+fn emit_line(app: &AppHandle, stream: &str, text: &str) {
+    let _ = app.emit("run-output", RunOutputLine {
+        stream: stream.to_string(),
+        text: text.to_string(),
+    });
 }
 
-fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>) -> Result<(String, String, Option<i32>), String> {
-    let path = write_file(dir, filename, code)?;
-    let path_str = path.to_string_lossy().to_string();
+fn emit_done(app: &AppHandle, exit_code: Option<i32>, duration_ms: u64) {
+    #[derive(Clone, Serialize)]
+    struct RunDone { exit_code: Option<i32>, duration_ms: u64 }
+    let _ = app.emit("run-done", RunDone { exit_code, duration_ms });
+}
 
-    // If user explicitly selected a Python path, use it
+fn find_python(python_path: Option<&str>) -> Option<String> {
     if let Some(py) = python_path {
-        return run_cmd(py, &[&path_str], dir);
+        return Some(py.to_string());
     }
 
-    // Try common command names (works if Python is in PATH)
-    // "py" is the Windows Python Launcher — handles version selection
     let candidates = if cfg!(target_os = "windows") {
         vec!["python", "python3", "py"]
     } else {
@@ -86,140 +245,121 @@ fn run_python(dir: &Path, code: &str, filename: &str, python_path: Option<&str>)
     };
 
     for cmd in &candidates {
-        if let Ok(r) = run_cmd(cmd, &[&path_str], dir) {
-            return Ok(r);
+        if Command::new(cmd).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
+            return Some(cmd.to_string());
         }
     }
 
-    // Windows: search common install locations + Conda
+    // Windows: scan common locations
     #[cfg(target_os = "windows")]
     {
         let home = std::env::var("USERPROFILE").unwrap_or_default();
-
-        // Direct conda base installs
-        let conda_directs: Vec<std::path::PathBuf> = [
-            format!("{}\\anaconda3\\python.exe", home),
-            format!("{}\\miniconda3\\python.exe", home),
-            format!("{}\\Anaconda3\\python.exe", home),
-            format!("{}\\Miniconda3\\python.exe", home),
-        ].into_iter().map(std::path::PathBuf::from).collect();
-
-        for py in &conda_directs {
-            if py.exists() {
-                let py_str = py.to_string_lossy().to_string();
-                if let Ok(r) = run_cmd(&py_str, &[&path_str], dir) {
-                    return Ok(r);
-                }
-            }
+        for dir_name in ["anaconda3", "miniconda3", "Anaconda3", "Miniconda3"] {
+            let py = format!("{}\\{}\\python.exe", home, dir_name);
+            if std::path::Path::new(&py).exists() { return Some(py); }
         }
-
-        // Standard Python installs
-        let search_bases: Vec<std::path::PathBuf> = [
-            std::env::var("LOCALAPPDATA").ok().map(|v| std::path::PathBuf::from(v).join("Programs").join("Python")),
-            std::env::var("PROGRAMFILES").ok().map(|v| std::path::PathBuf::from(v).join("Python")),
-            Some(std::path::PathBuf::from("C:\\Python3")),
-        ].into_iter().flatten().collect();
-
-        for base in &search_bases {
-            if let Ok(entries) = std::fs::read_dir(base) {
-                let mut dirs: Vec<_> = entries.flatten().collect();
-                dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-                for entry in dirs {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let base = std::path::PathBuf::from(local).join("Programs").join("Python");
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
                     let py = entry.path().join("python.exe");
-                    if py.exists() {
-                        let py_str = py.to_string_lossy().to_string();
-                        if let Ok(r) = run_cmd(&py_str, &[&path_str], dir) {
-                            return Ok(r);
-                        }
-                    }
+                    if py.exists() { return Some(py.to_string_lossy().to_string()); }
                 }
             }
         }
     }
 
-    // macOS: check homebrew, system, and Conda paths
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_default();
-        let mac_paths = [
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-            "/usr/bin/python3",
-        ];
-        let conda_paths = [
-            format!("{}/anaconda3/bin/python", home),
-            format!("{}/miniconda3/bin/python", home),
-            format!("{}/miniforge3/bin/python", home),
-            format!("{}/mambaforge/bin/python", home),
-        ];
-
-        for p in mac_paths {
-            if std::path::Path::new(p).exists() {
-                if let Ok(r) = run_cmd(p, &[&path_str], dir) {
-                    return Ok(r);
-                }
-            }
+        for p in [
+            "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3",
+        ] {
+            if std::path::Path::new(p).exists() { return Some(p.to_string()); }
         }
-        for p in &conda_paths {
-            if std::path::Path::new(p).exists() {
-                if let Ok(r) = run_cmd(p, &[&path_str], dir) {
-                    return Ok(r);
-                }
-            }
+        for name in ["anaconda3", "miniconda3", "miniforge3"] {
+            let py = format!("{}/{}/bin/python", home, name);
+            if std::path::Path::new(&py).exists() { return Some(py); }
         }
     }
 
-    Err("Python not found. Please install Python and ensure it is in your PATH.".to_string())
+    None
 }
 
-fn run_node(dir: &Path, code: &str, filename: &str) -> Result<(String, String, Option<i32>), String> {
-    let path = write_file(dir, filename, code)?;
-    let path_str = path.to_string_lossy().to_string();
-    run_cmd("node", &[&path_str], dir)
+fn build_python_cmd(dir: &Path, filename: &str, python_path: Option<&str>) -> Option<(String, Vec<String>)> {
+    let py = find_python(python_path)?;
+    let file = dir.join(filename);
+    Some((py, vec![file.to_string_lossy().to_string()]))
 }
 
-fn run_c(dir: &Path, code: &str, filename: &str) -> Result<(String, String, Option<i32>), String> {
-    let src = write_file(dir, filename, code)?;
-    let src_str = src.to_string_lossy().to_string();
-    let out_name = if cfg!(windows) { "a.exe" } else { "a.out" };
-    let out_path = dir.join(out_name);
-    let out_str = out_path.to_string_lossy().to_string();
+fn build_node_cmd(dir: &Path, filename: &str) -> Option<(String, Vec<String>)> {
+    let file = dir.join(filename);
+    Some(("node".to_string(), vec![file.to_string_lossy().to_string()]))
+}
 
-    let (_, stderr, exit) = run_cmd("gcc", &[&src_str, "-o", &out_str, "-lm"], dir)?;
-    if exit != Some(0) {
-        return Ok(("".into(), format!("[Compilation Error]\n{}", stderr), exit));
+fn compile_cmd(compiler: &str, src: &Path, out: &Path, extra_args: &[&str], app: &AppHandle) -> Option<()> {
+    let mut args: Vec<String> = vec![src.to_string_lossy().to_string(), "-o".to_string(), out.to_string_lossy().to_string()];
+    args.extend(extra_args.iter().map(|s| s.to_string()));
+
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let output = Command::new(compiler).args(&arg_refs).output();
+
+    match output {
+        Ok(o) => {
+            if !o.status.success() {
+                emit_line(app, "stderr", "[Compilation Error]\n");
+                emit_line(app, "stderr", &String::from_utf8_lossy(&o.stderr));
+                emit_done(app, o.status.code(), 0);
+                return None;
+            }
+            Some(())
+        }
+        Err(e) => {
+            emit_line(app, "stderr", &format!("Failed to run '{}': {}. Is it installed?\n", compiler, e));
+            emit_done(app, None, 0);
+            None
+        }
     }
-    run_cmd(&out_str, &[], dir)
 }
 
-fn run_cpp(dir: &Path, code: &str, filename: &str) -> Result<(String, String, Option<i32>), String> {
-    let src = write_file(dir, filename, code)?;
-    let src_str = src.to_string_lossy().to_string();
+fn build_and_run_c(dir: &Path, filename: &str, app: &AppHandle) -> Option<(String, Vec<String>)> {
+    let src = dir.join(filename);
     let out_name = if cfg!(windows) { "a.exe" } else { "a.out" };
-    let out_path = dir.join(out_name);
-    let out_str = out_path.to_string_lossy().to_string();
-
-    let (_, stderr, exit) = run_cmd("g++", &[&src_str, "-o", &out_str, "-std=c++17"], dir)?;
-    if exit != Some(0) {
-        return Ok(("".into(), format!("[Compilation Error]\n{}", stderr), exit));
-    }
-    run_cmd(&out_str, &[], dir)
+    let out = dir.join(out_name);
+    compile_cmd("gcc", &src, &out, &["-lm"], app)?;
+    Some((out.to_string_lossy().to_string(), vec![]))
 }
 
-fn run_java(dir: &Path, code: &str, filename: &str) -> Result<(String, String, Option<i32>), String> {
-    // Write the file as-is (may include subdirectory path)
-    let src = write_file(dir, filename, code)?;
+fn build_and_run_cpp(dir: &Path, filename: &str, app: &AppHandle) -> Option<(String, Vec<String>)> {
+    let src = dir.join(filename);
+    let out_name = if cfg!(windows) { "a.exe" } else { "a.out" };
+    let out = dir.join(out_name);
+    compile_cmd("g++", &src, &out, &["-std=c++17"], app)?;
+    Some((out.to_string_lossy().to_string(), vec![]))
+}
+
+fn build_and_run_java(dir: &Path, filename: &str, app: &AppHandle) -> Option<(String, Vec<String>)> {
+    let src = dir.join(filename);
     let src_str = src.to_string_lossy().to_string();
     let dir_str = dir.to_string_lossy().to_string();
 
-    // Extract class name from filename (strip path and .java extension)
+    let output = Command::new("javac").arg(&src_str).output();
+    match output {
+        Ok(o) if !o.status.success() => {
+            emit_line(app, "stderr", "[Compilation Error]\n");
+            emit_line(app, "stderr", &String::from_utf8_lossy(&o.stderr));
+            emit_done(app, o.status.code(), 0);
+            return None;
+        }
+        Err(e) => {
+            emit_line(app, "stderr", &format!("Failed to run 'javac': {}\n", e));
+            emit_done(app, None, 0);
+            return None;
+        }
+        _ => {}
+    }
+
     let basename = filename.rsplit('/').next().unwrap_or(filename);
     let class_name = basename.trim_end_matches(".java");
-
-    // Compile
-    let (_, stderr, exit) = run_cmd("javac", &[&src_str], dir)?;
-    if exit != Some(0) {
-        return Ok(("".into(), format!("[Compilation Error]\n{}", stderr), exit));
-    }
-    run_cmd("java", &["-cp", &dir_str, class_name], dir)
+    Some(("java".to_string(), vec!["-cp".to_string(), dir_str, class_name.to_string()]))
 }

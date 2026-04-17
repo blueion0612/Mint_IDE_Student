@@ -180,163 +180,123 @@ function renumberCells(): void {
 }
 
 // ===== Colab-style Execution =====
+// Uses run-done event only (no streaming) to avoid conflicts with main listener.
 
-/**
- * Run all code cells sequentially using cell markers.
- * Concatenates all code with print("__MINT_CELL_N__") between cells,
- * runs as one script, then splits output by markers.
- */
+let nbRunning = false;
+export function isNotebookRunning(): boolean { return nbRunning; }
+
 async function runAllCellsSequential(): Promise<void> {
   const codeCells: { idx: number; cell: CellState }[] = [];
   cells.forEach((c, i) => { if (c.type === "code") codeCells.push({ idx: i, cell: c }); });
-  if (codeCells.length === 0) return;
+  if (codeCells.length === 0 || nbRunning) return;
+  nbRunning = true;
 
-  // Show running state
   for (const { cell } of codeCells) {
     const out = cell.element.querySelector(".nb-cell-output") as HTMLElement;
-    out.textContent = "Running...";
+    out.textContent = "Waiting...";
     out.className = "nb-cell-output running";
     cell.output = "";
   }
 
-  // Build combined script with markers
-  let script = "";
+  // Build script with markers
+  let script = "import sys\n";
   for (let i = 0; i < codeCells.length; i++) {
-    script += `print("${CELL_MARKER}${i}__")\n`;
+    script += `print("${CELL_MARKER}${i}__", flush=True)\n`;
     script += (codeCells[i].cell.editor?.state.doc.toString() || "") + "\n";
   }
+  script += `print("${CELL_MARKER}END__", flush=True)\n`;
 
-  // Collect all output
-  let allOutput = "";
-  let allStderr = "";
-
-  const unlisten1 = await listen<{ stream: string; text: string }>("run-output", (event) => {
-    if (event.payload.stream === "stderr") {
-      allStderr += event.payload.text;
-    } else {
-      allOutput += event.payload.text;
-    }
-  });
-
-  const done = new Promise<void>((resolve) => {
-    listen<any>("run-done", () => {
-      resolve();
-    }).then(u => { setTimeout(() => u(), 100); });
-  });
-
-  await invoke("run_code", {
-    language: "python",
-    code: script,
-    filename: notebookPath.replace(".ipynb", "_nb.py"),
-    pythonPath: null,
-  });
-
-  await done;
-  unlisten1();
+  // Wait for run-done which includes full stdout+stderr
+  const result = await runAndCollect(script, notebookPath.replace(".ipynb", "_nb.py"));
 
   // Parse output by markers
-  const chunks: string[] = [];
-  const parts = allOutput.split(new RegExp(`${CELL_MARKER}(\\d+)__\\n?`));
-
-  // parts: ["", "0", "output0\n", "1", "output1\n", ...]
+  const parts = result.stdout.split(new RegExp(`${CELL_MARKER}(\\d+|END)__\\n?`));
   for (let i = 1; i < parts.length; i += 2) {
-    const cellIdx = parseInt(parts[i]);
+    const key = parts[i];
+    if (key === "END") break;
+    const cellIdx = parseInt(key);
     const text = (parts[i + 1] || "").trim();
-    chunks[cellIdx] = text;
-  }
-
-  // Assign output to cells
-  for (let i = 0; i < codeCells.length; i++) {
-    const { cell } = codeCells[i];
-    const outEl = cell.element.querySelector(".nb-cell-output") as HTMLElement;
-    const text = chunks[i] || "";
-
-    // Check for images (matplotlib savefig)
-    const imgHtml = detectImages(text);
-
-    cell.output = text;
-    if (imgHtml) {
-      outEl.innerHTML = escHtml(text) + imgHtml;
-    } else {
-      outEl.textContent = text || "(no output)";
+    if (cellIdx >= 0 && cellIdx < codeCells.length) {
+      const { cell } = codeCells[cellIdx];
+      const outEl = cell.element.querySelector(".nb-cell-output") as HTMLElement;
+      cell.output = text;
+      const imgHtml = detectImages(text);
+      if (imgHtml) {
+        outEl.innerHTML = escHtml(text) + imgHtml;
+      } else {
+        outEl.textContent = text || "(no output)";
+      }
+      outEl.className = "nb-cell-output success";
     }
-    outEl.className = "nb-cell-output success";
   }
 
-  // Show stderr on last cell if any
-  if (allStderr.trim()) {
+  // Stderr on last cell
+  if (result.stderr.trim()) {
     const lastCell = codeCells[codeCells.length - 1].cell;
     const outEl = lastCell.element.querySelector(".nb-cell-output") as HTMLElement;
-    outEl.innerHTML = (outEl.innerHTML || "") + `<div class="nb-stderr">${escHtml(allStderr)}</div>`;
+    outEl.innerHTML = (outEl.innerHTML || "") + `<div class="nb-stderr">${escHtml(result.stderr)}</div>`;
     outEl.className = "nb-cell-output error";
   }
+
+  nbRunning = false;
 }
 
-/** Run a single cell (runs all cells up to this one for context) */
 async function runSingleCell(targetIdx: number): Promise<void> {
-  // Run all code cells up to and including targetIdx
-  const codeCells: { idx: number; cell: CellState }[] = [];
-  cells.forEach((c, i) => {
-    if (c.type === "code" && i <= targetIdx) codeCells.push({ idx: i, cell: c });
-  });
-  if (codeCells.length === 0) return;
+  if (nbRunning) return;
+  nbRunning = true;
 
   const targetCell = cells[targetIdx];
   const outEl = targetCell.element.querySelector(".nb-cell-output") as HTMLElement;
   outEl.textContent = "Running...";
   outEl.className = "nb-cell-output running";
-  targetCell.output = "";
 
-  // Build script: all previous cells + target cell with marker
-  let script = "";
-  for (let i = 0; i < codeCells.length; i++) {
-    const code = codeCells[i].cell.editor?.state.doc.toString() || "";
-    if (codeCells[i].idx === targetIdx) {
-      script += `print("${CELL_MARKER}TARGET__")\n`;
-    }
-    script += code + "\n";
+  // Build: all prior code cells + target with marker
+  let script = "import sys\n";
+  for (let i = 0; i <= targetIdx; i++) {
+    if (cells[i].type !== "code") continue;
+    if (i === targetIdx) script += `print("${CELL_MARKER}TARGET__", flush=True)\n`;
+    script += (cells[i].editor?.state.doc.toString() || "") + "\n";
   }
 
-  let allOutput = "";
-  let allStderr = "";
+  const result = await runAndCollect(script, notebookPath.replace(".ipynb", "_cell.py"));
 
-  const unlisten1 = await listen<{ stream: string; text: string }>("run-output", (event) => {
-    if (event.payload.stream === "stderr") allStderr += event.payload.text;
-    else allOutput += event.payload.text;
-  });
+  const markerPos = result.stdout.indexOf(`${CELL_MARKER}TARGET__`);
+  const markerLen = `${CELL_MARKER}TARGET__`.length;
+  const text = markerPos >= 0
+    ? result.stdout.substring(markerPos + markerLen).trim()
+    : result.stdout.trim();
 
-  const done = new Promise<void>((resolve) => {
-    listen<any>("run-done", () => resolve()).then(u => { setTimeout(() => u(), 100); });
-  });
-
-  await invoke("run_code", {
-    language: "python",
-    code: script,
-    filename: notebookPath.replace(".ipynb", "_cell.py"),
-    pythonPath: null,
-  });
-
-  await done;
-  unlisten1();
-
-  // Extract output after TARGET marker
-  const markerIdx = allOutput.indexOf(`${CELL_MARKER}TARGET__`);
-  const text = markerIdx >= 0
-    ? allOutput.substring(markerIdx + `${CELL_MARKER}TARGET__`.length).trim()
-    : allOutput.trim();
-
-  const imgHtml = detectImages(text);
   targetCell.output = text;
+  const imgHtml = detectImages(text);
   if (imgHtml) {
     outEl.innerHTML = escHtml(text) + imgHtml;
   } else {
     outEl.textContent = text || "(no output)";
   }
-  outEl.className = allStderr.trim() ? "nb-cell-output error" : "nb-cell-output success";
+  outEl.className = result.stderr.trim() ? "nb-cell-output error" : "nb-cell-output success";
 
-  if (allStderr.trim()) {
-    outEl.innerHTML = (outEl.innerHTML || "") + `<div class="nb-stderr">${escHtml(allStderr)}</div>`;
+  if (result.stderr.trim()) {
+    outEl.innerHTML = (outEl.innerHTML || "") + `<div class="nb-stderr">${escHtml(result.stderr)}</div>`;
   }
+
+  nbRunning = false;
+}
+
+/** Run code and wait for completion. Returns collected stdout+stderr. */
+function runAndCollect(code: string, filename: string): Promise<{ stdout: string; stderr: string }> {
+  return new Promise(async (resolve) => {
+    const unlisten = await listen<{ exit_code: number | null; duration_ms: number; stdout: string; stderr: string }>("run-done", (event) => {
+      unlisten();
+      resolve({ stdout: event.payload.stdout, stderr: event.payload.stderr });
+    });
+
+    await invoke("run_code", {
+      language: "python",
+      code,
+      filename,
+      pythonPath: null,
+    });
+  });
 }
 
 // ===== Image Detection =====

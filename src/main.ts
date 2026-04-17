@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { createEditor, setLanguage, markErrorLines, clearErrors, type SupportedLanguage } from "./editor/setup";
 import { handleEditorInput, flushTypingSummary } from "./monitor/keystroke";
 import { recordTransaction, setCurrentFile, markNextInputSource, getEditHistoryJSON } from "./monitor/edithistory";
-import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook } from "./editor/notebook";
+import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook, isNotebookRunning } from "./editor/notebook";
 
 // ===== Types =====
 interface FileNode {
@@ -933,6 +933,14 @@ async function deleteItem(path: string): Promise<void> {
 // ===== Run Code =====
 async function runCurrentFile(): Promise<void> {
   if (isRunning || !activeFilePath) return;
+
+  // If notebook is active, delegate to notebook's Run All
+  if (isNotebookActive() && activeFilePath.endsWith(".ipynb")) {
+    const runAllBtn = document.getElementById("nb-run-all");
+    if (runAllBtn) runAllBtn.click();
+    return;
+  }
+
   const file = openFiles.find((f) => f.path === activeFilePath);
   if (!file) return;
 
@@ -1473,6 +1481,7 @@ async function listenForBackendEvents(): Promise<void> {
 
   // Real-time code output
   await listen<{ stream: string; text: string }>("run-output", (event) => {
+    if (isNotebookRunning()) return; // notebook handles its own output
     const { stream, text } = event.payload;
     if (stream === "stderr") {
       appendOutput(text, "error");
@@ -1486,7 +1495,7 @@ async function listenForBackendEvents(): Promise<void> {
 
   // Code execution finished
   await listen<{ exit_code: number | null; duration_ms: number; stdout: string; stderr: string }>("run-done", (event) => {
-    if (!isRunning) return; // Guard: ignore duplicate events
+    if (!isRunning || isNotebookRunning()) return; // Guard
 
     const { exit_code, duration_ms, stdout, stderr } = event.payload;
 

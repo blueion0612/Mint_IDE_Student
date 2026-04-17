@@ -1644,10 +1644,10 @@ print("\\nFolder import test passed!")
 
 const DEFAULT_NOTEBOOK = JSON.stringify({
   cells: [
-    { cell_type: "markdown", source: ["# MINT Exam IDE — Notebook Test\\n", "Run each cell to verify."], metadata: {}, outputs: [] },
-    { cell_type: "code", source: ["import numpy as np\\n", "print(f'NumPy: {np.mean([1,2,3,4,5])}')"], metadata: {}, outputs: [], execution_count: null },
-    { cell_type: "code", source: ["import pandas as pd\\n", "df = pd.DataFrame({'A': [1,2,3], 'B': [4,5,6]})\\n", "print(df)"], metadata: {}, outputs: [], execution_count: null },
-    { cell_type: "code", source: ["# Intentional error test\\n", "print('before error')\\n", "print(1/0)"], metadata: {}, outputs: [], execution_count: null },
+    { cell_type: "markdown", source: ["# MINT Exam IDE — Notebook Test\n", "Run each cell to verify."], metadata: {}, outputs: [] },
+    { cell_type: "code", source: ["import numpy as np\n", "print(f'NumPy: {np.mean([1,2,3,4,5])}')"], metadata: {}, outputs: [], execution_count: null },
+    { cell_type: "code", source: ["import pandas as pd\n", "df = pd.DataFrame({'A': [1,2,3], 'B': [4,5,6]})\n", "print(df)"], metadata: {}, outputs: [], execution_count: null },
+    { cell_type: "code", source: ["# Intentional error test\n", "print('before error')\n", "print(1/0)"], metadata: {}, outputs: [], execution_count: null },
   ],
   metadata: { kernelspec: { display_name: "Python 3", language: "python", name: "python3" }, language_info: { name: "python" } },
   nbformat: 4, nbformat_minor: 5,

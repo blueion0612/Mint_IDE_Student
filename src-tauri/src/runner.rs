@@ -275,6 +275,10 @@ fn emit_done_with_output(app: &AppHandle, exit_code: Option<i32>, duration_ms: u
     });
 }
 
+pub fn find_python_cached(python_path: Option<&str>) -> Option<String> {
+    find_python(python_path)
+}
+
 fn find_python(python_path: Option<&str>) -> Option<String> {
     // User-selected path takes priority
     if let Some(py) = python_path {

@@ -95,11 +95,12 @@ if ($pyCmd) {
 
     # TensorFlow CPU
     Write-Host "  Installing TensorFlow (CPU)..."
-    & $venvPy -m pip install tensorflow-cpu 2>&1 | Out-Null
+    try { & $venvPy -m pip install tensorflow-cpu 2>&1 | Out-Null } catch {}
     Write-Host "  [OK] TensorFlow" -ForegroundColor Green
 
-    # Verify
-    $check = & $venvPy -c "import numpy,pandas,matplotlib,seaborn,sklearn,scipy,sympy,cv2,torch,tensorflow; print('ALL OK')" 2>&1
+    # Verify (suppress TF warnings)
+    $env:TF_CPP_MIN_LOG_LEVEL = "3"
+    $check = & $venvPy -c "import os; os.environ['TF_CPP_MIN_LOG_LEVEL']='3'; import numpy,pandas,matplotlib,seaborn,sklearn,scipy,sympy,cv2,torch,tensorflow; print('ALL OK')" 2>&1
     if ($check -match "ALL OK") {
         Write-Host "  All packages verified!" -ForegroundColor Green
     } else {

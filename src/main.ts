@@ -42,6 +42,8 @@ let isRecording = false;
 let workspaceRoot = "";
 let studentId = "";
 let selectedPythonPath: string | null = null; // null = system default
+// Expose for notebook.ts
+(window as any).getSelectedPythonPath = () => selectedPythonPath;
 
 // ===== Initialization =====
 document.addEventListener("DOMContentLoaded", async () => {

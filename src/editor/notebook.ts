@@ -144,7 +144,7 @@ async function runAllCells(): Promise<void> {
 
   try {
     const result = await invoke<[string, string, number | null]>("run_code_sync", {
-      language: "python", code: script, filename: "_notebook_run.py",
+      language: "python", code: script, filename: "_notebook_run.py", pythonPath: (window as any).getSelectedPythonPath?.() ?? null,
     });
     const stdout = result[0];
     const stderr = result[1];
@@ -206,7 +206,7 @@ async function runSingleCell(targetIdx: number): Promise<void> {
 
   try {
     const result = await invoke<[string, string, number | null]>("run_code_sync", {
-      language: "python", code: script, filename: "_notebook_cell.py",
+      language: "python", code: script, filename: "_notebook_cell.py", pythonPath: (window as any).getSelectedPythonPath?.() ?? null,
     });
     const stdout = result[0];
     const stderr = result[1];

@@ -58,7 +58,7 @@ function showStudentIdModal(): void {
       <div class="modal-title">학번을 입력하세요</div>
       <input type="text" id="student-id-input" class="modal-input" placeholder="예: 20240001" autocomplete="off" spellcheck="false" />
       <div class="modal-error" id="student-id-error"></div>
-      <button class="btn btn-accent modal-btn" id="student-id-submit">시작</button>
+      <button class="btn btn-accent modal-btn" id="student-id-submit">Test Start (Screen Recording)</button>
     </div>
   `;
   document.body.appendChild(overlay);

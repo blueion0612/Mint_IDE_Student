@@ -1,6 +1,6 @@
 {
   "name": "mint-exam-ide",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "MINT Exam IDE - Anti-cheat coding environment for exams",
   "scripts": {
     "dev": "vite",

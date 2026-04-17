@@ -315,7 +315,12 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
     let py_str = py_exe.to_string_lossy().to_string();
 
     // Install common exam packages
-    let packages = ["numpy", "matplotlib", "pandas"];
+    let packages = [
+        "numpy", "pandas", "matplotlib", "seaborn",       // data science
+        "scikit-learn", "scipy", "sympy",                  // ML / math
+        "Pillow", "opencv-python-headless",                // image processing
+        "openpyxl", "requests",                            // Excel / HTTP
+    ];
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
         text: format!("Installing packages: {}...\n", packages.join(", ")),

@@ -114,7 +114,7 @@ pub fn start_integrity_monitor(
         }
 
         loop {
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(5));
 
             let now = epoch_secs();
             let files = scan_all_files(&root);

@@ -291,9 +291,20 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
         venv_dir.join("bin").join("python")
     };
 
-    // If venv already exists and has python, skip creation
+    // If venv exists, check if all packages are installed
     if py_exe.exists() {
-        return Ok(py_exe.to_string_lossy().to_string());
+        let py_str = py_exe.to_string_lossy().to_string();
+        // Quick check: try importing a package added in later versions
+        let check = silent_cmd(&py_str, &["-c", "import seaborn, sklearn, sympy, cv2"]);
+        if check.is_some() && check.as_ref().unwrap().status.success() {
+            return Ok(py_str); // All packages present
+        }
+        // Missing packages — fall through to install
+        let _ = app_handle.emit("run-output", runner::RunOutputLine {
+            stream: "system".to_string(),
+            text: "Updating exam Python packages...\n".to_string(),
+        });
+        return install_exam_packages(&py_str, &app_handle);
     }
 
     // Find system python to create venv from
@@ -313,40 +324,44 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
     }
 
     let py_str = py_exe.to_string_lossy().to_string();
+    install_exam_packages(&py_str, &app_handle)
+}
 
-    // Install common exam packages
-    // Step 1: standard packages
-    let packages = [
-        "numpy", "pandas", "matplotlib", "seaborn",       // data science
-        "scikit-learn", "scipy", "sympy",                  // ML / math
-        "Pillow", "opencv-python-headless",                // image processing
-        "openpyxl", "requests",                            // Excel / HTTP
-        "tensorflow-cpu",                                   // deep learning (CPU)
-    ];
+fn install_exam_packages(py_str: &str, app_handle: &tauri::AppHandle) -> Result<String, String> {
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
-        text: "Installing exam packages (numpy, pandas, sklearn, torch, tensorflow, etc.)...\nThis may take a few minutes on first run.\n".to_string(),
+        text: "Installing exam packages...\nThis may take a few minutes on first run.\n".to_string(),
     });
 
-    let mut args = vec!["-m", "pip", "install", "--quiet"];
+    let packages = [
+        "numpy", "pandas", "matplotlib", "seaborn",
+        "scikit-learn", "scipy", "sympy",
+        "Pillow", "opencv-python-headless",
+        "openpyxl", "requests",
+    ];
+
+    let mut args: Vec<&str> = vec!["-m", "pip", "install"];
     for pkg in &packages {
         args.push(pkg);
     }
-    let _ = silent_cmd(&py_str, &args);
+    let _ = silent_cmd(py_str, &args);
 
-    // Step 2: PyTorch CPU (needs special index URL)
-    let _ = silent_cmd(&py_str, &[
-        "-m", "pip", "install", "--quiet",
+    // PyTorch CPU
+    let _ = silent_cmd(py_str, &[
+        "-m", "pip", "install",
         "torch", "torchvision", "torchaudio",
         "--index-url", "https://download.pytorch.org/whl/cpu",
     ]);
+
+    // TensorFlow CPU (may fail on some platforms — that's OK)
+    let _ = silent_cmd(py_str, &["-m", "pip", "install", "tensorflow-cpu"]);
 
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
         text: "Exam Python environment ready!\n".to_string(),
     });
 
-    Ok(py_str)
+    Ok(py_str.to_string())
 }
 
 fn find_system_python() -> Option<String> {

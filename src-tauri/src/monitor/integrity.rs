@@ -77,7 +77,7 @@ fn scan_dir_recursive(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>)
             .replace('\\', "/");
 
         // Skip our own log files
-        if rel.starts_with('_') {
+        if rel.starts_with('_') || rel.starts_with('.') {
             continue;
         }
 

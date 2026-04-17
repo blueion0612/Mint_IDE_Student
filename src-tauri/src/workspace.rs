@@ -149,6 +149,8 @@ fn scan_dir(dir: &Path, root: &Path) -> Result<Vec<FileNode>, String> {
 
     for entry in items {
         let name = entry.file_name().to_string_lossy().to_string();
+        // Hide dot-prefix files (temp notebook files) and log files
+        if name.starts_with('.') || name.starts_with('_') { continue; }
         let full_path = entry.path();
         let relative = full_path.strip_prefix(root)
             .unwrap_or(&full_path)

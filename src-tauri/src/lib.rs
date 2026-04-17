@@ -96,24 +96,19 @@ async fn run_code_sync(
     code: String,
     filename: String,
 ) -> Result<(String, String, Option<i32>), String> {
-    if let Ok(guard) = ws.lock() {
-        if let Some(ref workspace) = *guard {
-            let _ = workspace.write_file(&filename, &code);
-        }
-    }
+    // Write temp file to workspace dir (for imports) but with dot-prefix to hide from tree
     let cwd = ws.lock().ok().and_then(|g| g.as_ref().map(|w| w.root_path()));
+    let work_dir = cwd.clone().unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
+    let hidden_name = format!(".{}", filename);
+    let file_path = std::path::PathBuf::from(&work_dir).join(&hidden_name);
+    std::fs::write(&file_path, &code).map_err(|e| e.to_string())?;
 
-    // Synchronous execution — blocks until done
+    // Synchronous execution
     let mut command = std::process::Command::new(
         runner::find_python_cached(None).unwrap_or("python".to_string())
     );
-    let file_path = cwd.as_ref()
-        .map(|d| std::path::PathBuf::from(d).join(&filename))
-        .unwrap_or(std::path::PathBuf::from(&filename));
     command.arg(&file_path);
-    if let Some(ref dir) = cwd {
-        command.current_dir(dir);
-    }
+    command.current_dir(&work_dir);
     command.env("PYTHONUNBUFFERED", "1")
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
@@ -126,6 +121,10 @@ async fn run_code_sync(
     }
 
     let output = command.output().map_err(|e| e.to_string())?;
+
+    // Cleanup temp file
+    let _ = std::fs::remove_file(&file_path);
+
     Ok((
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),

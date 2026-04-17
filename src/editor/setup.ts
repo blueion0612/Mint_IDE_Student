@@ -1,5 +1,5 @@
-import { EditorState, Transaction } from "@codemirror/state";
-import { EditorView, keymap, lineNumbers, highlightActiveLineGutter, highlightActiveLine, drawSelection, rectangularSelection, crosshairCursor, highlightSpecialChars } from "@codemirror/view";
+import { EditorState, Transaction, StateEffect, StateField, RangeSet } from "@codemirror/state";
+import { EditorView, keymap, lineNumbers, highlightActiveLineGutter, highlightActiveLine, drawSelection, rectangularSelection, crosshairCursor, highlightSpecialChars, Decoration, type DecorationSet } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { syntaxHighlighting, indentOnInput, bracketMatching, foldGutter, foldKeymap, defaultHighlightStyle, HighlightStyle } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
@@ -88,6 +88,45 @@ const mintHighlightStyle = HighlightStyle.define([
   { tag: tags.regexp, color: "#f5c2e7" },
 ]);
 
+// ===== Error Line Highlighting =====
+const setErrorLines = StateEffect.define<number[]>();
+const clearErrorLines = StateEffect.define<null>();
+
+const errorLineDeco = Decoration.line({ class: "cm-error-line" });
+
+const errorLineField = StateField.define<DecorationSet>({
+  create() { return RangeSet.empty; },
+  update(decos, tr) {
+    for (const effect of tr.effects) {
+      if (effect.is(clearErrorLines)) {
+        return RangeSet.empty;
+      }
+      if (effect.is(setErrorLines)) {
+        const builder: any[] = [];
+        for (const lineNum of effect.value) {
+          if (lineNum >= 1 && lineNum <= tr.state.doc.lines) {
+            const line = tr.state.doc.line(lineNum);
+            builder.push(errorLineDeco.range(line.from));
+          }
+        }
+        return RangeSet.of(builder);
+      }
+    }
+    return decos;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+/** Highlight specific line numbers as errors (1-indexed) */
+export function markErrorLines(view: EditorView, lineNumbers: number[]): void {
+  view.dispatch({ effects: setErrorLines.of(lineNumbers) });
+}
+
+/** Clear all error line highlights */
+export function clearErrors(view: EditorView): void {
+  view.dispatch({ effects: clearErrorLines.of(null) });
+}
+
 export function createEditor(
   parent: HTMLElement,
   language: SupportedLanguage = "python",
@@ -159,6 +198,7 @@ export function createEditor(
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
       inputListener,
       txListener,
+      errorLineField,
       keymap.of([
         ...defaultKeymap,
         ...historyKeymap,
@@ -198,6 +238,7 @@ export function setLanguage(view: EditorView, language: SupportedLanguage): void
       mintTheme,
       syntaxHighlighting(mintHighlightStyle),
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+      errorLineField,
       keymap.of([
         ...defaultKeymap,
         ...historyKeymap,

@@ -163,9 +163,22 @@ async function runAllCells(): Promise<void> {
     }
 
     if (stderr.trim()) {
-      const last = codeCells[codeCells.length - 1].element.querySelector(".nb-cell-output") as HTMLElement;
-      last.innerHTML += `<div class="nb-stderr">${esc(stderr)}</div>`;
-      last.className = "nb-cell-output error";
+      // Find which cell caused the error by parsing "line N" from stderr
+      let errorCellIdx = codeCells.length - 1; // default: last cell
+      const lineMatch = stderr.match(/line (\d+)/);
+      if (lineMatch) {
+        const errLine = parseInt(lineMatch[1]);
+        // Map script line back to cell index using cumulative line counts
+        let cumLines = 1; // marker line
+        for (let ci = 0; ci < codeCells.length; ci++) {
+          const cellLines = (codeCells[ci].editor?.state.doc.toString() || "").split("\n").length + 1; // +1 for marker
+          if (errLine <= cumLines + cellLines) { errorCellIdx = ci; break; }
+          cumLines += cellLines;
+        }
+      }
+      const errCell = codeCells[errorCellIdx].element.querySelector(".nb-cell-output") as HTMLElement;
+      errCell.innerHTML += `<div class="nb-stderr">${esc(stderr)}</div>`;
+      // Keep stdout part as success, only add stderr indicator
     }
   } catch (e) {
     const last = codeCells[codeCells.length - 1].element.querySelector(".nb-cell-output") as HTMLElement;
@@ -203,7 +216,7 @@ async function runSingleCell(targetIdx: number): Promise<void> {
 
     cells[targetIdx].output = text;
     outEl.innerHTML = esc(text || "(no output)") + detectImages(text);
-    outEl.className = stderr.trim() ? "nb-cell-output error" : "nb-cell-output success";
+    outEl.className = "nb-cell-output success";
     if (stderr.trim()) outEl.innerHTML += `<div class="nb-stderr">${esc(stderr)}</div>`;
   } catch (e) {
     outEl.textContent = String(e);

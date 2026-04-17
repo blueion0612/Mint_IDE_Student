@@ -88,6 +88,51 @@ fn run_code(
     Ok(())
 }
 
+/// Blocking code execution — for notebooks. Returns stdout+stderr directly.
+#[tauri::command]
+async fn run_code_sync(
+    ws: State<'_, WorkspaceState>,
+    language: String,
+    code: String,
+    filename: String,
+) -> Result<(String, String, Option<i32>), String> {
+    if let Ok(guard) = ws.lock() {
+        if let Some(ref workspace) = *guard {
+            let _ = workspace.write_file(&filename, &code);
+        }
+    }
+    let cwd = ws.lock().ok().and_then(|g| g.as_ref().map(|w| w.root_path()));
+
+    // Synchronous execution — blocks until done
+    let mut command = std::process::Command::new(
+        runner::find_python_cached(None).unwrap_or("python".to_string())
+    );
+    let file_path = cwd.as_ref()
+        .map(|d| std::path::PathBuf::from(d).join(&filename))
+        .unwrap_or(std::path::PathBuf::from(&filename));
+    command.arg(&file_path);
+    if let Some(ref dir) = cwd {
+        command.current_dir(dir);
+    }
+    command.env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .env("TF_CPP_MIN_LOG_LEVEL", "3");
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let output = command.output().map_err(|e| e.to_string())?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code(),
+    ))
+}
+
 #[tauri::command]
 fn stop_code(process: State<runner::RunningProcess>) -> bool {
     runner::stop_process(&process)
@@ -901,6 +946,7 @@ pub fn run() {
             export_activity_log,
             log_editor_event,
             run_code,
+            run_code_sync,
             stop_code,
             pip_install_packages,
             start_recording,

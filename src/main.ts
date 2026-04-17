@@ -131,6 +131,7 @@ async function initializeApp(): Promise<void> {
     await invoke("ws_write_file", { path: "utils/math_helper.py", content: DEFAULT_MATH_HELPER });
     await invoke("ws_write_file", { path: "utils/text_helper.py", content: DEFAULT_TEXT_HELPER });
     await invoke("ws_write_file", { path: "test_import.py", content: DEFAULT_IMPORT_TEST });
+    await invoke("ws_write_file", { path: "test_popup.py", content: DEFAULT_POPUP_TEST });
     // Notebook test
     await invoke("ws_write_file", { path: "test_notebook.ipynb", content: DEFAULT_NOTEBOOK });
     await refreshFileTree();
@@ -349,7 +350,8 @@ async function openFileByPath(path: string): Promise<void> {
   const ext = path.split(".").pop()?.toLowerCase() || "";
   const imageExts = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp"];
   const tableExts = ["csv", "tsv"];
-  const binaryExts = ["xlsx", "xls", "docx", "pdf", "zip", "tar", "gz", "exe", "dll", "so", "pyc"];
+  const excelExts = ["xlsx", "xls"];
+  const binaryExts = ["docx", "pdf", "zip", "tar", "gz", "exe", "dll", "so", "pyc"];
 
   // CSV/TSV: render as table
   if (tableExts.includes(ext)) {
@@ -364,6 +366,33 @@ async function openFileByPath(path: string): Promise<void> {
       } catch { return; }
     }
     mountTableViewer(file);
+    renderTabs();
+    refreshFileTree();
+    return;
+  }
+
+  // Excel: convert to CSV via Python, then show as table
+  if (excelExts.includes(ext)) {
+    activeFilePath = path;
+    const name = path.split("/").pop() || path;
+    let file = openFiles.find((f) => f.path === path);
+    if (!file) {
+      // Convert xlsx to CSV text using pandas
+      try {
+        const csvContent = await invoke<string>("ws_xlsx_to_csv", { path });
+        file = { path, name, language: "python" as SupportedLanguage, content: csvContent, modified: false };
+        openFiles.push(file);
+      } catch {
+        file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false };
+        openFiles.push(file);
+      }
+    }
+    if (file.content) {
+      mountTableViewer(file);
+    } else {
+      const container = document.getElementById("editor-container")!;
+      container.innerHTML = `<div class="binary-viewer"><div class="binary-icon">&#128196;</div><div class="binary-name">${escapeHtml(name)}</div><div class="binary-info">Could not read Excel file</div></div>`;
+    }
     renderTabs();
     refreshFileTree();
     return;
@@ -1477,6 +1506,17 @@ async function listenForBackendEvents(): Promise<void> {
 
     const status = exit_code === 0 ? "OK" : `exit code ${exit_code}`;
     appendOutput(`--- Finished (${status}, ${duration_ms}ms) ---\n\n`, "system");
+
+    // Log terminal output for audit trail
+    const truncStdout = stdout.length > 2000 ? stdout.substring(0, 2000) + "...(truncated)" : stdout;
+    const truncStderr = stderr.length > 1000 ? stderr.substring(0, 1000) + "...(truncated)" : stderr;
+    if (stdout) {
+      invoke("log_editor_event", { eventType: "terminal_stdout", detail: truncStdout, charCount: stdout.length, timeDeltaMs: duration_ms });
+    }
+    if (stderr) {
+      invoke("log_editor_event", { eventType: "terminal_stderr", detail: truncStderr, charCount: stderr.length, timeDeltaMs: duration_ms });
+    }
+
     resetRunButton();
   });
 }
@@ -1491,6 +1531,10 @@ function formatEventType(type: string): string {
     code_run: "RUN", code_run_result: "RUN-RESULT",
     recording_start: "REC-START", recording_stop: "REC-STOP",
     file_import: "IMPORT",
+    copy: "COPY",
+    cut: "CUT",
+    terminal_stdout: "STDOUT",
+    terminal_stderr: "STDERR",
     tamper_detected: "TAMPER",
     tamper_new_file: "TAMPER-NEW",
     tamper_deleted: "TAMPER-DEL",
@@ -1642,11 +1686,23 @@ print(f"reverse('hello') = {reverse('hello')}")
 print("\\nFolder import test passed!")
 `;
 
+const DEFAULT_POPUP_TEST = `"""Test: matplotlib popup window"""
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(6, 4))
+plt.plot([1, 4, 9, 16, 25], 'ro-', label='squares')
+plt.title('Popup Test — close this window')
+plt.legend()
+plt.show()
+print("Popup closed successfully!")
+`;
+
 const DEFAULT_NOTEBOOK = JSON.stringify({
   cells: [
     { cell_type: "markdown", source: ["# MINT Exam IDE — Notebook Test\n", "Run each cell to verify."], metadata: {}, outputs: [] },
     { cell_type: "code", source: ["import numpy as np\n", "print(f'NumPy: {np.mean([1,2,3,4,5])}')"], metadata: {}, outputs: [], execution_count: null },
     { cell_type: "code", source: ["import pandas as pd\n", "df = pd.DataFrame({'A': [1,2,3], 'B': [4,5,6]})\n", "print(df)"], metadata: {}, outputs: [], execution_count: null },
+    { cell_type: "code", source: ["import matplotlib\n", "matplotlib.use('Agg')\n", "import matplotlib.pyplot as plt\n", "plt.plot([1,4,9,16], 'ro-')\n", "plt.savefig('nb_plot.png')\n", "plt.close()\n", "print('nb_plot.png saved')"], metadata: {}, outputs: [], execution_count: null },
     { cell_type: "code", source: ["# Intentional error test\n", "print('before error')\n", "print(1/0)"], metadata: {}, outputs: [], execution_count: null },
   ],
   metadata: { kernelspec: { display_name: "Python 3", language: "python", name: "python3" }, language_info: { name: "python" } },

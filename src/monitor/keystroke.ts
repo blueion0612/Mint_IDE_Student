@@ -19,6 +19,35 @@ export function handleEditorInput(event: InputEvent): void {
   const timeDelta = lastInputTime > 0 ? now - lastInputTime : 0;
   lastInputTime = now;
 
+  // Copy event
+  if (event.inputType === "copy") {
+    const preview = event.text.length > 100
+      ? event.text.substring(0, 100).replace(/\n/g, "\\n") + "..."
+      : event.text.replace(/\n/g, "\\n");
+    invoke("log_editor_event", {
+      eventType: "copy",
+      detail: `Copied ${event.text.length} chars: ${preview}`,
+      charCount: event.text.length,
+      timeDeltaMs: timeDelta,
+    });
+    return;
+  }
+
+  // Cut event
+  if (event.inputType === "cut") {
+    const preview = event.text.length > 100
+      ? event.text.substring(0, 100).replace(/\n/g, "\\n") + "..."
+      : event.text.replace(/\n/g, "\\n");
+    invoke("log_editor_event", {
+      eventType: "cut",
+      detail: `Cut ${event.text.length} chars: ${preview}`,
+      charCount: event.text.length,
+      timeDeltaMs: timeDelta,
+    });
+    return;
+  }
+
+  // Paste event
   if (event.inputType === "insertFromPaste") {
     const charCount = event.text.length;
     const eventType = charCount > PASTE_THRESHOLD ? "paste_large" : "paste";

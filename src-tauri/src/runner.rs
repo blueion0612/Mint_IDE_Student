@@ -76,13 +76,21 @@ pub fn execute_code_streaming(
         };
 
         // Spawn with piped stdout/stderr
-        let child = Command::new(&cmd)
-            .args(&args)
+        let mut command = Command::new(&cmd);
+        command.args(&args)
             .current_dir(&dir)
             .env("PYTHONUNBUFFERED", "1")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+
+        // Hide console window on Windows (does NOT affect GUI windows like matplotlib)
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let child = command.spawn();
 
         let mut child = match child {
             Ok(c) => c,

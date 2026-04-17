@@ -2122,6 +2122,7 @@ name = "mint-exam-ide"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "chrono",
  "dirs",
  "hex",

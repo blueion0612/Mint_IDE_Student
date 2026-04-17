@@ -315,15 +315,17 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
     let py_str = py_exe.to_string_lossy().to_string();
 
     // Install common exam packages
+    // Step 1: standard packages
     let packages = [
         "numpy", "pandas", "matplotlib", "seaborn",       // data science
         "scikit-learn", "scipy", "sympy",                  // ML / math
         "Pillow", "opencv-python-headless",                // image processing
         "openpyxl", "requests",                            // Excel / HTTP
+        "tensorflow-cpu",                                   // deep learning (CPU)
     ];
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
-        text: format!("Installing packages: {}...\n", packages.join(", ")),
+        text: "Installing exam packages (numpy, pandas, sklearn, torch, tensorflow, etc.)...\nThis may take a few minutes on first run.\n".to_string(),
     });
 
     let mut args = vec!["-m", "pip", "install", "--quiet"];
@@ -331,6 +333,13 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
         args.push(pkg);
     }
     let _ = silent_cmd(&py_str, &args);
+
+    // Step 2: PyTorch CPU (needs special index URL)
+    let _ = silent_cmd(&py_str, &[
+        "-m", "pip", "install", "--quiet",
+        "torch", "torchvision", "torchaudio",
+        "--index-url", "https://download.pytorch.org/whl/cpu",
+    ]);
 
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),

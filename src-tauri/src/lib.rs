@@ -95,18 +95,17 @@ async fn run_code_sync(
     language: String,
     code: String,
     filename: String,
+    python_path: Option<String>,
 ) -> Result<(String, String, Option<i32>), String> {
-    // Write temp file to workspace dir (for imports) but with dot-prefix to hide from tree
     let cwd = ws.lock().ok().and_then(|g| g.as_ref().map(|w| w.root_path()));
     let work_dir = cwd.clone().unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
     let hidden_name = format!(".{}", filename);
     let file_path = std::path::PathBuf::from(&work_dir).join(&hidden_name);
     std::fs::write(&file_path, &code).map_err(|e| e.to_string())?;
 
-    // Synchronous execution
-    let mut command = std::process::Command::new(
-        runner::find_python_cached(None).unwrap_or("python".to_string())
-    );
+    let py = runner::find_python_cached(python_path.as_deref())
+        .unwrap_or("python".to_string());
+    let mut command = std::process::Command::new(&py);
     command.arg(&file_path);
     command.current_dir(&work_dir);
     command.env("PYTHONUNBUFFERED", "1")
@@ -335,9 +334,25 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
         venv_dir.join("bin").join("python")
     };
 
-    // If venv exists, use it immediately (packages installed by install script)
+    // If venv exists, check if it has packages
     if py_exe.exists() {
-        return Ok(py_exe.to_string_lossy().to_string());
+        let py_str = py_exe.to_string_lossy().to_string();
+        // Quick check: can it import numpy? (installed by install script)
+        let check = silent_cmd(&py_str, &["-c", "import numpy"]);
+        if check.is_some() && check.as_ref().unwrap().status.success() {
+            return Ok(py_str); // Venv with packages — use it
+        }
+        // Venv exists but no packages — don't use it, fall back to system Python
+        let _ = app_handle.emit("run-output", runner::RunOutputLine {
+            stream: "system".to_string(),
+            text: "Exam venv has no packages. Using system Python.\nRun install script to set up packages.\n".to_string(),
+        });
+        // Return system Python instead
+        if let Some(sys_py) = find_system_python() {
+            return Ok(sys_py);
+        }
+        // Even system Python not found — still return venv path as last resort
+        return Ok(py_str);
     }
 
     // Find system python to create venv from

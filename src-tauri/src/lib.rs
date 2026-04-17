@@ -295,7 +295,7 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
     if py_exe.exists() {
         let py_str = py_exe.to_string_lossy().to_string();
         // Quick check: try importing a package added in later versions
-        let check = silent_cmd(&py_str, &["-c", "import seaborn, sklearn, sympy, cv2"]);
+        let check = silent_cmd(&py_str, &["-c", "import seaborn, sklearn, sympy, cv2, torch, tensorflow"]);
         if check.is_some() && check.as_ref().unwrap().status.success() {
             return Ok(py_str); // All packages present
         }

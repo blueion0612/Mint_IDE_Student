@@ -1106,8 +1106,11 @@ body {
 
 .modal-btn {
   width: 100%;
-  padding: 10px;
-  font-size: 14px;
+  padding: 12px;
+  font-size: 15px;
+  font-weight: 700;
   border-radius: 6px;
-  margin-top: 4px;
+  margin-top: 8px;
+  text-align: center;
+  letter-spacing: 0.5px;
 }

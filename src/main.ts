@@ -1246,8 +1246,23 @@ async function listenForBackendEvents(): Promise<void> {
   });
 
   // Code execution finished
-  await listen<{ exit_code: number | null; duration_ms: number }>("run-done", (event) => {
-    const { exit_code, duration_ms } = event.payload;
+  await listen<{ exit_code: number | null; duration_ms: number; stdout: string; stderr: string }>("run-done", (event) => {
+    const { exit_code, duration_ms, stdout, stderr } = event.payload;
+
+    // Fallback: if streaming events didn't show output, display collected output now
+    const outputEl = document.getElementById("output-content")!;
+    const hasContent = outputEl.textContent && outputEl.textContent.length > 50; // more than just the "$ Running..." header
+    if (!hasContent) {
+      if (stdout) appendOutput(stdout, "stdout");
+      if (stderr) {
+        appendOutput(stderr, "error");
+        // Parse error lines from collected stderr
+        for (const line of stderr.split("\n")) {
+          highlightErrorLine(line);
+        }
+      }
+    }
+
     const status = exit_code === 0 ? "OK" : `exit code ${exit_code}`;
     appendOutput(`\n--- Finished (${status}, ${duration_ms}ms) ---\n\n`, "system");
     resetRunButton();

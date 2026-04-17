@@ -52,7 +52,7 @@ pub fn execute_code_streaming(
         }
         if std::fs::write(&file_path, &code).is_err() {
             emit_line(&app_handle, "system", "Failed to write file\n");
-            emit_done(&app_handle, None, 0);
+            emit_done_with_output(&app_handle, None, 0, "", "");
             return;
         }
 
@@ -65,7 +65,7 @@ pub fn execute_code_streaming(
             "java" => build_and_run_java(&dir, &fname, &app_handle),
             _ => {
                 emit_line(&app_handle, "stderr", &format!("Unsupported language: {}\n", lang));
-                emit_done(&app_handle, None, 0);
+                emit_done_with_output(&app_handle, None, 0, "", "");
                 return;
             }
         };
@@ -88,7 +88,7 @@ pub fn execute_code_streaming(
             Ok(c) => c,
             Err(e) => {
                 emit_line(&app_handle, "stderr", &format!("Failed to run '{}': {}. Is it installed?\n", cmd, e));
-                emit_done(&app_handle, None, 0);
+                emit_done_with_output(&app_handle, None, 0, "", "");
                 return;
             }
         };
@@ -112,12 +112,20 @@ pub fn execute_code_streaming(
         let ah1 = app_handle.clone();
         let ah2 = app_handle.clone();
 
+        // Collect output in case streaming events fail
+        let stdout_collected = Arc::new(Mutex::new(String::new()));
+        let stderr_collected = Arc::new(Mutex::new(String::new()));
+        let sc1 = stdout_collected.clone();
+        let sc2 = stderr_collected.clone();
+
         let t1 = thread::spawn(move || {
             if let Some(out) = stdout {
                 let reader = BufReader::new(out);
                 for line in reader.lines() {
                     if let Ok(l) = line {
-                        emit_line(&ah1, "stdout", &format!("{}\n", l));
+                        let text = format!("{}\n", l);
+                        sc1.lock().unwrap().push_str(&text);
+                        emit_line(&ah1, "stdout", &text);
                     }
                 }
             }
@@ -128,7 +136,9 @@ pub fn execute_code_streaming(
                 let reader = BufReader::new(err);
                 for line in reader.lines() {
                     if let Ok(l) = line {
-                        emit_line(&ah2, "stderr", &format!("{}\n", l));
+                        let text = format!("{}\n", l);
+                        sc2.lock().unwrap().push_str(&text);
+                        emit_line(&ah2, "stderr", &text);
                     }
                 }
             }
@@ -137,7 +147,6 @@ pub fn execute_code_streaming(
         t1.join().ok();
         t2.join().ok();
 
-        // Wait for process to finish
         let exit_code = {
             let mut guard = process_handle.lock().unwrap();
             if let Some(ref mut child) = *guard {
@@ -147,14 +156,15 @@ pub fn execute_code_streaming(
             }
         };
 
-        // Clear handle
         {
             let mut guard = process_handle.lock().unwrap();
             *guard = None;
         }
 
         let elapsed = start.elapsed().as_millis() as u64;
-        emit_done(&app_handle, exit_code, elapsed);
+        let stdout_str = stdout_collected.lock().unwrap().clone();
+        let stderr_str = stderr_collected.lock().unwrap().clone();
+        emit_done_with_output(&app_handle, exit_code, elapsed, &stdout_str, &stderr_str);
     });
 }
 
@@ -227,10 +237,19 @@ fn emit_line(app: &AppHandle, stream: &str, text: &str) {
     });
 }
 
-fn emit_done(app: &AppHandle, exit_code: Option<i32>, duration_ms: u64) {
+fn emit_done_with_output(app: &AppHandle, exit_code: Option<i32>, duration_ms: u64, stdout: &str, stderr: &str) {
     #[derive(Clone, Serialize)]
-    struct RunDone { exit_code: Option<i32>, duration_ms: u64 }
-    let _ = app.emit("run-done", RunDone { exit_code, duration_ms });
+    struct RunDone {
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        stdout: String,
+        stderr: String,
+    }
+    let _ = app.emit("run-done", RunDone {
+        exit_code, duration_ms,
+        stdout: stdout.to_string(),
+        stderr: stderr.to_string(),
+    });
 }
 
 fn find_python(python_path: Option<&str>) -> Option<String> {
@@ -309,14 +328,14 @@ fn compile_cmd(compiler: &str, src: &Path, out: &Path, extra_args: &[&str], app:
             if !o.status.success() {
                 emit_line(app, "stderr", "[Compilation Error]\n");
                 emit_line(app, "stderr", &String::from_utf8_lossy(&o.stderr));
-                emit_done(app, o.status.code(), 0);
+                emit_done_with_output(app, o.status.code(), 0, "", "");
                 return None;
             }
             Some(())
         }
         Err(e) => {
             emit_line(app, "stderr", &format!("Failed to run '{}': {}. Is it installed?\n", compiler, e));
-            emit_done(app, None, 0);
+            emit_done_with_output(app, None, 0, "", "");
             None
         }
     }
@@ -348,12 +367,12 @@ fn build_and_run_java(dir: &Path, filename: &str, app: &AppHandle) -> Option<(St
         Ok(o) if !o.status.success() => {
             emit_line(app, "stderr", "[Compilation Error]\n");
             emit_line(app, "stderr", &String::from_utf8_lossy(&o.stderr));
-            emit_done(app, o.status.code(), 0);
+            emit_done_with_output(app, o.status.code(), 0, "", "");
             return None;
         }
         Err(e) => {
             emit_line(app, "stderr", &format!("Failed to run 'javac': {}\n", e));
-            emit_done(app, None, 0);
+            emit_done_with_output(app, None, 0, "", "");
             return None;
         }
         _ => {}

@@ -452,8 +452,8 @@ body {
 }
 
 #editor-container .cm-editor .cm-error-line {
-  background: rgba(243, 139, 168, 0.15);
-  outline-left: 3px solid var(--alert);
+  background: rgba(243, 139, 168, 0.18) !important;
+  border-left: 3px solid var(--alert);
 }
 
 /* ===== Output Panel ===== */

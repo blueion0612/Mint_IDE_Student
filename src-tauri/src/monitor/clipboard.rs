@@ -19,7 +19,7 @@ pub fn start_clipboard_monitor(log: LogHandle, app_handle: AppHandle) {
         let mut last_content = clipboard.get_text().unwrap_or_default();
 
         loop {
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(1000));
 
             let current = match clipboard.get_text() {
                 Ok(text) => text,

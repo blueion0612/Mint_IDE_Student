@@ -167,7 +167,7 @@ function buildToolbar(): void {
     }
   });
 
-  document.getElementById("btn-run")!.addEventListener("click", runCurrentFile);
+  document.getElementById("btn-run")!.onclick = () => runCurrentFile();
   document.getElementById("btn-save")!.addEventListener("click", saveCurrentFile);
   document.getElementById("btn-submit")!.addEventListener("click", submitExam);
 }
@@ -1247,16 +1247,18 @@ async function listenForBackendEvents(): Promise<void> {
 
   // Code execution finished
   await listen<{ exit_code: number | null; duration_ms: number; stdout: string; stderr: string }>("run-done", (event) => {
+    if (!isRunning) return; // Guard: ignore duplicate events
+
     const { exit_code, duration_ms, stdout, stderr } = event.payload;
 
     // Fallback: if streaming events didn't show output, display collected output now
     const outputEl = document.getElementById("output-content")!;
-    const hasContent = outputEl.textContent && outputEl.textContent.length > 50; // more than just the "$ Running..." header
-    if (!hasContent) {
+    const currentText = outputEl.textContent || "";
+    const headerOnly = currentText.split("\n").filter(l => l.trim() && !l.startsWith("$")).length === 0;
+    if (headerOnly) {
       if (stdout) appendOutput(stdout, "stdout");
       if (stderr) {
         appendOutput(stderr, "error");
-        // Parse error lines from collected stderr
         for (const line of stderr.split("\n")) {
           highlightErrorLine(line);
         }
@@ -1264,7 +1266,7 @@ async function listenForBackendEvents(): Promise<void> {
     }
 
     const status = exit_code === 0 ? "OK" : `exit code ${exit_code}`;
-    appendOutput(`\n--- Finished (${status}, ${duration_ms}ms) ---\n\n`, "system");
+    appendOutput(`--- Finished (${status}, ${duration_ms}ms) ---\n\n`, "system");
     resetRunButton();
   });
 }

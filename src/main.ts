@@ -325,6 +325,8 @@ function iconForExt(name: string): string {
   const map: Record<string, string> = {
     py: "Py", js: "JS", ts: "TS", java: "Jv", c: "C", cpp: "C+", h: "H",
     hpp: "H+", json: "{}", txt: "Tx", md: "Md", ipynb: "Nb",
+    png: "Ig", jpg: "Ig", jpeg: "Ig", gif: "Ig", svg: "Ig", webp: "Ig", bmp: "Ig",
+    csv: "Cs", xml: "Xm", html: "Ht", css: "Ss",
   };
   return map[ext] || "??";
 }
@@ -333,6 +335,24 @@ function iconForExt(name: string): string {
 async function openFileByPath(path: string): Promise<void> {
   // Save current editor content
   await syncCurrentEditor();
+
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const imageExts = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp"];
+
+  // Images: don't read as text, go straight to viewer
+  if (imageExts.includes(ext)) {
+    activeFilePath = path;
+    const name = path.split("/").pop() || path;
+    let file = openFiles.find((f) => f.path === path);
+    if (!file) {
+      file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false };
+      openFiles.push(file);
+    }
+    mountImageViewer(file);
+    renderTabs();
+    refreshFileTree();
+    return;
+  }
 
   let file = openFiles.find((f) => f.path === path);
   if (!file) {
@@ -353,11 +373,8 @@ async function openFileByPath(path: string): Promise<void> {
   const selector = document.getElementById("lang-selector") as HTMLSelectElement;
   if (selector) selector.value = file.language;
 
-  const ext = path.split(".").pop()?.toLowerCase() || "";
-  const imageExts = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp"];
-
-  if (imageExts.includes(ext)) {
-    mountImageViewer(file);
+  if (path.endsWith(".ipynb")) {
+    mountNotebookView(file);
   } else if (path.endsWith(".ipynb")) {
     mountNotebookView(file);
   } else {
@@ -797,6 +814,8 @@ function resetRunButton(): void {
   btn.classList.remove("btn-danger");
   btn.classList.add("btn-run");
   btn.onclick = () => runCurrentFile();
+  // Refresh file tree to show newly created files (png, csv, etc.)
+  refreshFileTree();
 }
 
 // Error line highlighting — parse Python traceback "line N"

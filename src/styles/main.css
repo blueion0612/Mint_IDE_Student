@@ -352,10 +352,11 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  background: var(--bg-primary);
 }
 
 .table-info {
-  padding: 8px 14px;
+  padding: 10px 20px;
   font-size: 12px;
   color: var(--text-muted);
   background: var(--bg-tertiary);
@@ -366,13 +367,18 @@ body {
 .table-scroll {
   flex: 1;
   overflow: auto;
+  padding: 12px 16px;
 }
 
 .data-table {
-  width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: 12px;
   font-family: "Cascadia Code", "Fira Code", monospace;
+  margin: 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
 }
 
 .data-table thead {
@@ -385,31 +391,37 @@ body {
   background: var(--bg-surface);
   color: var(--accent);
   font-weight: 600;
-  padding: 6px 12px;
+  padding: 8px 18px;
   text-align: left;
   border-bottom: 2px solid var(--accent);
   white-space: nowrap;
+  font-size: 11px;
+  letter-spacing: 0.3px;
 }
 
 .data-table td {
-  padding: 4px 12px;
-  border-bottom: 1px solid var(--border);
+  padding: 7px 18px;
+  border-bottom: 1px solid rgba(69, 71, 90, 0.4);
   color: var(--text-primary);
-  max-width: 300px;
+  max-width: 250px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.data-table tbody tr:nth-child(even) {
+  background: rgba(49, 50, 68, 0.3);
+}
+
 .data-table tbody tr:hover {
-  background: rgba(137, 180, 250, 0.08);
+  background: rgba(137, 180, 250, 0.1);
 }
 
 .data-table .row-num {
   color: var(--text-muted);
   text-align: right;
-  padding-right: 8px;
-  min-width: 36px;
+  padding-right: 10px;
+  min-width: 40px;
   font-size: 10px;
   background: var(--bg-secondary);
   border-right: 1px solid var(--border);

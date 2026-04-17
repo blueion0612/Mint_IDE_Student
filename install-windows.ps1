@@ -2,7 +2,7 @@
 # PowerShell (관리자):
 #   Set-ExecutionPolicy Bypass -Scope Process -Force; irm https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-windows.ps1 | iex
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 try {
 

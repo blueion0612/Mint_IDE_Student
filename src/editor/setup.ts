@@ -153,6 +153,18 @@ export function createEditor(
   });
 
   const inputListener = EditorView.domEventHandlers({
+    copy(_event: ClipboardEvent, view: EditorView) {
+      if (onInput) {
+        const sel = view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to);
+        onInput({ inputType: "copy", text: sel, from: view.state.selection.main.from, to: view.state.selection.main.to });
+      }
+    },
+    cut(_event: ClipboardEvent, view: EditorView) {
+      if (onInput) {
+        const sel = view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to);
+        onInput({ inputType: "cut", text: sel, from: view.state.selection.main.from, to: view.state.selection.main.to });
+      }
+    },
     beforeinput(event: InputEvent, view: EditorView) {
       if (onInput && event.data) {
         onInput({

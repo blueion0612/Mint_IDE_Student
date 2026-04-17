@@ -519,6 +519,28 @@ fn ws_read_file(ws: State<WorkspaceState>, path: String) -> Result<String, Strin
 }
 
 #[tauri::command]
+fn ws_xlsx_to_csv(ws: State<WorkspaceState>, path: String) -> Result<String, String> {
+    let guard = ws.lock().map_err(|e| e.to_string())?;
+    let workspace = guard.as_ref().ok_or("No workspace initialized")?;
+    let full_path = workspace.resolve_safe_for_write(&path)?;
+    let full_str = full_path.to_string_lossy().to_string();
+
+    // Use Python pandas to convert xlsx to CSV string
+    let py = find_system_python().ok_or("Python not found")?;
+    let script = format!(
+        "import pandas as pd; df = pd.read_excel(r'{}'); print(df.to_csv(index=False))",
+        full_str
+    );
+    let output = silent_cmd(&py, &["-c", &script]);
+    match output {
+        Some(o) if o.status.success() => {
+            Ok(String::from_utf8_lossy(&o.stdout).to_string())
+        }
+        _ => Err("Failed to read Excel file".to_string()),
+    }
+}
+
+#[tauri::command]
 fn ws_read_file_base64(ws: State<WorkspaceState>, path: String) -> Result<String, String> {
     let guard = ws.lock().map_err(|e| e.to_string())?;
     let workspace = guard.as_ref().ok_or("No workspace initialized".to_string())?;
@@ -646,7 +668,8 @@ fn submit_exam(
         let editor_log: Vec<_> = events.iter()
             .filter(|e| matches!(e.event_type.as_str(),
                 "paste" | "paste_large" | "input_burst" | "typing_summary" |
-                "code_run" | "code_run_result"))
+                "code_run" | "code_run_result" | "copy" | "cut" |
+                "terminal_stdout" | "terminal_stderr"))
             .cloned().collect();
 
         let ws_path = std::path::PathBuf::from(&ws_root);
@@ -888,6 +911,7 @@ pub fn run() {
             ws_list_tree,
             ws_read_file,
             ws_read_file_base64,
+            ws_xlsx_to_csv,
             ws_write_file,
             ws_create_dir,
             ws_rename,

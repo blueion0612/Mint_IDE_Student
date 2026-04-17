@@ -1130,6 +1130,31 @@ body {
   color: var(--alert);
 }
 
+.nb-stderr {
+  color: var(--alert);
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 4px;
+}
+
+.nb-cell-image {
+  margin-top: 8px;
+  text-align: center;
+}
+
+.nb-cell-image img {
+  max-width: 100%;
+  max-height: 400px;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+
+.nb-img-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
 /* ===== Student ID Modal ===== */
 #student-id-overlay {
   position: fixed;

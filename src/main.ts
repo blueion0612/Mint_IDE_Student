@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { createEditor, setLanguage, type SupportedLanguage } from "./editor/setup";
+import { createEditor, setLanguage, markErrorLines, clearErrors, type SupportedLanguage } from "./editor/setup";
 import { handleEditorInput, flushTypingSummary } from "./monitor/keystroke";
 import { recordTransaction, setCurrentFile, markNextInputSource, getEditHistoryJSON } from "./monitor/edithistory";
 import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook } from "./editor/notebook";
@@ -722,6 +722,9 @@ async function runCurrentFile(): Promise<void> {
   panel.classList.add("expanded");
 
   document.getElementById("output-content")!.textContent = "";
+  // Clear previous error highlights
+  pendingErrorLines.length = 0;
+  if (editorView) clearErrors(editorView);
   appendOutput(`$ Running ${file.path} (${file.language})\n`, "system");
 
   try {
@@ -756,15 +759,31 @@ function resetRunButton(): void {
 }
 
 // Error line highlighting — parse Python traceback "line N"
-function highlightErrorLine(text: string): void {
-  if (!editorView || !text.includes("line ")) return;
-  const match = text.match(/line (\d+)/);
-  if (!match) return;
-  const lineNum = parseInt(match[1]) - 1; // 0-indexed
-  if (lineNum < 0 || lineNum >= editorView.state.doc.lines) return;
+// Parse error lines from stderr (Python, GCC, Java tracebacks)
+// Patterns: 'File "x.py", line 5' / 'main.c:5:' / 'Main.java:5:'
+const pendingErrorLines: number[] = [];
 
-  // TODO: could add CodeMirror decoration here
-  // For now error lines are visible in the output
+function highlightErrorLine(text: string): void {
+  if (!editorView) return;
+
+  let lineNum: number | null = null;
+
+  // Python: File "xxx", line N
+  const pyMatch = text.match(/line (\d+)/);
+  if (pyMatch) lineNum = parseInt(pyMatch[1]);
+
+  // C/C++/Java: filename:N: or filename:N:N:
+  if (!lineNum) {
+    const cMatch = text.match(/:\s*(\d+)\s*:/);
+    if (cMatch) lineNum = parseInt(cMatch[1]);
+  }
+
+  if (lineNum && lineNum >= 1 && lineNum <= editorView.state.doc.lines) {
+    if (!pendingErrorLines.includes(lineNum)) {
+      pendingErrorLines.push(lineNum);
+      markErrorLines(editorView, [...pendingErrorLines]);
+    }
+  }
 }
 
 // ===== Screen Recording (auto-start) =====

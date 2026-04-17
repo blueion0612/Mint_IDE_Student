@@ -6,6 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{AppHandle, Emitter};
 
+// Cached Python path — found once, reused forever
+static CACHED_PYTHON: Mutex<Option<String>> = Mutex::new(None);
+
 /// Event sent to frontend for each line of output
 #[derive(Debug, Clone, Serialize)]
 pub struct RunOutputLine {
@@ -80,6 +83,8 @@ pub fn execute_code_streaming(
         command.args(&args)
             .current_dir(&dir)
             .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -269,52 +274,89 @@ fn emit_done_with_output(app: &AppHandle, exit_code: Option<i32>, duration_ms: u
 }
 
 fn find_python(python_path: Option<&str>) -> Option<String> {
+    // User-selected path takes priority
     if let Some(py) = python_path {
         return Some(py.to_string());
     }
 
-    let candidates = if cfg!(target_os = "windows") {
-        vec!["python", "python3", "py"]
-    } else {
-        vec!["python3", "python"]
-    };
-
-    for cmd in &candidates {
-        if Command::new(cmd).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
-            return Some(cmd.to_string());
+    // Return cached path if available (instant)
+    if let Ok(cache) = CACHED_PYTHON.lock() {
+        if let Some(ref cached) = *cache {
+            return Some(cached.clone());
         }
     }
 
-    // Windows: scan common locations
+    // First-time discovery
+    let found = discover_python();
+    if let Some(ref py) = found {
+        if let Ok(mut cache) = CACHED_PYTHON.lock() {
+            *cache = Some(py.clone());
+        }
+    }
+    found
+}
+
+fn discover_python() -> Option<String> {
+    // Fast: check PATH first (no subprocess spawn for exists-check)
     #[cfg(target_os = "windows")]
     {
+        // Check well-known Windows paths by file existence (no process spawn = instant)
         let home = std::env::var("USERPROFILE").unwrap_or_default();
-        for dir_name in ["anaconda3", "miniconda3", "Anaconda3", "Miniconda3"] {
-            let py = format!("{}\\{}\\python.exe", home, dir_name);
-            if std::path::Path::new(&py).exists() { return Some(py); }
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+
+        let direct_paths = [
+            format!("{}\\AppData\\Local\\Programs\\Python\\Python312\\python.exe", home),
+            format!("{}\\AppData\\Local\\Programs\\Python\\Python311\\python.exe", home),
+            format!("{}\\AppData\\Local\\Programs\\Python\\Python310\\python.exe", home),
+            format!("{}\\anaconda3\\python.exe", home),
+            format!("{}\\miniconda3\\python.exe", home),
+            "C:\\Python312\\python.exe".to_string(),
+            "C:\\Python311\\python.exe".to_string(),
+        ];
+
+        for p in &direct_paths {
+            if std::path::Path::new(p).exists() {
+                return Some(p.clone());
+            }
         }
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let base = std::path::PathBuf::from(local).join("Programs").join("Python");
-            if let Ok(entries) = std::fs::read_dir(&base) {
-                for entry in entries.flatten() {
-                    let py = entry.path().join("python.exe");
-                    if py.exists() { return Some(py.to_string_lossy().to_string()); }
-                }
+
+        // Fallback: try PATH commands (slower, spawns process)
+        use std::os::windows::process::CommandExt;
+        for cmd in ["python", "py"] {
+            if let Ok(out) = Command::new(cmd)
+                .arg("--version")
+                .stdout(Stdio::null()).stderr(Stdio::null())
+                .creation_flags(0x08000000)
+                .status()
+            {
+                if out.success() { return Some(cmd.to_string()); }
+            }
+        }
+
+        // Scan LOCALAPPDATA
+        let base = std::path::PathBuf::from(&local).join("Programs").join("Python");
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let py = entry.path().join("python.exe");
+                if py.exists() { return Some(py.to_string_lossy().to_string()); }
             }
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "windows"))]
     {
+        // macOS/Linux: check common paths by file existence
         let home = std::env::var("HOME").unwrap_or_default();
-        for p in [
-            "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3",
-        ] {
+        let paths = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3",
+            &format!("{}/anaconda3/bin/python", home),
+            &format!("{}/miniconda3/bin/python", home),
+            &format!("{}/miniforge3/bin/python", home),
+        ];
+        for p in paths {
             if std::path::Path::new(p).exists() { return Some(p.to_string()); }
-        }
-        for name in ["anaconda3", "miniconda3", "miniforge3"] {
-            let py = format!("{}/{}/bin/python", home, name);
-            if std::path::Path::new(&py).exists() { return Some(py); }
         }
     }
 

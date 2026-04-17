@@ -83,17 +83,16 @@ if ($pyCmd) {
     Write-Host "    numpy, pandas, matplotlib, seaborn, scikit-learn, scipy, sympy," -ForegroundColor DarkGray
     Write-Host "    Pillow, opencv, openpyxl, requests, torch, tensorflow" -ForegroundColor DarkGray
 
-    # Standard packages
-    & $venvPy -m pip install --upgrade pip 2>&1 | Out-Null
-    & $venvPy -m pip install numpy pandas matplotlib seaborn scikit-learn scipy sympy Pillow opencv-python-headless openpyxl requests 2>&1 | Out-Null
+    # All pip/python commands go through cmd /c ... 2>NUL
+    # to prevent TensorFlow's C++ stderr from leaking into PowerShell
+    cmd /c "`"$venvPy`" -m pip install --upgrade pip 2>NUL" | Out-Null
+    cmd /c "`"$venvPy`" -m pip install numpy pandas matplotlib seaborn scikit-learn scipy sympy Pillow opencv-python-headless openpyxl requests 2>NUL" | Out-Null
     Write-Host "  [OK] Core packages" -ForegroundColor Green
 
-    # PyTorch CPU
     Write-Host "  Installing PyTorch (CPU)..."
-    & $venvPy -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu 2>&1 | Out-Null
+    cmd /c "`"$venvPy`" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu 2>NUL" | Out-Null
     Write-Host "  [OK] PyTorch" -ForegroundColor Green
 
-    # TensorFlow CPU
     Write-Host "  Installing TensorFlow (CPU)..."
     cmd /c "`"$venvPy`" -m pip install tensorflow-cpu 2>NUL" | Out-Null
     Write-Host "  [OK] TensorFlow" -ForegroundColor Green

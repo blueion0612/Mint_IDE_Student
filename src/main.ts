@@ -102,6 +102,18 @@ async function initializeApp(): Promise<void> {
 
   document.addEventListener("click", closeContextMenu);
 
+  // Keyboard shortcuts
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+      e.preventDefault();
+      saveCurrentFile();
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === "r") {
+      e.preventDefault();
+      runCurrentFile();
+    }
+  });
+
   document.getElementById("btn-sidebar-new-file")!.addEventListener("click", () => promptNewFile(""));
   document.getElementById("btn-sidebar-new-folder")!.addEventListener("click", () => promptNewFolder(""));
   document.getElementById("btn-sidebar-new-notebook")!.addEventListener("click", () => promptNewNotebook(""));
@@ -341,7 +353,12 @@ async function openFileByPath(path: string): Promise<void> {
   const selector = document.getElementById("lang-selector") as HTMLSelectElement;
   if (selector) selector.value = file.language;
 
-  if (path.endsWith(".ipynb")) {
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const imageExts = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp"];
+
+  if (imageExts.includes(ext)) {
+    mountImageViewer(file);
+  } else if (path.endsWith(".ipynb")) {
     mountNotebookView(file);
   } else {
     clearNotebook();
@@ -441,6 +458,30 @@ function mountEditor(file: OpenFile): void {
       recordTransaction(changes, userEvent);
     },
   );
+}
+
+function mountImageViewer(file: OpenFile): void {
+  const container = document.getElementById("editor-container")!;
+  container.innerHTML = "";
+  editorView = null;
+  clearNotebook();
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "image-viewer";
+
+  // Load image as base64 from workspace
+  invoke<string>("ws_read_file_base64", { path: file.path }).then((base64) => {
+    const ext = file.path.split(".").pop()?.toLowerCase() || "png";
+    const mime = ext === "svg" ? "image/svg+xml" : `image/${ext === "jpg" ? "jpeg" : ext}`;
+    wrapper.innerHTML = `
+      <div class="image-viewer-label">${escapeHtml(file.name)}</div>
+      <img src="data:${mime};base64,${base64}" class="image-preview" />
+    `;
+  }).catch(() => {
+    wrapper.innerHTML = `<div class="image-viewer-label">Cannot display image</div>`;
+  });
+
+  container.appendChild(wrapper);
 }
 
 function mountNotebookView(file: OpenFile): void {

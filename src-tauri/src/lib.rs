@@ -494,6 +494,16 @@ fn ws_read_file(ws: State<WorkspaceState>, path: String) -> Result<String, Strin
 }
 
 #[tauri::command]
+fn ws_read_file_base64(ws: State<WorkspaceState>, path: String) -> Result<String, String> {
+    let guard = ws.lock().map_err(|e| e.to_string())?;
+    let workspace = guard.as_ref().ok_or("No workspace initialized".to_string())?;
+    let full_path = workspace.resolve_safe_for_write(&path)?;
+    let data = std::fs::read(&full_path).map_err(|e| e.to_string())?;
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+}
+
+#[tauri::command]
 fn ws_write_file(ws: State<WorkspaceState>, kw: State<KnownWrites>, path: String, content: String) -> Result<(), String> {
     mark_known_write(&kw, &path);
     let guard = ws.lock().map_err(|e| e.to_string())?;
@@ -852,6 +862,7 @@ pub fn run() {
             init_workspace,
             ws_list_tree,
             ws_read_file,
+            ws_read_file_base64,
             ws_write_file,
             ws_create_dir,
             ws_rename,

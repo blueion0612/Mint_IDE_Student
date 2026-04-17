@@ -348,7 +348,26 @@ async function openFileByPath(path: string): Promise<void> {
 
   const ext = path.split(".").pop()?.toLowerCase() || "";
   const imageExts = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp"];
+  const tableExts = ["csv", "tsv"];
   const binaryExts = ["xlsx", "xls", "docx", "pdf", "zip", "tar", "gz", "exe", "dll", "so", "pyc"];
+
+  // CSV/TSV: render as table
+  if (tableExts.includes(ext)) {
+    activeFilePath = path;
+    const name = path.split("/").pop() || path;
+    let file = openFiles.find((f) => f.path === path);
+    if (!file) {
+      try {
+        const content = await invoke<string>("ws_read_file", { path });
+        file = { path, name, language: "python" as SupportedLanguage, content, modified: false };
+        openFiles.push(file);
+      } catch { return; }
+    }
+    mountTableViewer(file);
+    renderTabs();
+    refreshFileTree();
+    return;
+  }
 
   // Binary files: show info only
   if (binaryExts.includes(ext)) {
@@ -507,6 +526,103 @@ function mountEditor(file: OpenFile): void {
       recordTransaction(changes, userEvent);
     },
   );
+}
+
+function mountTableViewer(file: OpenFile): void {
+  const container = document.getElementById("editor-container")!;
+  container.innerHTML = "";
+  editorView = null;
+  clearNotebook();
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "table-viewer";
+
+  const sep = file.path.endsWith(".tsv") ? "\t" : ",";
+  const lines = file.content.split("\n").filter(l => l.trim());
+  if (lines.length === 0) {
+    wrapper.innerHTML = '<div class="binary-info">Empty file</div>';
+    container.appendChild(wrapper);
+    return;
+  }
+
+  // Parse CSV (handle quoted fields)
+  const parseRow = (line: string): string[] => {
+    const result: string[] = [];
+    let current = "";
+    let inQuotes = false;
+    for (const ch of line) {
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === sep && !inQuotes) { result.push(current.trim()); current = ""; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  };
+
+  const headers = parseRow(lines[0]);
+  const rows = lines.slice(1).map(parseRow);
+
+  // Info bar
+  const info = document.createElement("div");
+  info.className = "table-info";
+  info.textContent = `${file.name} — ${rows.length} rows, ${headers.length} columns`;
+  wrapper.appendChild(info);
+
+  // Table
+  const tableWrap = document.createElement("div");
+  tableWrap.className = "table-scroll";
+
+  const table = document.createElement("table");
+  table.className = "data-table";
+
+  // Header
+  const thead = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  // Row number column
+  const thNum = document.createElement("th");
+  thNum.className = "row-num";
+  thNum.textContent = "#";
+  headerRow.appendChild(thNum);
+  for (const h of headers) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    headerRow.appendChild(th);
+  }
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  // Body (max 500 rows)
+  const tbody = document.createElement("tbody");
+  const maxRows = Math.min(rows.length, 500);
+  for (let i = 0; i < maxRows; i++) {
+    const tr = document.createElement("tr");
+    const tdNum = document.createElement("td");
+    tdNum.className = "row-num";
+    tdNum.textContent = String(i + 1);
+    tr.appendChild(tdNum);
+    for (let j = 0; j < headers.length; j++) {
+      const td = document.createElement("td");
+      td.textContent = rows[i]?.[j] ?? "";
+      // Right-align numbers
+      if (rows[i]?.[j] && !isNaN(Number(rows[i][j]))) {
+        td.className = "num-cell";
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  tableWrap.appendChild(table);
+  wrapper.appendChild(tableWrap);
+
+  if (rows.length > 500) {
+    const more = document.createElement("div");
+    more.className = "table-info";
+    more.textContent = `Showing 500 of ${rows.length} rows`;
+    wrapper.appendChild(more);
+  }
+
+  container.appendChild(wrapper);
 }
 
 function mountImageViewer(file: OpenFile): void {

@@ -93,22 +93,17 @@ if ($pyCmd) {
     & $venvPy -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu 2>&1 | Out-Null
     Write-Host "  [OK] PyTorch" -ForegroundColor Green
 
-    # TensorFlow CPU (stderr warnings are normal — suppress completely)
+    # TensorFlow CPU
     Write-Host "  Installing TensorFlow (CPU)..."
-    & $venvPy -m pip install tensorflow-cpu 2>&1 | Out-String | Out-Null
+    cmd /c "`"$venvPy`" -m pip install tensorflow-cpu 2>NUL" | Out-Null
     Write-Host "  [OK] TensorFlow" -ForegroundColor Green
 
-    # Verify (skip tensorflow import to avoid C++ stderr warning)
-    $check = & $venvPy -c "import numpy,pandas,matplotlib,seaborn,sklearn,scipy,sympy,cv2,torch; print('ALL OK')" 2>&1 | Out-String
+    # Verify
+    $check = cmd /c "`"$venvPy`" -c `"import numpy,pandas,matplotlib,seaborn,sklearn,scipy,sympy,cv2,torch; print('ALL OK')`" 2>NUL"
     if ($check -match "ALL OK") {
         Write-Host "  All packages verified!" -ForegroundColor Green
     } else {
         Write-Host "  Warning: some packages may have failed" -ForegroundColor Yellow
-    }
-    # TensorFlow verified separately via pip list
-    $tfCheck = & $venvPy -m pip show tensorflow-cpu 2>&1 | Out-String
-    if ($tfCheck -match "Version") {
-        Write-Host "  TensorFlow verified via pip" -ForegroundColor Green
     }
 } else {
     Write-Host "  [SKIP] Python not found — exam venv not created" -ForegroundColor Yellow

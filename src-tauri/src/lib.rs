@@ -238,20 +238,24 @@ fn detect_pythons() -> Result<Vec<PythonInfo>, String> {
     Ok(results)
 }
 
+fn silent_cmd(cmd: &str, args: &[&str]) -> Option<std::process::Output> {
+    let mut command = std::process::Command::new(cmd);
+    command.args(args);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    command.output().ok()
+}
+
 fn probe_python(cmd: &str) -> Option<PythonInfo> {
-    let output = std::process::Command::new(cmd)
-        .args(["--version"])
-        .output()
-        .ok()?;
+    let output = silent_cmd(cmd, &["--version"])?;
     let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let ver = if ver.is_empty() { String::from_utf8_lossy(&output.stderr).trim().to_string() } else { ver };
     if ver.is_empty() { return None; }
 
-    // Get the real path
-    let path_output = std::process::Command::new(cmd)
-        .args(["-c", "import sys; print(sys.executable)"])
-        .output()
-        .ok()?;
+    let path_output = silent_cmd(cmd, &["-c", "import sys; print(sys.executable)"])?;
     let real_path = String::from_utf8_lossy(&path_output.stdout).trim().to_string();
 
     Some(PythonInfo {
@@ -268,6 +272,119 @@ fn save_code_history(ws: State<WorkspaceState>, history_json: String) -> Result<
     let guard = ws.lock().map_err(|e| e.to_string())?;
     let workspace = guard.as_ref().ok_or("No workspace")?;
     workspace.write_file("_log_code_history.json", &history_json)
+}
+
+// ===== Exam Python Environment =====
+
+/// Create a dedicated Python venv for the exam with common libraries pre-installed.
+/// Returns the path to the venv's python executable.
+#[tauri::command]
+fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
+    let venv_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
+        .join("MINT_Exam_IDE")
+        .join("exam-venv");
+
+    let py_exe = if cfg!(windows) {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python")
+    };
+
+    // If venv already exists and has python, skip creation
+    if py_exe.exists() {
+        return Ok(py_exe.to_string_lossy().to_string());
+    }
+
+    // Find system python to create venv from
+    let sys_python = find_system_python()
+        .ok_or("Python not found. Please install Python first.")?;
+
+    let _ = app_handle.emit("run-output", runner::RunOutputLine {
+        stream: "system".to_string(),
+        text: format!("Setting up exam Python environment...\nUsing: {}\n", sys_python),
+    });
+
+    // Create venv
+    let venv_str = venv_dir.to_string_lossy().to_string();
+    let output = silent_cmd(&sys_python, &["-m", "venv", &venv_str]);
+    if output.is_none() || !output.as_ref().unwrap().status.success() {
+        return Err("Failed to create Python venv".to_string());
+    }
+
+    let py_str = py_exe.to_string_lossy().to_string();
+
+    // Install common exam packages
+    let packages = ["numpy", "matplotlib", "pandas"];
+    let _ = app_handle.emit("run-output", runner::RunOutputLine {
+        stream: "system".to_string(),
+        text: format!("Installing packages: {}...\n", packages.join(", ")),
+    });
+
+    let mut args = vec!["-m", "pip", "install", "--quiet"];
+    for pkg in &packages {
+        args.push(pkg);
+    }
+    let _ = silent_cmd(&py_str, &args);
+
+    let _ = app_handle.emit("run-output", runner::RunOutputLine {
+        stream: "system".to_string(),
+        text: "Exam Python environment ready!\n".to_string(),
+    });
+
+    Ok(py_str)
+}
+
+fn find_system_python() -> Option<String> {
+    let candidates = if cfg!(target_os = "windows") {
+        vec!["python", "python3", "py"]
+    } else {
+        vec!["python3", "python"]
+    };
+    for cmd in &candidates {
+        if let Some(out) = silent_cmd(cmd, &["--version"]) {
+            if out.status.success() {
+                return Some(cmd.to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        for name in ["anaconda3", "miniconda3", "Anaconda3", "Miniconda3"] {
+            let py = format!("{}\\{}\\python.exe", home, name);
+            if std::path::Path::new(&py).exists() { return Some(py); }
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let base = std::path::PathBuf::from(local).join("Programs").join("Python");
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let py = entry.path().join("python.exe");
+                    if py.exists() { return Some(py.to_string_lossy().to_string()); }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Log when student changes Python environment
+#[tauri::command]
+fn log_python_change(
+    state: State<AppState>,
+    app_handle: tauri::AppHandle,
+    from_env: String,
+    to_env: String,
+) {
+    let event = ActivityEvent::new(
+        "python_env_changed",
+        &format!("Python environment changed: {} → {}", from_env, to_env),
+        None, None,
+    );
+    state.activity_log.lock().unwrap().add_event(event.clone());
+    let _ = app_handle.emit("activity-event", &event);
 }
 
 // ===== Import File from outside =====
@@ -517,23 +634,49 @@ fn submit_exam(
     std::fs::create_dir_all(&submit_dir)
         .map_err(|e| format!("Failed to create submission folder: {}", e))?;
 
-    // 5. Encryption password = SHA-256 hash of student ID
+    // 5. Encryption password
     let password = hash_student_id(&student_id);
+    let password_bytes = password.as_bytes().to_vec();
 
-    // 6. ZIP 1: Code + Log (AES-256 encrypted)
+    // 6. Code + Logs → AES-256 zip (small files, fast)
     let code_zip_path = submit_dir.join("submission_code.zip");
     create_encrypted_zip(&ws_root, &code_zip_path, &password)?;
 
-    // 7. ZIP 2: Video recordings (AES-256 encrypted)
-    let video_zip_path = submit_dir.join("submission_video.zip");
+    // 7. Video → copy + obfuscate headers (instant, no re-encoding/zipping)
+    //    Much faster than zipping 300MB+ video files
+    let video_dir = submit_dir.join("video");
+    let _ = std::fs::create_dir_all(&video_dir);
     let rec_dir = dirs::home_dir().unwrap_or_default().join("MINT_Exam_Recordings");
-    create_encrypted_video_zip(&rec_dir, &video_zip_path, &password)?;
+    let mut video_count = 0u32;
 
-    // 8. Write a manifest with student info (unencrypted, for identification)
+    if rec_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&rec_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext == "mp4" || ext == "mov" {
+                    let dest = video_dir.join(path.file_name().unwrap());
+                    // Move (not copy) for speed — if same filesystem, instant
+                    if std::fs::rename(&path, &dest).is_err() {
+                        // Different filesystem: fall back to copy
+                        let _ = std::fs::copy(&path, &dest);
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    // Obfuscate header so student can't play it
+                    let _ = recorder::obfuscate_video(&dest, &password_bytes);
+                    video_count += 1;
+                }
+            }
+        }
+    }
+
+    // 8. Manifest
     let manifest = serde_json::json!({
         "student_id": student_id,
         "timestamp": timestamp,
-        "hash_check": &password[..16], // first 16 chars for verification, not the full key
+        "hash_check": &password[..16],
+        "video_count": video_count,
+        "video_obfuscated": true,
     });
     let _ = std::fs::write(
         submit_dir.join("manifest.json"),
@@ -542,9 +685,8 @@ fn submit_exam(
 
     let folder_str = submit_dir.to_string_lossy().to_string();
     let code_str = code_zip_path.to_string_lossy().to_string();
-    let video_str = video_zip_path.to_string_lossy().to_string();
+    let video_str = video_dir.to_string_lossy().to_string();
 
-    // 9. Log
     let event = ActivityEvent::new(
         "exam_submitted",
         &format!("Submitted by {}: {}", student_id, folder_str),
@@ -718,6 +860,8 @@ pub fn run() {
             ws_root_path,
             ws_import_file,
             detect_pythons,
+            setup_exam_python,
+            log_python_change,
             save_code_history,
             submit_exam,
         ])

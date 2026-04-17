@@ -125,6 +125,7 @@ async function initializeApp(): Promise<void> {
   });
 
   startAutoRecording();
+  setupExamPython();
 }
 
 // ===== Toolbar =====
@@ -767,6 +768,18 @@ function highlightErrorLine(text: string): void {
 }
 
 // ===== Screen Recording (auto-start) =====
+async function setupExamPython(): Promise<void> {
+  try {
+    const examPyPath = await invoke<string>("setup_exam_python");
+    selectedPythonPath = examPyPath;
+    const pyEl = document.getElementById("status-python");
+    if (pyEl) pyEl.textContent = "Python: Exam Env";
+  } catch (e) {
+    console.warn("Exam Python setup failed:", e);
+    // Fall back to system Python — not an error
+  }
+}
+
 async function startAutoRecording(): Promise<void> {
   const indicator = document.getElementById("rec-indicator")!;
   try {
@@ -1126,9 +1139,11 @@ function showPythonSelector(): void {
   sysItem.className = `py-option${selectedPythonPath === null ? " active" : ""}`;
   sysItem.textContent = "System Default";
   sysItem.addEventListener("click", () => {
+    const oldPath = selectedPythonPath || "exam-env";
     selectedPythonPath = null;
     anchor.textContent = "Python: System";
     popup.remove();
+    invoke("log_python_change", { fromEnv: oldPath, toEnv: "system" });
   });
   popup.appendChild(sysItem);
 
@@ -1138,9 +1153,11 @@ function showPythonSelector(): void {
     item.className = `py-option${selectedPythonPath === py.path ? " active" : ""}`;
     item.innerHTML = `<span>${escapeHtml(py.label)}</span><span class="py-path">${escapeHtml(py.path)}</span>`;
     item.addEventListener("click", () => {
+      const oldPath = selectedPythonPath || "exam-env";
       selectedPythonPath = py.path;
       anchor.textContent = `Python: ${py.label}`;
       popup.remove();
+      invoke("log_python_change", { fromEnv: oldPath, toEnv: py.path });
     });
     popup.appendChild(item);
   }

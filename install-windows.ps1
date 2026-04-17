@@ -4,6 +4,18 @@
 
 $ErrorActionPreference = "Continue"
 
+# Check admin
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host ""
+    Write-Host "  [!] Not running as Administrator." -ForegroundColor Yellow
+    Write-Host "  Some installations may fail. Please re-run as Administrator:" -ForegroundColor Yellow
+    Write-Host '  Right-click PowerShell > "Run as Administrator"' -ForegroundColor Cyan
+    Write-Host ""
+    $continue = Read-Host "Continue anyway? (y/N)"
+    if ($continue -ne "y" -and $continue -ne "Y") { exit 0 }
+}
+
 try {
 
 Write-Host ""

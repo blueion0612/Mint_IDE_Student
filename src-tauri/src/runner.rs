@@ -85,6 +85,8 @@ pub fn execute_code_streaming(
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1")
+            .env("TF_CPP_MIN_LOG_LEVEL", "3")      // suppress TensorFlow warnings
+            .env("TF_ENABLE_ONEDNN_OPTS", "0")      // suppress oneDNN messages
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

@@ -291,20 +291,9 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
         venv_dir.join("bin").join("python")
     };
 
-    // If venv exists, check if all packages are installed
+    // If venv exists, use it immediately (packages installed by install script)
     if py_exe.exists() {
-        let py_str = py_exe.to_string_lossy().to_string();
-        // Quick check: try importing a package added in later versions
-        let check = silent_cmd(&py_str, &["-c", "import seaborn, sklearn, sympy, cv2, torch, tensorflow"]);
-        if check.is_some() && check.as_ref().unwrap().status.success() {
-            return Ok(py_str); // All packages present
-        }
-        // Missing packages — fall through to install
-        let _ = app_handle.emit("run-output", runner::RunOutputLine {
-            stream: "system".to_string(),
-            text: "Updating exam Python packages...\n".to_string(),
-        });
-        return install_exam_packages(&py_str, &app_handle);
+        return Ok(py_exe.to_string_lossy().to_string());
     }
 
     // Find system python to create venv from
@@ -324,7 +313,14 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
     }
 
     let py_str = py_exe.to_string_lossy().to_string();
-    install_exam_packages(&py_str, &app_handle)
+
+    // Only create venv — packages are installed by install-windows.ps1 / install-mac.sh
+    let _ = app_handle.emit("run-output", runner::RunOutputLine {
+        stream: "system".to_string(),
+        text: "Exam venv created. Run install script to add packages.\n".to_string(),
+    });
+
+    Ok(py_str)
 }
 
 fn install_exam_packages(py_str: &str, app_handle: &tauri::AppHandle) -> Result<String, String> {

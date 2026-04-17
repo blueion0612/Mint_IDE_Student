@@ -110,14 +110,13 @@ pub fn execute_code_streaming(
         }
 
         let ah1 = app_handle.clone();
-        let ah2 = app_handle.clone();
 
-        // Collect output in case streaming events fail
         let stdout_collected = Arc::new(Mutex::new(String::new()));
         let stderr_collected = Arc::new(Mutex::new(String::new()));
         let sc1 = stdout_collected.clone();
         let sc2 = stderr_collected.clone();
 
+        // stdout: stream in real-time (line by line)
         let t1 = thread::spawn(move || {
             if let Some(out) = stdout {
                 let reader = BufReader::new(out);
@@ -131,21 +130,30 @@ pub fn execute_code_streaming(
             }
         });
 
+        // stderr: collect silently, display AFTER stdout finishes
+        // This prevents interleaving (traceback mixed into print output)
         let t2 = thread::spawn(move || {
             if let Some(err) = stderr {
                 let reader = BufReader::new(err);
                 for line in reader.lines() {
                     if let Ok(l) = line {
-                        let text = format!("{}\n", l);
-                        sc2.lock().unwrap().push_str(&text);
-                        emit_line(&ah2, "stderr", &text);
+                        sc2.lock().unwrap().push_str(&format!("{}\n", l));
                     }
                 }
             }
         });
 
+        // Wait for stdout to finish first
         t1.join().ok();
         t2.join().ok();
+
+        // Now emit stderr all at once (after stdout)
+        {
+            let err_str = stderr_collected.lock().unwrap().clone();
+            if !err_str.is_empty() {
+                emit_line(&app_handle, "stderr", &err_str);
+            }
+        }
 
         let exit_code = {
             let mut guard = process_handle.lock().unwrap();

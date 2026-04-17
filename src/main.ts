@@ -125,6 +125,14 @@ async function initializeApp(): Promise<void> {
     // Default test files
     await invoke("ws_write_file", { path: "main.py", content: DEFAULT_MAIN_PY });
     await invoke("ws_write_file", { path: "test_all.py", content: DEFAULT_TEST_PY });
+    // Folder import test
+    await invoke("ws_create_dir", { path: "utils" });
+    await invoke("ws_write_file", { path: "utils/__init__.py", content: "from .math_helper import add, multiply\nfrom .text_helper import greet\n" });
+    await invoke("ws_write_file", { path: "utils/math_helper.py", content: DEFAULT_MATH_HELPER });
+    await invoke("ws_write_file", { path: "utils/text_helper.py", content: DEFAULT_TEXT_HELPER });
+    await invoke("ws_write_file", { path: "test_import.py", content: DEFAULT_IMPORT_TEST });
+    // Notebook test
+    await invoke("ws_write_file", { path: "test_notebook.ipynb", content: DEFAULT_NOTEBOOK });
     await refreshFileTree();
     openFileByPath("main.py");
   } catch (e) {
@@ -340,6 +348,28 @@ async function openFileByPath(path: string): Promise<void> {
 
   const ext = path.split(".").pop()?.toLowerCase() || "";
   const imageExts = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "webp"];
+  const binaryExts = ["xlsx", "xls", "docx", "pdf", "zip", "tar", "gz", "exe", "dll", "so", "pyc"];
+
+  // Binary files: show info only
+  if (binaryExts.includes(ext)) {
+    activeFilePath = path;
+    const name = path.split("/").pop() || path;
+    let file = openFiles.find((f) => f.path === path);
+    if (!file) {
+      file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false };
+      openFiles.push(file);
+    }
+    const container = document.getElementById("editor-container")!;
+    container.innerHTML = `<div class="binary-viewer">
+      <div class="binary-icon">&#128196;</div>
+      <div class="binary-name">${escapeHtml(name)}</div>
+      <div class="binary-info">${ext.toUpperCase()} file — binary format, cannot preview in editor</div>
+    </div>`;
+    editorView = null;
+    renderTabs();
+    refreshFileTree();
+    return;
+  }
 
   // Images: don't read as text, go straight to viewer
   if (imageExts.includes(ext)) {
@@ -1463,6 +1493,49 @@ except:
 
 print("\\n=== ALL TESTS PASSED ===")
 `;
+
+const DEFAULT_MATH_HELPER = `def add(a, b):
+    return a + b
+
+def multiply(a, b):
+    return a * b
+
+def factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+`;
+
+const DEFAULT_TEXT_HELPER = `def greet(name):
+    return f"Hello, {name}!"
+
+def reverse(text):
+    return text[::-1]
+`;
+
+const DEFAULT_IMPORT_TEST = `"""Test: folder import (utils package)"""
+from utils import add, multiply, greet
+from utils.math_helper import factorial
+from utils.text_helper import reverse
+
+print(f"add(3, 5) = {add(3, 5)}")
+print(f"multiply(4, 7) = {multiply(4, 7)}")
+print(f"factorial(6) = {factorial(6)}")
+print(f"greet('MINT') = {greet('MINT')}")
+print(f"reverse('hello') = {reverse('hello')}")
+print("\\nFolder import test passed!")
+`;
+
+const DEFAULT_NOTEBOOK = JSON.stringify({
+  cells: [
+    { cell_type: "markdown", source: ["# MINT Exam IDE — Notebook Test\\n", "Run each cell to verify."], metadata: {}, outputs: [] },
+    { cell_type: "code", source: ["import numpy as np\\n", "print(f'NumPy: {np.mean([1,2,3,4,5])}')"], metadata: {}, outputs: [], execution_count: null },
+    { cell_type: "code", source: ["import pandas as pd\\n", "df = pd.DataFrame({'A': [1,2,3], 'B': [4,5,6]})\\n", "print(df)"], metadata: {}, outputs: [], execution_count: null },
+    { cell_type: "code", source: ["# Intentional error test\\n", "print('before error')\\n", "print(1/0)"], metadata: {}, outputs: [], execution_count: null },
+  ],
+  metadata: { kernelspec: { display_name: "Python 3", language: "python", name: "python3" }, language_info: { name: "python" } },
+  nbformat: 4, nbformat_minor: 5,
+}, null, 1);
 
 function langFromExtension(name: string): SupportedLanguage | null {
   const ext = name.split(".").pop()?.toLowerCase();

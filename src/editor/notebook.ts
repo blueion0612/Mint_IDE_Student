@@ -1,6 +1,7 @@
 import { EditorView } from "@codemirror/view";
 import { createEditor, type SupportedLanguage } from "./setup";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { recordTransaction, setCurrentFile, markNextInputSource } from "../monitor/edithistory";
 import { handleEditorInput } from "../monitor/keystroke";
 
@@ -216,75 +217,85 @@ async function runCell(idx: number): Promise<void> {
   const outputEl = cell.element.querySelector(".nb-cell-output") as HTMLElement;
   outputEl.textContent = "Running...";
   outputEl.className = "nb-cell-output running";
+  cell.output = "";
+
+  // Listen for streaming output
+  const unlisten1 = await listen<{ stream: string; text: string }>("run-output", (event) => {
+    cell.output += event.payload.text;
+    outputEl.textContent = cell.output;
+    outputEl.className = `nb-cell-output ${event.payload.stream === "stderr" ? "error" : "success"}`;
+  });
+
+  const unlisten2 = await listen<{ exit_code: number | null }>("run-done", () => {
+    cell.running = false;
+    if (!cell.output) outputEl.textContent = "(no output)";
+    unlisten1();
+    unlisten2();
+  });
 
   try {
-    const result = await invoke<{ stdout: string; stderr: string; exit_code: number | null }>("run_code", {
+    await invoke("run_code", {
       language: "python",
       code,
       filename: notebookPath.replace(".ipynb", "_cell.py"),
       pythonPath: null,
     });
-
-    let out = "";
-    if (result.stdout) out += result.stdout;
-    if (result.stderr) out += result.stderr;
-    cell.output = out;
-    outputEl.textContent = out || "(no output)";
-    outputEl.className = `nb-cell-output ${result.exit_code === 0 ? "success" : "error"}`;
   } catch (e) {
     cell.output = String(e);
     outputEl.textContent = String(e);
     outputEl.className = "nb-cell-output error";
+    cell.running = false;
+    unlisten1();
+    unlisten2();
   }
-
-  cell.running = false;
 }
 
 async function runAllCells(): Promise<void> {
-  // Run cells sequentially — each cell can depend on previous state
-  // We concatenate all code cells and run as one script, then attribute output
   const codeCells = cells.filter((c) => c.type === "code");
   if (codeCells.length === 0) return;
 
-  // Simple approach: run all code cells as one script
   const allCode = codeCells.map((c) => c.editor?.state.doc.toString() || "").join("\n\n");
+  const lastCell = codeCells[codeCells.length - 1];
+  const lastOut = lastCell.element.querySelector(".nb-cell-output") as HTMLElement;
+  lastCell.output = "";
 
-  // Show running state
   for (const c of codeCells) {
     const out = c.element.querySelector(".nb-cell-output") as HTMLElement;
     out.textContent = "Running...";
     out.className = "nb-cell-output running";
   }
 
+  const unlisten1 = await listen<{ stream: string; text: string }>("run-output", (event) => {
+    lastCell.output += event.payload.text;
+    lastOut.textContent = lastCell.output;
+    lastOut.className = `nb-cell-output ${event.payload.stream === "stderr" ? "error" : "success"}`;
+  });
+
+  const unlisten2 = await listen<{ exit_code: number | null }>("run-done", () => {
+    for (const c of codeCells) {
+      if (c !== lastCell) {
+        const outEl = c.element.querySelector(".nb-cell-output") as HTMLElement;
+        outEl.textContent = "";
+        outEl.className = "nb-cell-output";
+      }
+    }
+    if (!lastCell.output) lastOut.textContent = "(no output)";
+    unlisten1();
+    unlisten2();
+  });
+
   try {
-    const result = await invoke<{ stdout: string; stderr: string; exit_code: number | null }>("run_code", {
+    await invoke("run_code", {
       language: "python",
       code: allCode,
       filename: notebookPath.replace(".ipynb", "_all.py"),
       pythonPath: null,
     });
-
-    let out = "";
-    if (result.stdout) out += result.stdout;
-    if (result.stderr) out += result.stderr;
-
-    // Show output on the last code cell
-    for (const c of codeCells) {
-      const outEl = c.element.querySelector(".nb-cell-output") as HTMLElement;
-      outEl.textContent = "";
-      outEl.className = "nb-cell-output";
-    }
-
-    const lastCell = codeCells[codeCells.length - 1];
-    const lastOut = lastCell.element.querySelector(".nb-cell-output") as HTMLElement;
-    lastOut.textContent = out || "(no output)";
-    lastOut.className = `nb-cell-output ${result.exit_code === 0 ? "success" : "error"}`;
-    lastCell.output = out;
   } catch (e) {
-    const lastCell = codeCells[codeCells.length - 1];
-    const lastOut = lastCell.element.querySelector(".nb-cell-output") as HTMLElement;
     lastOut.textContent = String(e);
     lastOut.className = "nb-cell-output error";
+    unlisten1();
+    unlisten2();
   }
 }
 

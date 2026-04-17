@@ -853,9 +853,11 @@ async function setupExamPython(): Promise<void> {
     selectedPythonPath = examPyPath;
     const pyEl = document.getElementById("status-python");
     if (pyEl) pyEl.textContent = "Python: Exam Env";
+    appendOutput(`Exam Python ready: ${examPyPath}\n`, "system");
   } catch (e) {
-    console.warn("Exam Python setup failed:", e);
-    // Fall back to system Python — not an error
+    appendOutput(`Exam Python setup failed: ${e}\nUsing system Python instead.\n`, "system");
+    const pyEl = document.getElementById("status-python");
+    if (pyEl) pyEl.textContent = "Python: System (no exam env)";
   }
 }
 

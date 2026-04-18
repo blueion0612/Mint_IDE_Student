@@ -5,6 +5,7 @@ import { createEditor, setLanguage, markErrorLines, clearErrors, type SupportedL
 import { handleEditorInput, flushTypingSummary } from "./monitor/keystroke";
 import { recordTransaction, setCurrentFile, markNextInputSource, getEditHistoryJSON } from "./monitor/edithistory";
 import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook, isNotebookRunning } from "./editor/notebook";
+import { showSetupWizard, showSettingsModal, loadConfig, type SetupConfig } from "./setup_wizard";
 
 // ===== Types =====
 interface FileNode {
@@ -42,8 +43,19 @@ let isRecording = false;
 let workspaceRoot = "";
 let studentId = "";
 let selectedPythonPath: string | null = null; // null = system default
+let setupConfig: SetupConfig = {
+  setup_done: false,
+  package_profile: "basic",
+  custom_packages: [],
+  recording_enabled: true,
+  include_sample_code: true,
+  config_version: 1,
+};
 // Expose for notebook.ts
 (window as any).getSelectedPythonPath = () => selectedPythonPath;
+// Expose for setup_wizard.ts (settings modal sample-create button)
+(window as any).__mintCreateSampleFiles = async () => { await createSampleFiles(); };
+(window as any).__mintRefreshFileTree = async () => { await refreshFileTree(); };
 
 // ===== Initialization =====
 document.addEventListener("DOMContentLoaded", async () => {
@@ -85,6 +97,18 @@ function showStudentIdModal(): void {
     }
     studentId = val;
     overlay.remove();
+
+    setupConfig = await loadConfig();
+    if (!setupConfig.setup_done) {
+      // Prepare venv first so wizard installs packages into it (not system Python)
+      try {
+        selectedPythonPath = await invoke<string>("setup_exam_python");
+      } catch (e) {
+        console.warn("Exam venv prep failed:", e);
+      }
+      setupConfig = await showSetupWizard(selectedPythonPath);
+    }
+
     await initializeApp();
   };
 
@@ -124,18 +148,13 @@ async function initializeApp(): Promise<void> {
   const session = `${studentId}_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, "")}`;
   try {
     workspaceRoot = await invoke<string>("init_workspace", { sessionName: session });
-    // Default test files
-    await invoke("ws_write_file", { path: "main.py", content: DEFAULT_MAIN_PY });
-    await invoke("ws_write_file", { path: "test_all.py", content: DEFAULT_TEST_PY });
-    // Folder import test
-    await invoke("ws_create_dir", { path: "utils" });
-    await invoke("ws_write_file", { path: "utils/__init__.py", content: "from .math_helper import add, multiply\nfrom .text_helper import greet\n" });
-    await invoke("ws_write_file", { path: "utils/math_helper.py", content: DEFAULT_MATH_HELPER });
-    await invoke("ws_write_file", { path: "utils/text_helper.py", content: DEFAULT_TEXT_HELPER });
-    await invoke("ws_write_file", { path: "test_import.py", content: DEFAULT_IMPORT_TEST });
-    await invoke("ws_write_file", { path: "test_popup.py", content: DEFAULT_POPUP_TEST });
-    // Notebook test
-    await invoke("ws_write_file", { path: "test_notebook.ipynb", content: DEFAULT_NOTEBOOK });
+
+    if (setupConfig.include_sample_code) {
+      await createSampleFiles();
+    } else {
+      await invoke("ws_write_file", { path: "main.py", content: EMPTY_MAIN_PY });
+    }
+
     await refreshFileTree();
     openFileByPath("main.py");
   } catch (e) {
@@ -149,8 +168,36 @@ async function initializeApp(): Promise<void> {
     timeDeltaMs: null,
   });
 
-  startAutoRecording();
-  setupExamPython();
+  if (setupConfig.recording_enabled) {
+    startAutoRecording();
+  } else {
+    const indicator = document.getElementById("rec-indicator");
+    if (indicator) {
+      indicator.textContent = "REC: OFF";
+      indicator.classList.add("rec-disabled");
+      indicator.title = "Recording disabled in settings";
+    }
+  }
+
+  if (selectedPythonPath) {
+    const pyEl = document.getElementById("status-python");
+    if (pyEl) pyEl.textContent = "Python: Exam Env";
+  } else {
+    setupExamPython();
+  }
+}
+
+async function createSampleFiles(): Promise<void> {
+  await invoke("ws_write_file", { path: "main.py", content: DEFAULT_MAIN_PY });
+  await invoke("ws_write_file", { path: "test_all.py", content: DEFAULT_TEST_PY });
+  await invoke("ws_create_dir", { path: "utils" });
+  await invoke("ws_write_file", { path: "utils/__init__.py", content: "from .math_helper import add, multiply\nfrom .text_helper import greet\n" });
+  await invoke("ws_write_file", { path: "utils/math_helper.py", content: DEFAULT_MATH_HELPER });
+  await invoke("ws_write_file", { path: "utils/text_helper.py", content: DEFAULT_TEXT_HELPER });
+  await invoke("ws_write_file", { path: "test_import.py", content: DEFAULT_IMPORT_TEST });
+  await invoke("ws_write_file", { path: "test_popup.py", content: DEFAULT_POPUP_TEST });
+  await invoke("ws_write_file", { path: "test_notebook.ipynb", content: DEFAULT_NOTEBOOK });
+  await refreshFileTree();
 }
 
 // ===== Toolbar =====
@@ -179,6 +226,7 @@ function buildToolbar(): void {
     </div>
     <div class="toolbar-separator"></div>
     <div class="toolbar-group">
+      <button class="btn btn-settings" id="btn-settings" title="설정 (Settings)">&#9881;</button>
       <button class="btn btn-submit" id="btn-submit">Submit</button>
     </div>
   `;
@@ -195,6 +243,31 @@ function buildToolbar(): void {
   document.getElementById("btn-run")!.onclick = () => runCurrentFile();
   document.getElementById("btn-save")!.addEventListener("click", saveCurrentFile);
   document.getElementById("btn-submit")!.addEventListener("click", submitExam);
+  document.getElementById("btn-settings")!.addEventListener("click", openSettingsModal);
+}
+
+async function openSettingsModal(): Promise<void> {
+  const updated = await showSettingsModal(selectedPythonPath);
+  if (!updated) return;
+  const prevRecording = setupConfig.recording_enabled;
+  setupConfig = updated;
+
+  if (updated.recording_enabled && !prevRecording && !isRecording) {
+    await startAutoRecording();
+  } else if (!updated.recording_enabled && isRecording) {
+    try {
+      await invoke<string>("stop_recording");
+      isRecording = false;
+      const ind = document.getElementById("rec-indicator");
+      if (ind) {
+        ind.textContent = "REC: OFF";
+        ind.classList.remove("recording");
+        ind.classList.add("rec-disabled");
+      }
+    } catch (e) {
+      console.warn("Stop recording failed:", e);
+    }
+  }
 }
 
 // ===== Workspace / File Tree =====
@@ -1050,15 +1123,17 @@ async function setupExamPython(): Promise<void> {
 
 async function startAutoRecording(): Promise<void> {
   const indicator = document.getElementById("rec-indicator")!;
+  indicator.classList.remove("rec-disabled", "rec-error");
+  indicator.textContent = "● REC";
   try {
-    const home = await invoke<string>("get_home_dir");
-    const path = await invoke<string>("start_recording", { outputDir: `${home}/MINT_Exam_Recordings` });
+    const path = await invoke<string>("start_recording", { outputDir: null });
     isRecording = true;
     indicator.classList.add("recording");
     appendOutput(`Screen recording started: ${path}\n`, "system");
   } catch (e) {
     indicator.classList.add("rec-error");
     indicator.title = `Recording failed: ${e}`;
+    appendOutput(`Recording failed: ${e}\n`, "error");
     console.warn("Auto-recording failed:", e);
   }
 }
@@ -1564,6 +1639,10 @@ function escapeAttr(text: string): string {
 }
 
 // ===== Default Test Files =====
+const EMPTY_MAIN_PY = `# MINT Exam IDE
+# Ctrl+S to save, Ctrl+R to run
+`;
+
 const DEFAULT_MAIN_PY = `# MINT Exam IDE — Write your code here
 print("Hello, MINT!")
 

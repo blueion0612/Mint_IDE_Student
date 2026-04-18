@@ -251,6 +251,177 @@ pub fn pip_install(
     });
 }
 
+/// Run a pip command with streaming output. Returns final exit code.
+fn run_pip_streaming(py_cmd: &str, args: &[&str], app: &AppHandle) -> i32 {
+    let mut command = Command::new(py_cmd);
+    command.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let child = command.spawn();
+    match child {
+        Ok(mut c) => {
+            let stdout = c.stdout.take();
+            let stderr = c.stderr.take();
+            let app2 = app.clone();
+            let t1 = thread::spawn(move || {
+                if let Some(out) = stdout {
+                    for line in BufReader::new(out).lines().flatten() {
+                        emit_line(&app2, "stdout", &format!("{}\n", line));
+                    }
+                }
+            });
+            let app3 = app.clone();
+            let t2 = thread::spawn(move || {
+                if let Some(err) = stderr {
+                    for line in BufReader::new(err).lines().flatten() {
+                        emit_line(&app3, "stderr", &format!("{}\n", line));
+                    }
+                }
+            });
+            t1.join().ok();
+            t2.join().ok();
+            c.wait().ok().and_then(|s| s.code()).unwrap_or(-1)
+        }
+        Err(e) => {
+            emit_line(app, "stderr", &format!("pip failed: {}\n", e));
+            -1
+        }
+    }
+}
+
+/// Smart install: routes torch / tensorflow through their proper indexes.
+pub fn pip_install_smart(
+    packages: &[String],
+    python_path: Option<&str>,
+    app_handle: AppHandle,
+) {
+    let py = find_python(python_path);
+    let pkgs = packages.to_vec();
+
+    thread::spawn(move || {
+        let py_cmd = match py {
+            Some(p) => p,
+            None => {
+                emit_line(&app_handle, "stderr", "Python not found\n");
+                emit_line(&app_handle, "system", "[INSTALL_DONE:fail]\n");
+                return;
+            }
+        };
+
+        let mut torch_pkgs: Vec<String> = Vec::new();
+        let mut tf_pkgs: Vec<String> = Vec::new();
+        let mut other_pkgs: Vec<String> = Vec::new();
+        for pkg in &pkgs {
+            let lower = pkg.to_lowercase();
+            if lower.starts_with("torch") {
+                torch_pkgs.push(pkg.clone());
+            } else if lower.starts_with("tensorflow") {
+                tf_pkgs.push(pkg.clone());
+            } else {
+                other_pkgs.push(pkg.clone());
+            }
+        }
+
+        let mut overall_ok = true;
+
+        if !other_pkgs.is_empty() {
+            emit_line(&app_handle, "system",
+                &format!("Installing: {}\n", other_pkgs.join(", ")));
+            let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "install".into(), "--upgrade".into()];
+            args.extend(other_pkgs);
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let code = run_pip_streaming(&py_cmd, &arg_refs, &app_handle);
+            if code != 0 { overall_ok = false; }
+            emit_line(&app_handle, "system", &format!("[core exit {}]\n", code));
+        }
+
+        if !torch_pkgs.is_empty() {
+            emit_line(&app_handle, "system",
+                &format!("Installing PyTorch (CPU): {}\n", torch_pkgs.join(", ")));
+            let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "install".into()];
+            args.extend(torch_pkgs);
+            args.push("--index-url".into());
+            args.push("https://download.pytorch.org/whl/cpu".into());
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let code = run_pip_streaming(&py_cmd, &arg_refs, &app_handle);
+            if code != 0 { overall_ok = false; }
+            emit_line(&app_handle, "system", &format!("[torch exit {}]\n", code));
+        }
+
+        if !tf_pkgs.is_empty() {
+            emit_line(&app_handle, "system",
+                &format!("Installing TensorFlow: {}\n", tf_pkgs.join(", ")));
+            let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "install".into()];
+            args.extend(tf_pkgs);
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let code = run_pip_streaming(&py_cmd, &arg_refs, &app_handle);
+            if code != 0 { overall_ok = false; }
+            emit_line(&app_handle, "system", &format!("[tensorflow exit {}]\n", code));
+        }
+
+        let marker = if overall_ok { "[INSTALL_DONE:ok]\n" } else { "[INSTALL_DONE:partial]\n" };
+        emit_line(&app_handle, "system", marker);
+    });
+}
+
+pub fn pip_uninstall(
+    packages: &[String],
+    python_path: Option<&str>,
+    app_handle: AppHandle,
+) {
+    let py = find_python(python_path);
+    let pkgs = packages.to_vec();
+
+    thread::spawn(move || {
+        let py_cmd = match py {
+            Some(p) => p,
+            None => {
+                emit_line(&app_handle, "stderr", "Python not found\n");
+                emit_line(&app_handle, "system", "[UNINSTALL_DONE:fail]\n");
+                return;
+            }
+        };
+        emit_line(&app_handle, "system",
+            &format!("Uninstalling: {}\n", pkgs.join(", ")));
+        let mut args: Vec<String> = vec!["-m".into(), "pip".into(), "uninstall".into(), "-y".into()];
+        args.extend(pkgs);
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let code = run_pip_streaming(&py_cmd, &arg_refs, &app_handle);
+        let marker = if code == 0 { "[UNINSTALL_DONE:ok]\n" } else { "[UNINSTALL_DONE:fail]\n" };
+        emit_line(&app_handle, "system", marker);
+    });
+}
+
+pub fn pip_list(python_path: Option<&str>) -> Vec<String> {
+    let py = match find_python(python_path) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let mut command = Command::new(&py);
+    command.args(["-m", "pip", "list", "--format=freeze"]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = match command.output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .filter_map(|l| l.split("==").next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 // ===== Helpers =====
 
 fn emit_line(app: &AppHandle, stream: &str, text: &str) {

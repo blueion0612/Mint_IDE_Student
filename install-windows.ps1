@@ -74,8 +74,8 @@ if ($missing.Count -gt 0) {
     Write-Host "[2/5] All system deps installed." -ForegroundColor Green
 }
 
-# ─── 3. Create exam Python venv + install packages ───
-Write-Host "[3/5] Setting up exam Python environment..." -ForegroundColor Yellow
+# ─── 3. Create empty exam Python venv (packages installed by IDE wizard) ───
+Write-Host "[3/5] Creating exam Python environment (empty)..." -ForegroundColor Yellow
 
 $venvDir = "$env:LOCALAPPDATA\MINT_Exam_IDE\exam-venv"
 $venvPy = "$venvDir\Scripts\python.exe"
@@ -87,35 +87,13 @@ elseif (Test-Cmd "py") { $pyCmd = "py" }
 
 if ($pyCmd) {
     if (-not (Test-Path $venvPy)) {
-        Write-Host "  Creating venv..."
+        Write-Host "  Creating venv at $venvDir..."
         & $pyCmd -m venv $venvDir
-    }
-
-    Write-Host "  Installing packages (this may take 5-10 minutes)..."
-    Write-Host "    numpy, pandas, matplotlib, seaborn, scikit-learn, scipy, sympy," -ForegroundColor DarkGray
-    Write-Host "    Pillow, opencv, openpyxl, requests, torch, tensorflow" -ForegroundColor DarkGray
-
-    # All pip/python commands go through cmd /c ... 2>NUL
-    # to prevent TensorFlow's C++ stderr from leaking into PowerShell
-    cmd /c "`"$venvPy`" -m pip install --upgrade pip 2>NUL" | Out-Null
-    cmd /c "`"$venvPy`" -m pip install numpy pandas matplotlib seaborn scikit-learn scipy sympy Pillow opencv-python-headless openpyxl requests 2>NUL" | Out-Null
-    Write-Host "  [OK] Core packages" -ForegroundColor Green
-
-    Write-Host "  Installing PyTorch (CPU)..."
-    cmd /c "`"$venvPy`" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu 2>NUL" | Out-Null
-    Write-Host "  [OK] PyTorch" -ForegroundColor Green
-
-    Write-Host "  Installing TensorFlow (CPU)..."
-    cmd /c "`"$venvPy`" -m pip install tensorflow-cpu 2>NUL" | Out-Null
-    Write-Host "  [OK] TensorFlow" -ForegroundColor Green
-
-    # Verify
-    $check = cmd /c "`"$venvPy`" -c `"import numpy,pandas,matplotlib,seaborn,sklearn,scipy,sympy,cv2,torch; print('ALL OK')`" 2>NUL"
-    if ($check -match "ALL OK") {
-        Write-Host "  All packages verified!" -ForegroundColor Green
     } else {
-        Write-Host "  Warning: some packages may have failed" -ForegroundColor Yellow
+        Write-Host "  Venv already exists at $venvDir" -ForegroundColor Green
     }
+    cmd /c "`"$venvPy`" -m pip install --upgrade pip 2>NUL" | Out-Null
+    Write-Host "  [OK] Empty venv ready. Packages will be installed by the IDE on first launch." -ForegroundColor Green
 } else {
     Write-Host "  [SKIP] Python not found — exam venv not created" -ForegroundColor Yellow
 }

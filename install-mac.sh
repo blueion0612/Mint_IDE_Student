@@ -98,6 +98,31 @@ if [ -n "$WARNINGS" ]; then
 fi
 echo ""
 
+# ─── 3.5 Create empty exam venv (packages installed by IDE wizard) ───
+echo "[3.5/5] Creating exam Python venv (empty)..."
+VENV_DIR="$HOME/Library/Application Support/MINT_Exam_IDE/exam-venv"
+VENV_PY="$VENV_DIR/bin/python"
+if [ ! -x "$VENV_PY" ]; then
+    PY_CMD=""
+    for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
+        if command -v "$c" &>/dev/null || [ -x "$c" ]; then
+            PY_CMD="$c"; break
+        fi
+    done
+    if [ -n "$PY_CMD" ]; then
+        mkdir -p "$(dirname "$VENV_DIR")"
+        "$PY_CMD" -m venv "$VENV_DIR" 2>/dev/null
+        "$VENV_PY" -m pip install --upgrade pip 2>/dev/null >/dev/null
+        echo "  [OK] Empty venv ready at $VENV_DIR"
+    else
+        echo "  [SKIP] Python not found — venv will be created on first launch"
+    fi
+else
+    echo "  [OK] Venv already exists at $VENV_DIR"
+fi
+echo "  Packages will be installed by the IDE wizard on first launch."
+echo ""
+
 # ─── 4. Download & Install App ───
 echo "[4/5] Downloading MINT Exam IDE..."
 

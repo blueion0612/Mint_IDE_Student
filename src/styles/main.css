@@ -731,6 +731,11 @@ body {
   text-decoration: line-through;
 }
 
+.rec-indicator.rec-disabled {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 /* Submit button */
 .btn-submit {
   background: var(--accent);
@@ -1237,4 +1242,254 @@ body {
   margin-top: 8px;
   text-align: center;
   letter-spacing: 0.5px;
+}
+
+/* ===== Setup Wizard / Settings Modal ===== */
+.wizard-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  user-select: none;
+}
+
+.wizard-modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 640px;
+  max-width: 92vw;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.wizard-header {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-tertiary);
+}
+
+.wizard-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+}
+
+.wizard-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 22px;
+  cursor: pointer;
+  padding: 0 8px;
+  border-radius: 4px;
+}
+
+.wizard-close:hover {
+  color: var(--alert);
+  background: var(--bg-surface);
+}
+
+.wizard-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 24px;
+}
+
+.wizard-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.wizard-body::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.wiz-section {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.wiz-section:last-child {
+  border-bottom: none;
+}
+
+.wiz-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.wiz-section-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  font-style: italic;
+}
+
+.wiz-radio,
+.wiz-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.wiz-radio:hover,
+.wiz-check:hover {
+  color: var(--text-primary);
+}
+
+.wiz-radio input,
+.wiz-check input {
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.wiz-check-block {
+  padding: 8px 0;
+}
+
+.wiz-radio-label {
+  flex: 1;
+}
+
+.wiz-custom-pkg-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px 12px;
+  padding: 10px 12px;
+  margin-top: 8px;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.wiz-custom-pkg-grid.hidden {
+  display: none;
+}
+
+.wiz-custom-pkg-grid .wiz-check {
+  padding: 3px 0;
+  font-size: 11px;
+}
+
+.wiz-extra-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.wiz-mini-btn {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.wiz-mini-btn:hover {
+  background: var(--border);
+}
+
+.wiz-mini-btn.wiz-danger {
+  border-color: var(--alert);
+  color: var(--alert);
+}
+
+.wiz-mini-btn.wiz-danger:hover {
+  background: rgba(243, 139, 168, 0.15);
+}
+
+.wiz-installed-details {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.wiz-installed-details summary {
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.wiz-installed-list {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  padding: 8px;
+  margin-top: 4px;
+  max-height: 100px;
+  overflow-y: auto;
+  font-family: "Cascadia Code", monospace;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.wiz-progress {
+  padding: 12px 0;
+}
+
+.wiz-progress.hidden {
+  display: none;
+}
+
+.wiz-progress-log {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  font-family: "Cascadia Code", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  max-height: 240px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.wizard-footer {
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  background: var(--bg-tertiary);
+}
+
+.wizard-footer .btn {
+  padding: 7px 18px;
+  font-size: 13px;
+}
+
+/* Settings (gear) button in toolbar */
+.btn-settings {
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  padding: 4px 8px;
+}
+
+.btn-settings:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }

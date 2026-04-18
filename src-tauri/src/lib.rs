@@ -1,10 +1,12 @@
 mod monitor;
 mod recorder;
 mod runner;
+mod setup;
 mod workspace;
 
 use monitor::{ActivityEvent, ActivityLog, KnownWrites, new_known_writes, mark_known_write};
 use recorder::{RecorderState, ScreenRecorder};
+use setup::SetupConfig;
 use workspace::{FileNode, Workspace, WorkspaceState};
 use std::sync::Mutex;
 use tauri::{Emitter, State};
@@ -152,12 +154,18 @@ fn start_recording(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
     recorder: State<RecorderState>,
-    output_dir: String,
+    output_dir: Option<String>,
 ) -> Result<String, String> {
     let mut rec = recorder.lock().map_err(|e| e.to_string())?;
-    let path = rec.start(&output_dir)?;
+    let dir = output_dir.unwrap_or_else(|| setup::recordings_dir().to_string_lossy().to_string());
+    let path = rec.start(&dir)?;
+    let strategy = rec.last_strategy().unwrap_or_else(|| "unknown".to_string());
 
-    let event = ActivityEvent::new("recording_start", &format!("Screen recording started: {}", path), None, None);
+    let event = ActivityEvent::new(
+        "recording_start",
+        &format!("Screen recording started [{}]: {}", strategy, path),
+        None, None,
+    );
     state.activity_log.lock().unwrap().add_event(event.clone());
     let _ = app_handle.emit("activity-event", &event);
 
@@ -192,6 +200,85 @@ fn get_home_dir() -> Result<String, String> {
         .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
         .map(|p| p.to_string_lossy().to_string())
         .ok_or_else(|| "Cannot determine home directory".to_string())
+}
+
+#[tauri::command]
+fn get_recordings_dir() -> String {
+    setup::recordings_dir().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn get_workspaces_dir() -> String {
+    setup::workspaces_dir().to_string_lossy().to_string()
+}
+
+// ===== Setup Config =====
+
+#[tauri::command]
+fn read_setup_config() -> SetupConfig {
+    setup::load_config()
+}
+
+#[tauri::command]
+fn write_setup_config(config: SetupConfig) -> Result<(), String> {
+    setup::save_config(&config)
+}
+
+#[tauri::command]
+fn package_list_for_profile(profile: String, custom: Vec<String>) -> Vec<String> {
+    setup::package_list_for_profile(&profile, &custom)
+}
+
+// ===== Pip Package Management =====
+
+/// Install packages with smart routing for torch / tensorflow.
+/// Streams output via run-output events; emits run-done when finished.
+#[tauri::command]
+fn install_packages_smart(
+    app_handle: tauri::AppHandle,
+    packages: Vec<String>,
+    python_path: Option<String>,
+) {
+    runner::pip_install_smart(&packages, python_path.as_deref(), app_handle);
+}
+
+#[tauri::command]
+fn uninstall_packages(
+    app_handle: tauri::AppHandle,
+    packages: Vec<String>,
+    python_path: Option<String>,
+) {
+    runner::pip_uninstall(&packages, python_path.as_deref(), app_handle);
+}
+
+#[tauri::command]
+fn list_installed_packages(python_path: Option<String>) -> Vec<String> {
+    runner::pip_list(python_path.as_deref())
+}
+
+// ===== Sample Code Helpers =====
+
+#[tauri::command]
+fn delete_sample_files(ws: State<WorkspaceState>) -> Result<u32, String> {
+    let guard = ws.lock().map_err(|e| e.to_string())?;
+    let workspace = guard.as_ref().ok_or("No workspace initialized")?;
+    let root = std::path::PathBuf::from(workspace.root_path());
+    let sample_names = [
+        "test_all.py", "test_import.py", "test_popup.py", "test_notebook.ipynb",
+        "main.py", "utils",
+    ];
+    let mut removed = 0u32;
+    for name in sample_names {
+        let p = root.join(name);
+        if p.exists() {
+            if p.is_dir() {
+                if std::fs::remove_dir_all(&p).is_ok() { removed += 1; }
+            } else if std::fs::remove_file(&p).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 // ===== Python Interpreter Detection =====
@@ -319,8 +406,9 @@ fn save_code_history(ws: State<WorkspaceState>, history_json: String) -> Result<
 
 // ===== Exam Python Environment =====
 
-/// Create a dedicated Python venv for the exam with common libraries pre-installed.
-/// Returns the path to the venv's python executable.
+/// Ensure the exam venv exists and return its python executable path.
+/// Creates the venv if missing. Always returns the venv path (never falls back
+/// to system Python) so the in-app wizard installs packages into the venv.
 #[tauri::command]
 fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
     let venv_dir = dirs::data_local_dir()
@@ -334,52 +422,30 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
         venv_dir.join("bin").join("python")
     };
 
-    // If venv exists, check if it has packages
     if py_exe.exists() {
-        let py_str = py_exe.to_string_lossy().to_string();
-        // Quick check: can it import numpy? (installed by install script)
-        let check = silent_cmd(&py_str, &["-c", "import numpy"]);
-        if check.is_some() && check.as_ref().unwrap().status.success() {
-            return Ok(py_str); // Venv with packages — use it
-        }
-        // Venv exists but no packages — don't use it, fall back to system Python
-        let _ = app_handle.emit("run-output", runner::RunOutputLine {
-            stream: "system".to_string(),
-            text: "Exam venv has no packages. Using system Python.\nRun install script to set up packages.\n".to_string(),
-        });
-        // Return system Python instead
-        if let Some(sys_py) = find_system_python() {
-            return Ok(sys_py);
-        }
-        // Even system Python not found — still return venv path as last resort
-        return Ok(py_str);
+        return Ok(py_exe.to_string_lossy().to_string());
     }
 
-    // Find system python to create venv from
     let sys_python = find_system_python()
         .ok_or("Python not found. Please install Python first.")?;
 
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
-        text: format!("Setting up exam Python environment...\nUsing: {}\n", sys_python),
+        text: format!("Creating exam Python venv...\nUsing: {}\n", sys_python),
     });
 
-    // Create venv
     let venv_str = venv_dir.to_string_lossy().to_string();
     let output = silent_cmd(&sys_python, &["-m", "venv", &venv_str]);
     if output.is_none() || !output.as_ref().unwrap().status.success() {
         return Err("Failed to create Python venv".to_string());
     }
 
-    let py_str = py_exe.to_string_lossy().to_string();
-
-    // Only create venv — packages are installed by install-windows.ps1 / install-mac.sh
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
-        text: "Exam venv created. Run install script to add packages.\n".to_string(),
+        text: "Exam venv ready.\n".to_string(),
     });
 
-    Ok(py_str)
+    Ok(py_exe.to_string_lossy().to_string())
 }
 
 fn install_exam_packages(py_str: &str, app_handle: &tauri::AppHandle) -> Result<String, String> {
@@ -448,6 +514,27 @@ fn find_system_python() -> Option<String> {
                     if py.exists() { return Some(py.to_string_lossy().to_string()); }
                 }
             }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // GUI-launched apps on macOS have a stripped PATH; search known locations.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut candidates: Vec<String> = vec![
+            "/opt/homebrew/bin/python3".to_string(),
+            "/usr/local/bin/python3".to_string(),
+            "/usr/bin/python3".to_string(),
+            format!("{}/anaconda3/bin/python", home),
+            format!("{}/miniconda3/bin/python", home),
+            format!("{}/miniforge3/bin/python", home),
+            format!("{}/mambaforge/bin/python", home),
+        ];
+        if let Some(pyenv_root) = std::env::var("PYENV_ROOT").ok() {
+            candidates.push(format!("{}/shims/python3", pyenv_root));
+        }
+        for p in &candidates {
+            if std::path::Path::new(p).exists() { return Some(p.clone()); }
         }
     }
 
@@ -544,10 +631,7 @@ fn init_workspace(
     kw: State<KnownWrites>,
     session_name: String,
 ) -> Result<String, String> {
-    let base = dirs::document_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let base = base.join("MINT_Exam_Workspaces");
+    let base = setup::workspaces_dir();
 
     let workspace = Workspace::init(&base, &session_name)?;
     let root = workspace.root_path();
@@ -763,7 +847,7 @@ fn submit_exam(
     //    Much faster than zipping 300MB+ video files
     let video_dir = submit_dir.join("video");
     let _ = std::fs::create_dir_all(&video_dir);
-    let rec_dir = dirs::home_dir().unwrap_or_default().join("MINT_Exam_Recordings");
+    let rec_dir = setup::recordings_dir();
     let mut video_count = 0u32;
 
     if rec_dir.exists() {
@@ -843,6 +927,8 @@ fn add_dir_to_zip_encrypted<W: std::io::Write + std::io::Seek>(
 
     if !dir.is_dir() { return Ok(()); }
 
+    const VIDEO_EXTS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm"];
+
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
@@ -857,6 +943,13 @@ fn add_dir_to_zip_encrypted<W: std::io::Write + std::io::Seek>(
             zip.add_directory(&format!("{}/", relative), dir_options).map_err(|e| e.to_string())?;
             add_dir_to_zip_encrypted(zip, &path, root, password)?;
         } else {
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            if VIDEO_EXTS.contains(&ext.as_str()) {
+                continue;
+            }
             let file_options = SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .with_aes_encryption(AesMode::Aes256, password);
@@ -967,6 +1060,15 @@ pub fn run() {
             stop_recording,
             is_recording,
             get_home_dir,
+            get_recordings_dir,
+            get_workspaces_dir,
+            read_setup_config,
+            write_setup_config,
+            package_list_for_profile,
+            install_packages_smart,
+            uninstall_packages,
+            list_installed_packages,
+            delete_sample_files,
             init_workspace,
             ws_list_tree,
             ws_read_file,

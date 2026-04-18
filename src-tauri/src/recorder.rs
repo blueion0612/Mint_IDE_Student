@@ -6,11 +6,19 @@ pub struct ScreenRecorder {
     process: Option<Child>,
     output_dir: Option<PathBuf>,
     segment_index: u32,
+    last_error: Option<String>,
+    last_strategy: Option<String>,
 }
 
 impl ScreenRecorder {
     pub fn new() -> Self {
-        Self { process: None, output_dir: None, segment_index: 0 }
+        Self {
+            process: None,
+            output_dir: None,
+            segment_index: 0,
+            last_error: None,
+            last_strategy: None,
+        }
     }
 
     pub fn start(&mut self, output_dir: &str) -> Result<String, String> {
@@ -22,6 +30,8 @@ impl ScreenRecorder {
         std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create dir: {}", e))?;
         self.output_dir = Some(dir.clone());
         self.segment_index = 0;
+        self.last_error = None;
+        self.last_strategy = None;
 
         self.start_segment()
     }
@@ -37,15 +47,34 @@ impl ScreenRecorder {
         let output_path = dir.join(&filename);
         let output_str = output_path.to_string_lossy().to_string();
 
-        let child = if cfg!(target_os = "macos") {
-            build_recording_command("", &output_str)?
+        let result = if cfg!(target_os = "macos") {
+            build_recording_command("", &output_str)
         } else {
-            let ffmpeg = find_ffmpeg()?;
-            build_recording_command(&ffmpeg, &output_str)?
+            match find_ffmpeg() {
+                Ok(ffmpeg) => build_recording_command(&ffmpeg, &output_str),
+                Err(e) => Err(e),
+            }
         };
 
-        self.process = Some(child);
-        Ok(output_path.to_string_lossy().to_string())
+        match result {
+            Ok((child, strategy)) => {
+                self.last_strategy = Some(strategy);
+                self.process = Some(child);
+                Ok(output_path.to_string_lossy().to_string())
+            }
+            Err(e) => {
+                self.last_error = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.clone()
+    }
+
+    pub fn last_strategy(&self) -> Option<String> {
+        self.last_strategy.clone()
     }
 
     /// Auto-segment: call periodically to split into ~15 min chunks
@@ -184,82 +213,141 @@ fn walkdir_simple(dir: &std::path::Path, depth: u32) -> Vec<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<Child, String> {
+fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<(Child, String), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    // Segmented recording with -t 900 (15 min) — FFmpeg auto-stops, we restart
-    // Try GPU first, fall back to CPU
-    let strategies: Vec<Vec<String>> = vec![
-        // NVIDIA NVENC
-        ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_nvenc",
-         "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
-            .iter().map(|s| s.to_string()).collect(),
-        // Intel QuickSync
-        ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_qsv",
-         "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
-            .iter().map(|s| s.to_string()).collect(),
-        // AMD AMF
-        ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_amf",
-         "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
-            .iter().map(|s| s.to_string()).collect(),
-        // CPU: 2fps, half res
-        ["-y", "-filter_complex", "ddagrab=framerate=2,scale=iw/2:ih/2",
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
-         "-pix_fmt", "yuv420p", "-t", "900", output_path]
-            .iter().map(|s| s.to_string()).collect(),
-        // Legacy GDI fallback
-        ["-y", "-f", "gdigrab", "-framerate", "2", "-i", "desktop",
-         "-vf", "scale=iw/2:ih/2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
-         "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", "900", output_path]
-            .iter().map(|s| s.to_string()).collect(),
+    let strategies: Vec<(&str, Vec<String>)> = vec![
+        ("CPU/GDI (most compatible)",
+         ["-y", "-f", "gdigrab", "-framerate", "2", "-i", "desktop",
+          "-vf", "scale=iw/2:ih/2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
+          "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", "900", output_path]
+            .iter().map(|s| s.to_string()).collect()),
+        ("CPU/DDA",
+         ["-y", "-filter_complex", "ddagrab=framerate=2,scale=iw/2:ih/2",
+          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
+          "-pix_fmt", "yuv420p", "-t", "900", output_path]
+            .iter().map(|s| s.to_string()).collect()),
+        ("NVIDIA NVENC",
+         ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_nvenc",
+          "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
+            .iter().map(|s| s.to_string()).collect()),
+        ("Intel QuickSync",
+         ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_qsv",
+          "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
+            .iter().map(|s| s.to_string()).collect()),
+        ("AMD AMF",
+         ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_amf",
+          "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
+            .iter().map(|s| s.to_string()).collect()),
     ];
 
-    for args in &strategies {
+    let mut errors: Vec<String> = Vec::new();
+
+    for (label, args) in &strategies {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        if let Ok(mut child) = Command::new(ffmpeg)
+        let spawn = Command::new(ffmpeg)
             .args(&arg_refs)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-        {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            match child.try_wait() {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(child),
-                Err(_) => continue,
+            .spawn();
+
+        let mut child = match spawn {
+            Ok(c) => c,
+            Err(e) => {
+                errors.push(format!("{}: spawn failed: {}", label, e));
+                continue;
+            }
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr_text = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut stderr_text);
+                }
+                let tail = if stderr_text.len() > 400 {
+                    stderr_text[stderr_text.len()-400..].to_string()
+                } else {
+                    stderr_text
+                };
+                errors.push(format!("{} (exit {:?}): {}", label, status.code(), tail.replace('\n', " | ")));
+                continue;
+            }
+            Ok(None) => {
+                if let Some(stderr) = child.stderr.take() {
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut buf = [0u8; 4096];
+                        let mut reader = stderr;
+                        while reader.read(&mut buf).unwrap_or(0) > 0 {}
+                    });
+                }
+                return Ok((child, label.to_string()));
+            }
+            Err(e) => {
+                errors.push(format!("{}: wait failed: {}", label, e));
+                continue;
             }
         }
     }
 
-    Err("All recording strategies failed".to_string())
+    Err(format!("All FFmpeg strategies failed:\n  - {}", errors.join("\n  - ")))
 }
 
 #[cfg(target_os = "macos")]
-fn build_recording_command(_ffmpeg: &str, output_path: &str) -> Result<Child, String> {
-    Command::new("screencapture")
+fn build_recording_command(_ffmpeg: &str, output_path: &str) -> Result<(Child, String), String> {
+    let mut child = Command::new("screencapture")
         .args(["-v", "-C", output_path])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to start screen recording: {}", e))
+        .map_err(|e| format!("Failed to start screen recording: {}", e))?;
+
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    if let Ok(Some(status)) = child.try_wait() {
+        let mut err_text = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_string(&mut err_text);
+        }
+        return Err(format!(
+            "screencapture exited immediately (code {:?}): {}",
+            status.code(),
+            err_text.trim()
+        ));
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let mut reader = stderr;
+            while reader.read(&mut buf).unwrap_or(0) > 0 {}
+        });
+    }
+
+    Ok((child, "macOS screencapture".to_string()))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<Child, String> {
-    Command::new(ffmpeg)
+fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<(Child, String), String> {
+    let child = Command::new(ffmpeg)
         .args(["-y", "-f", "x11grab", "-framerate", "2", "-i", ":0.0",
                "-vf", "scale=iw/2:ih/2",
                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
                "-pix_fmt", "yuv420p", "-t", "900", output_path])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to start FFmpeg: {}", e))
+        .map_err(|e| format!("Failed to start FFmpeg: {}", e))?;
+    Ok((child, "Linux x11grab".to_string()))
 }
 
 pub type RecorderState = Mutex<ScreenRecorder>;

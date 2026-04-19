@@ -15,14 +15,6 @@ jobs:
             label: Windows
             args: ""
             arch: x64
-          - os: macos-latest
-            label: macOS-ARM
-            args: "--target aarch64-apple-darwin"
-            arch: aarch64
-          - os: macos-latest
-            label: macOS-Intel
-            args: "--target x86_64-apple-darwin"
-            arch: x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +26,6 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install dependencies
         run: npm install
@@ -47,60 +37,5 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MINT Exam IDE ${{ github.ref_name }}"
-          releaseBody: "Installers for Windows and macOS"
-          releaseDraft: true
+          releaseDraft: false
           args: ${{ matrix.args }}
-
-      - name: Create macOS .pkg installer
-        if: runner.os == 'macOS'
-        run: |
-          APP_NAME="MINT Exam IDE"
-          VERSION="${{ github.ref_name }}"
-          ARCH="${{ matrix.arch }}"
-
-          if [ "$ARCH" = "aarch64" ]; then
-            TARGET_DIR="aarch64-apple-darwin"
-          else
-            TARGET_DIR="x86_64-apple-darwin"
-          fi
-
-          APP_PATH="src-tauri/target/${TARGET_DIR}/release/bundle/macos/${APP_NAME}.app"
-
-          if [ ! -d "$APP_PATH" ]; then
-            echo "App not found at $APP_PATH, skipping .pkg"
-            exit 0
-          fi
-
-          # Remove quarantine from built app
-          xattr -cr "$APP_PATH"
-
-          # Create postinstall script
-          mkdir -p scripts
-          cat > scripts/postinstall << 'SCRIPT'
-          #!/bin/bash
-          xattr -cr "/Applications/MINT Exam IDE.app" 2>/dev/null || true
-          SCRIPT
-          chmod +x scripts/postinstall
-
-          # Build component pkg
-          pkgbuild \
-            --root "src-tauri/target/${TARGET_DIR}/release/bundle/macos" \
-            --install-location /Applications \
-            --scripts scripts \
-            --identifier com.mint.exam-ide \
-            --version "${VERSION#v}" \
-            "MINT.Exam.IDE_${VERSION#v}_${ARCH}.pkg"
-
-          echo "Created: MINT.Exam.IDE_${VERSION#v}_${ARCH}.pkg"
-
-      - name: Upload .pkg to release
-        if: runner.os == 'macOS'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ github.ref_name }}"
-          ARCH="${{ matrix.arch }}"
-          PKG="MINT.Exam.IDE_${VERSION#v}_${ARCH}.pkg"
-          if [ -f "$PKG" ]; then
-            gh release upload "$VERSION" "$PKG" --clobber
-          fi

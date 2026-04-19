@@ -1650,17 +1650,15 @@ print("Hello, MINT!")
 # Run test_all.py to verify all libraries
 `;
 
-const DEFAULT_TEST_PY = `"""MINT Exam IDE — Full Library Test"""
+const DEFAULT_TEST_PY = `"""MINT Exam IDE — Library Test (skips packages not installed)"""
 import sys
 print(f"Python: {sys.executable}")
 print(f"Version: {sys.version}")
 
-# === Built-in modules ===
 import csv, json, os, math, random, statistics
 import collections, itertools, re, datetime
 print("Built-in modules: OK")
 
-# === Data Science ===
 import numpy as np
 import pandas as pd
 print(f"NumPy {np.__version__}: mean([1..5]) = {np.mean([1,2,3,4,5])}")
@@ -1669,55 +1667,73 @@ df = pd.DataFrame({"Name": ["A","B","C"], "Score": [95, 88, 72]})
 print(f"Pandas {pd.__version__}:")
 print(df)
 
-# === Visualization ===
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 fig, ax = plt.subplots(1, 2, figsize=(10, 4))
 ax[0].hist(np.random.randn(300), bins=20, color='#89b4fa')
 ax[0].set_title('Histogram')
-sns.barplot(data=df, x="Name", y="Score", ax=ax[1])
-ax[1].set_title('Scores')
+try:
+    import seaborn as sns
+    sns.barplot(data=df, x="Name", y="Score", ax=ax[1])
+    ax[1].set_title('Scores (seaborn)')
+    print("Seaborn: OK")
+except ImportError:
+    ax[1].bar(df["Name"], df["Score"], color='#a6e3a1')
+    ax[1].set_title('Scores (matplotlib fallback)')
+    print("Seaborn: not installed (optional)")
 plt.tight_layout()
 plt.savefig("test_chart.png", dpi=100)
 plt.close()
-print("Matplotlib + Seaborn: OK (test_chart.png saved)")
+print("Matplotlib: OK (test_chart.png saved)")
 
-# === ML / Math ===
-from sklearn.linear_model import LinearRegression
-X = np.array([[1],[2],[3],[4],[5]])
-model = LinearRegression().fit(X, [2, 4, 5, 4, 5])
-print(f"sklearn: predict(6) = {model.predict([[6]])[0]:.2f}")
+try:
+    from sklearn.linear_model import LinearRegression
+    X = np.array([[1],[2],[3],[4],[5]])
+    model = LinearRegression().fit(X, [2, 4, 5, 4, 5])
+    print(f"sklearn: predict(6) = {model.predict([[6]])[0]:.2f}")
+except ImportError:
+    print("sklearn: not installed (optional)")
 
-from scipy import optimize
-r = optimize.minimize(lambda x: (x-3)**2, x0=0)
-print(f"SciPy: min of (x-3)^2 at x = {r.x[0]:.2f}")
+try:
+    from scipy import optimize
+    r = optimize.minimize(lambda x: (x-3)**2, x0=0)
+    print(f"SciPy: min of (x-3)^2 at x = {r.x[0]:.2f}")
+except ImportError:
+    print("SciPy: not installed (optional)")
 
-import sympy as sp
-x = sp.Symbol('x')
-print(f"SymPy: integral(x^2) = {sp.integrate(x**2, x)}")
+try:
+    import sympy as sp
+    x = sp.Symbol('x')
+    print(f"SymPy: integral(x^2) = {sp.integrate(x**2, x)}")
+except ImportError:
+    print("SymPy: not installed (optional)")
 
-# === Image ===
 from PIL import Image
 img = Image.new('RGB', (50, 50), color='blue')
 img.save('test_img.png')
 print("Pillow: OK (test_img.png saved)")
 
-import cv2
-gray = cv2.imread('test_img.png', cv2.IMREAD_GRAYSCALE)
-print(f"OpenCV: shape={gray.shape}")
+try:
+    import cv2
+    gray = cv2.imread('test_img.png', cv2.IMREAD_GRAYSCALE)
+    print(f"OpenCV: shape={gray.shape}")
+except ImportError:
+    print("OpenCV: not installed (optional)")
 
-# === Files ===
-import openpyxl
-df.to_excel("test.xlsx", index=False)
+try:
+    import openpyxl
+    df.to_excel("test.xlsx", index=False)
+    print("openpyxl: OK (test.xlsx saved)")
+except ImportError:
+    print("openpyxl: not installed (optional)")
+
 df.to_csv("test.csv", index=False)
 with open("test.json", "w") as f:
     json.dump({"result": "pass"}, f, indent=2)
-print("Files: test.xlsx, test.csv, test.json saved")
+print("test.csv, test.json saved")
 
-# === Deep Learning ===
 try:
     import torch
     t = torch.tensor([1.0, 2.0, 3.0])
@@ -1726,22 +1742,20 @@ except ImportError:
     print("PyTorch: not installed (optional)")
 
 try:
-    import os
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     import tensorflow as tf
     print(f"TensorFlow {tf.__version__}: 1+2 = {tf.add(1, 2).numpy()}")
 except ImportError:
     print("TensorFlow: not installed (optional)")
 
-# === Network ===
 try:
     import requests
     r = requests.get("https://httpbin.org/get", timeout=3)
     print(f"Requests: status {r.status_code}")
-except:
-    print("Requests: network unavailable (OK for exam)")
+except Exception:
+    print("Requests: network unavailable or not installed")
 
-print("\\n=== ALL TESTS PASSED ===")
+print("\\n=== TESTS COMPLETE ===")
 `;
 
 const DEFAULT_MATH_HELPER = `def add(a, b):

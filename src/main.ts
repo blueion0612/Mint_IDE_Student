@@ -138,6 +138,11 @@ async function initializeApp(): Promise<void> {
       e.preventDefault();
       runCurrentFile();
     }
+    // Ctrl+Shift+C — emergency stop (bypasses event-flooded UI)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "C" || e.key === "c")) {
+      e.preventDefault();
+      if (isRunning) stopCurrentRun();
+    }
   });
 
   document.getElementById("btn-sidebar-new-file")!.addEventListener("click", () => promptNewFile(""));
@@ -1366,13 +1371,41 @@ function setupOutputPanel(): void {
   });
 }
 
+const MAX_OUTPUT_NODES = 5000;
+let pendingOutput: { text: string; type: "stdout" | "error" | "system" }[] = [];
+let pendingFlushHandle: number | null = null;
+
 function appendOutput(text: string, type: "stdout" | "error" | "system"): void {
-  const content = document.getElementById("output-content")!;
-  const span = document.createElement("span");
-  if (type === "error") span.className = "output-error";
-  if (type === "system") span.className = "output-system";
-  span.textContent = text;
-  content.appendChild(span);
+  pendingOutput.push({ text, type });
+  if (pendingFlushHandle !== null) return;
+  pendingFlushHandle = requestAnimationFrame(flushPendingOutput);
+}
+
+function flushPendingOutput(): void {
+  pendingFlushHandle = null;
+  if (pendingOutput.length === 0) return;
+
+  const content = document.getElementById("output-content");
+  if (!content) {
+    pendingOutput = [];
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const { text, type } of pendingOutput) {
+    const span = document.createElement("span");
+    if (type === "error") span.className = "output-error";
+    if (type === "system") span.className = "output-system";
+    span.textContent = text;
+    frag.appendChild(span);
+  }
+  pendingOutput = [];
+  content.appendChild(frag);
+
+  while (content.childElementCount > MAX_OUTPUT_NODES) {
+    content.removeChild(content.firstChild!);
+  }
+
   content.scrollTop = content.scrollHeight;
 }
 

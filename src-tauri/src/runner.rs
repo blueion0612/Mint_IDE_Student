@@ -3,8 +3,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+
+const EMIT_BATCH_INTERVAL_MS: u64 = 50;
+const EMIT_BATCH_MAX_BYTES: usize = 8192;
+const MAX_OUTPUT_LINES_BEFORE_AUTO_STOP: u64 = 200_000;
 
 // Cached Python path — found once, reused forever
 static CACHED_PYTHON: Mutex<Option<String>> = Mutex::new(None);
@@ -131,22 +137,52 @@ pub fn execute_code_streaming(
         let sc1 = stdout_collected.clone();
         let sc2 = stderr_collected.clone();
 
-        // stdout: stream in real-time (line by line)
+        // stdout: batch lines into ~50ms chunks to avoid frontend event flood.
+        // Auto-stop if output line count exceeds the safety cap.
+        let line_counter = Arc::new(AtomicU64::new(0));
+        let lc1 = line_counter.clone();
+        let proc_handle1 = process_handle.clone();
         let t1 = thread::spawn(move || {
             if let Some(out) = stdout {
                 let reader = BufReader::new(out);
+                let mut buffer = String::new();
+                let mut last_flush = Instant::now();
+                let mut auto_stopped = false;
                 for line in reader.lines() {
                     if let Ok(l) = line {
-                        let text = format!("{}\n", l);
-                        sc1.lock().unwrap().push_str(&text);
-                        emit_line(&ah1, "stdout", &text);
+                        let count = lc1.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count > MAX_OUTPUT_LINES_BEFORE_AUTO_STOP {
+                            if !buffer.is_empty() {
+                                sc1.lock().unwrap().push_str(&buffer);
+                                emit_line(&ah1, "stdout", &buffer);
+                                buffer.clear();
+                            }
+                            emit_line(&ah1, "system",
+                                &format!("\n[OUTPUT LIMIT EXCEEDED — {} lines. Auto-stopping process.]\n", MAX_OUTPUT_LINES_BEFORE_AUTO_STOP));
+                            stop_process(&proc_handle1);
+                            auto_stopped = true;
+                            break;
+                        }
+                        buffer.push_str(&l);
+                        buffer.push('\n');
+                        if buffer.len() >= EMIT_BATCH_MAX_BYTES
+                            || last_flush.elapsed() >= Duration::from_millis(EMIT_BATCH_INTERVAL_MS)
+                        {
+                            sc1.lock().unwrap().push_str(&buffer);
+                            emit_line(&ah1, "stdout", &buffer);
+                            buffer.clear();
+                            last_flush = Instant::now();
+                        }
                     }
+                }
+                if !auto_stopped && !buffer.is_empty() {
+                    sc1.lock().unwrap().push_str(&buffer);
+                    emit_line(&ah1, "stdout", &buffer);
                 }
             }
         });
 
         // stderr: collect silently, display AFTER stdout finishes
-        // This prevents interleaving (traceback mixed into print output)
         let t2 = thread::spawn(move || {
             if let Some(err) = stderr {
                 let reader = BufReader::new(err);
@@ -191,11 +227,38 @@ pub fn execute_code_streaming(
     });
 }
 
-/// Stop the currently running process
+/// Stop the currently running process and its entire descendant tree.
+/// Plain `child.kill()` only kills the parent; subprocesses spawned by Python
+/// (multiprocessing, subprocess, threads with native processes) survive.
 pub fn stop_process(process_handle: &RunningProcess) -> bool {
     let mut guard = process_handle.lock().unwrap();
     if let Some(ref mut child) = *guard {
+        let pid = child.id();
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(0x08000000)
+                .output();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Negative PID targets the process group (same group as the spawned child).
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{}", pid)])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+        }
+
+        // Belt-and-suspenders: also kill the direct child handle and reap.
         let _ = child.kill();
+        let _ = child.wait();
         *guard = None;
         true
     } else {

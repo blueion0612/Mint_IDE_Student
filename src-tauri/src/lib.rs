@@ -422,8 +422,26 @@ fn python_exe_in_venv(venv_dir: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+fn try_create_venv(target: &std::path::Path, sys_python: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let target_str = target.to_string_lossy().to_string();
+    let out = silent_cmd(sys_python, &["-m", "venv", &target_str]);
+    if out.is_none() || !out.as_ref().unwrap().status.success() {
+        let err = out.and_then(|o| String::from_utf8(o.stderr).ok()).unwrap_or_default();
+        return Err(if err.is_empty() { "unknown error".to_string() } else { err });
+    }
+    if !python_exe_in_venv(target).exists() {
+        return Err("python executable missing after venv creation".to_string());
+    }
+    Ok(())
+}
+
 /// Ensure the exam venv exists and return its python executable path.
-/// Honors `custom_venv_path` from SetupConfig if set.
+/// Honors `custom_venv_path` from SetupConfig if set. Auto-falls-back to
+/// `C:\ProgramData\MINT_Exam_IDE\exam-venv` (ASCII) if default path fails —
+/// covers Windows users whose `%LOCALAPPDATA%` contains non-ASCII characters.
 #[tauri::command]
 fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
     let venv_dir = venv_dir_from_config();
@@ -441,21 +459,44 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
         text: format!("Creating exam Python venv at {}...\nUsing: {}\n", venv_dir.display(), sys_python),
     });
 
-    let venv_str = venv_dir.to_string_lossy().to_string();
-    let output = silent_cmd(&sys_python, &["-m", "venv", &venv_str]);
-    if output.is_none() || !output.as_ref().unwrap().status.success() {
-        let err_detail = output
-            .and_then(|o| String::from_utf8(o.stderr).ok())
-            .unwrap_or_else(|| "unknown".to_string());
-        return Err(format!("Failed to create Python venv at {}: {}", venv_dir.display(), err_detail));
+    match try_create_venv(&venv_dir, &sys_python) {
+        Ok(()) => {
+            let _ = app_handle.emit("run-output", runner::RunOutputLine {
+                stream: "system".to_string(),
+                text: "Exam venv ready.\n".to_string(),
+            });
+            Ok(python_exe_in_venv(&venv_dir).to_string_lossy().to_string())
+        }
+        Err(primary_err) => {
+            // Fallback: ASCII-guaranteed path (covers non-ASCII Windows usernames).
+            #[cfg(target_os = "windows")]
+            {
+                let fallback = std::path::PathBuf::from(r"C:\ProgramData\MINT_Exam_IDE\exam-venv");
+                if fallback != venv_dir {
+                    let _ = app_handle.emit("run-output", runner::RunOutputLine {
+                        stream: "system".to_string(),
+                        text: format!(
+                            "Primary venv creation failed ({}). Retrying at ASCII path {}...\n",
+                            primary_err.trim(),
+                            fallback.display()
+                        ),
+                    });
+                    if let Ok(()) = try_create_venv(&fallback, &sys_python) {
+                        let fallback_str = fallback.to_string_lossy().to_string();
+                        let mut cfg = setup::load_config();
+                        cfg.custom_venv_path = Some(fallback_str.clone());
+                        let _ = setup::save_config(&cfg);
+                        let _ = app_handle.emit("run-output", runner::RunOutputLine {
+                            stream: "system".to_string(),
+                            text: format!("Fallback venv ready at {}.\n", fallback.display()),
+                        });
+                        return Ok(python_exe_in_venv(&fallback).to_string_lossy().to_string());
+                    }
+                }
+            }
+            Err(format!("Failed to create Python venv at {}: {}", venv_dir.display(), primary_err))
+        }
     }
-
-    let _ = app_handle.emit("run-output", runner::RunOutputLine {
-        stream: "system".to_string(),
-        text: "Exam venv ready.\n".to_string(),
-    });
-
-    Ok(py_exe.to_string_lossy().to_string())
 }
 
 #[tauri::command]

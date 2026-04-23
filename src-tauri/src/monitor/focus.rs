@@ -17,7 +17,11 @@ pub fn start_focus_monitor(log: LogHandle, app_handle: AppHandle) {
 
             if was_focused && !is_our_app {
                 lost_focus_at = Some(chrono::Local::now().timestamp_millis());
-                let detail = format!("Switched to: {}", foreground_app);
+                let detail = if foreground_app.contains(" — \"") || foreground_app.contains(" (\"") {
+                    format!("Switched to: {}", foreground_app)
+                } else {
+                    format!("Switched to: {}", foreground_app)
+                };
                 let event = ActivityEvent::new("focus_lost", &detail, None, None);
                 log.add_event(event.clone());
                 let _ = app_handle.emit("activity-event", &event);
@@ -46,6 +50,8 @@ fn check_foreground_window() -> (bool, String) {
     extern "system" {
         fn GetForegroundWindow() -> isize;
         fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetWindowTextLengthW(hwnd: isize) -> i32;
+        fn GetWindowTextW(hwnd: isize, text: *mut u16, max: i32) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -71,10 +77,9 @@ fn check_foreground_window() -> (bool, String) {
         let mut fg_pid: u32 = 0;
         GetWindowThreadProcessId(fg_hwnd, &mut fg_pid);
         let our_pid = GetCurrentProcessId();
-
         let is_ours = fg_pid == our_pid;
 
-        let app_name = if is_ours {
+        let exe_name = if is_ours {
             "MINT Exam IDE".to_string()
         } else {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, fg_pid);
@@ -85,19 +90,39 @@ fn check_foreground_window() -> (bool, String) {
                 let mut size = 260u32;
                 let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
                 CloseHandle(handle);
-
                 if ok != 0 && size > 0 {
-                    let path = OsString::from_wide(&buf[..size as usize])
+                    OsString::from_wide(&buf[..size as usize])
                         .to_string_lossy()
-                        .to_string();
-                    path.rsplit('\\').next().unwrap_or("unknown").to_string()
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or("unknown")
+                        .to_string()
                 } else {
                     format!("pid:{}", fg_pid)
                 }
             }
         };
 
-        (is_ours, app_name)
+        // Window title (e.g. "ChatGPT - Google Chrome")
+        let title_len = GetWindowTextLengthW(fg_hwnd);
+        let title = if title_len > 0 {
+            let mut tbuf = vec![0u16; (title_len + 1) as usize];
+            let n = GetWindowTextW(fg_hwnd, tbuf.as_mut_ptr(), title_len + 1);
+            if n > 0 {
+                OsString::from_wide(&tbuf[..n as usize]).to_string_lossy().into_owned()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let label = if is_ours || title.is_empty() {
+            exe_name
+        } else {
+            format!("{} — \"{}\"", exe_name, title)
+        };
+        (is_ours, label)
     }
 }
 

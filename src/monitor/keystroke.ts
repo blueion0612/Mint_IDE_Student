@@ -7,7 +7,7 @@ interface InputEvent {
   to: number;
 }
 
-const PASTE_THRESHOLD = 30; // chars — above this, flag as significant paste
+const PASTE_THRESHOLD = 100; // chars — above this, flag as paste_large (was 30)
 const BURST_WINDOW_MS = 100; // time window for burst detection
 const BURST_CHAR_THRESHOLD = 20; // chars in burst window = suspicious
 
@@ -78,6 +78,11 @@ export function handleEditorInput(event: InputEvent): void {
       timeDeltaMs: timeDelta,
     });
     burstBuffer = [];
+  }
+
+  // Track typing for periodic typing_summary (every 30s — see flushTypingSummary below).
+  if (event.inputType === "insertText" && event.text.length > 0) {
+    trackTyping(event.text.length);
   }
 }
 

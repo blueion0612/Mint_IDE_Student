@@ -34,7 +34,7 @@ pub fn start_clipboard_monitor(log: LogHandle, app_handle: AppHandle) {
                     current.clone()
                 };
 
-                let source = detect_clipboard_source();
+                let (source, window_title) = detect_clipboard_source();
 
                 let event_type = if source == "self" {
                     "clipboard_internal"
@@ -42,9 +42,15 @@ pub fn start_clipboard_monitor(log: LogHandle, app_handle: AppHandle) {
                     "clipboard_external"
                 };
 
+                let title_part = if window_title.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", window_title)
+                };
                 let detail = format!(
-                    "[Source: {}] {}",
+                    "[Source: {}{}] {}",
                     source,
+                    title_part,
                     truncated.replace('\n', "\\n").replace('\r', "")
                 );
 
@@ -59,14 +65,17 @@ pub fn start_clipboard_monitor(log: LogHandle, app_handle: AppHandle) {
 }
 
 #[cfg(target_os = "windows")]
-fn detect_clipboard_source() -> String {
+fn detect_clipboard_source() -> (String, String) {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
     #[link(name = "user32")]
     extern "system" {
         fn GetClipboardOwner() -> isize;
+        fn GetForegroundWindow() -> isize;
         fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetWindowTextLengthW(hwnd: isize) -> i32;
+        fn GetWindowTextW(hwnd: isize, text: *mut u16, max: i32) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -82,51 +91,68 @@ fn detect_clipboard_source() -> String {
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
-    let exe_name: String = unsafe {
+    fn read_title(hwnd: isize) -> String {
+        unsafe {
+            let len = GetWindowTextLengthW(hwnd);
+            if len <= 0 { return String::new(); }
+            let mut buf = vec![0u16; (len + 1) as usize];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
+            if n > 0 {
+                OsString::from_wide(&buf[..n as usize]).to_string_lossy().into_owned()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    let (exe_name, title): (String, String) = unsafe {
         let hwnd = GetClipboardOwner();
-        if hwnd == 0 { return "unknown".to_string(); }
+        if hwnd == 0 { return ("unknown".to_string(), String::new()); }
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid == 0 { return "unknown".to_string(); }
+        if pid == 0 { return ("unknown".to_string(), String::new()); }
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle == 0 { return format!("pid:{}", pid); }
-        let mut buf = [0u16; 260];
-        let mut size = 260u32;
-        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
-        CloseHandle(handle);
-        if ok != 0 && size > 0 {
-            OsString::from_wide(&buf[..size as usize])
-                .to_string_lossy()
-                .rsplit('\\')
-                .next()
-                .unwrap_or("unknown")
-                .to_string()
+        let exe = if handle == 0 {
+            format!("pid:{}", pid)
         } else {
-            return format!("pid:{}", pid);
+            let mut buf = [0u16; 260];
+            let mut size = 260u32;
+            let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+            CloseHandle(handle);
+            if ok != 0 && size > 0 {
+                OsString::from_wide(&buf[..size as usize])
+                    .to_string_lossy()
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            } else {
+                format!("pid:{}", pid)
+            }
+        };
+        // Title from clipboard owner; fall back to foreground window if empty.
+        let mut t = read_title(hwnd);
+        if t.is_empty() {
+            t = read_title(GetForegroundWindow());
         }
+        (exe, t)
     };
 
-    // Compare against own exe name (e.g. "mint-exam-ide.exe") and the
-    // Tauri/WebView2 helper process. Both belong to "us" — clipboard activity
-    // from these is internal copy/paste, not a sign of external tools.
     let own_exe = std::env::current_exe().ok()
         .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
         .unwrap_or_default();
 
     let lc = exe_name.to_ascii_lowercase();
-    if !own_exe.is_empty() && lc == own_exe.to_ascii_lowercase() {
-        return "self".to_string();
-    }
-    if lc == "msedgewebview2.exe" {
-        // Tauri Windows bundle uses Edge WebView2; the helper process owns the
-        // clipboard when the user copies/pastes inside our window.
-        return "self".to_string();
+    if (!own_exe.is_empty() && lc == own_exe.to_ascii_lowercase())
+        || lc == "msedgewebview2.exe"
+    {
+        return ("self".to_string(), title);
     }
 
-    exe_name
+    (exe_name, title)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn detect_clipboard_source() -> String {
-    "external".to_string()
+fn detect_clipboard_source() -> (String, String) {
+    ("external".to_string(), String::new())
 }

@@ -1096,8 +1096,35 @@ fn submit_exam(
         }
     }
 
-    // 8. Manifest (includes IDE integrity fingerprint)
+    // 8. Manifest (IDE integrity + student setup + suspicious event timestamps)
     let ide_exe_hash = compute_self_hash().unwrap_or_else(|| "unavailable".to_string());
+    let cfg = setup::load_config();
+
+    // Recording start epoch_ms — used to compute video offset for suspicious events.
+    let rec_start_ms: Option<i64> = state.activity_log.lock().unwrap().get_events().iter()
+        .find(|e| e.event_type == "recording_start")
+        .map(|e| e.epoch_ms);
+
+    // Suspicious events with seconds-from-recording-start (helps grader jump to video).
+    let suspect_types = [
+        "tamper_detected","tamper_new_file","tamper_deleted",
+        "clipboard_external","paste_large","focus_lost","file_import",
+    ];
+    let mut suspect_events: Vec<serde_json::Value> = Vec::new();
+    if let Some(start) = rec_start_ms {
+        for e in state.activity_log.lock().unwrap().get_events().iter() {
+            if !suspect_types.contains(&e.event_type.as_str()) { continue; }
+            let offset_s = ((e.epoch_ms - start) as f64) / 1000.0;
+            if offset_s < 0.0 { continue; }
+            suspect_events.push(serde_json::json!({
+                "t": e.timestamp,
+                "type": e.event_type,
+                "video_offset_s": (offset_s * 10.0).round() / 10.0,
+                "detail": e.detail,
+            }));
+        }
+    }
+
     let manifest = serde_json::json!({
         "student_id": student_id,
         "timestamp": timestamp,
@@ -1107,6 +1134,15 @@ fn submit_exam(
         "ide_commit_sha": env!("MINT_GIT_SHA"),
         "ide_build_time": env!("MINT_BUILD_TIME"),
         "ide_exe_hash": ide_exe_hash,
+        "setup_config": {
+            "package_profile": cfg.package_profile,
+            "custom_packages": cfg.custom_packages,
+            "recording_enabled": cfg.recording_enabled,
+            "include_sample_code": cfg.include_sample_code,
+            "custom_venv_path": cfg.custom_venv_path,
+        },
+        "recording_start_epoch_ms": rec_start_ms,
+        "suspect_events": suspect_events,
     });
     let _ = std::fs::write(
         submit_dir.join("manifest.json"),

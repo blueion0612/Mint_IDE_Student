@@ -1443,6 +1443,53 @@ body {
   word-break: break-all;
 }
 
+.wiz-venv-row {
+  display: flex;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.wiz-venv-row.hidden { display: none; }
+
+.wiz-path-input {
+  flex: 1;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: "Cascadia Code", monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+  outline: none;
+}
+
+.wiz-build-info {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wiz-build-info code {
+  font-family: "Cascadia Code", monospace;
+  color: var(--text-primary);
+}
+
+.wiz-build-label {
+  color: var(--text-muted);
+  display: inline-block;
+  min-width: 80px;
+}
+
+.wiz-build-hash {
+  word-break: break-all;
+  font-size: 10px;
+}
+
 .wiz-progress {
   padding: 12px 0;
 }

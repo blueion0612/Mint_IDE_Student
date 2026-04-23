@@ -406,21 +406,28 @@ fn save_code_history(ws: State<WorkspaceState>, history_json: String) -> Result<
 
 // ===== Exam Python Environment =====
 
-/// Ensure the exam venv exists and return its python executable path.
-/// Creates the venv if missing. Always returns the venv path (never falls back
-/// to system Python) so the in-app wizard installs packages into the venv.
-#[tauri::command]
-fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
-    let venv_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
-        .join("MINT_Exam_IDE")
-        .join("exam-venv");
+fn venv_dir_from_config() -> std::path::PathBuf {
+    let cfg = setup::load_config();
+    match cfg.custom_venv_path {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => setup::default_venv_path(),
+    }
+}
 
-    let py_exe = if cfg!(windows) {
+fn python_exe_in_venv(venv_dir: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(windows) {
         venv_dir.join("Scripts").join("python.exe")
     } else {
         venv_dir.join("bin").join("python")
-    };
+    }
+}
+
+/// Ensure the exam venv exists and return its python executable path.
+/// Honors `custom_venv_path` from SetupConfig if set.
+#[tauri::command]
+fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
+    let venv_dir = venv_dir_from_config();
+    let py_exe = python_exe_in_venv(&venv_dir);
 
     if py_exe.exists() {
         return Ok(py_exe.to_string_lossy().to_string());
@@ -431,19 +438,88 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
 
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
-        text: format!("Creating exam Python venv...\nUsing: {}\n", sys_python),
+        text: format!("Creating exam Python venv at {}...\nUsing: {}\n", venv_dir.display(), sys_python),
     });
 
     let venv_str = venv_dir.to_string_lossy().to_string();
     let output = silent_cmd(&sys_python, &["-m", "venv", &venv_str]);
     if output.is_none() || !output.as_ref().unwrap().status.success() {
-        return Err("Failed to create Python venv".to_string());
+        let err_detail = output
+            .and_then(|o| String::from_utf8(o.stderr).ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(format!("Failed to create Python venv at {}: {}", venv_dir.display(), err_detail));
     }
 
     let _ = app_handle.emit("run-output", runner::RunOutputLine {
         stream: "system".to_string(),
         text: "Exam venv ready.\n".to_string(),
     });
+
+    Ok(py_exe.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_current_venv_path() -> String {
+    venv_dir_from_config().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn get_default_venv_path() -> String {
+    setup::default_venv_path().to_string_lossy().to_string()
+}
+
+/// Delete existing venv (if any) and create a new one at `path` (or default).
+/// Saves the resulting path to SetupConfig.custom_venv_path.
+#[tauri::command]
+fn recreate_venv(app_handle: tauri::AppHandle, path: Option<String>) -> Result<String, String> {
+    let target_dir = match path.as_deref() {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => setup::default_venv_path(),
+    };
+
+    // Wipe existing venv at target (if exists)
+    if target_dir.exists() {
+        std::fs::remove_dir_all(&target_dir)
+            .map_err(|e| format!("Failed to remove existing venv: {}", e))?;
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+    }
+
+    let sys_python = find_system_python()
+        .ok_or("Python not found. Please install Python first.")?;
+
+    let _ = app_handle.emit("run-output", runner::RunOutputLine {
+        stream: "system".to_string(),
+        text: format!("Creating new venv at {}...\n", target_dir.display()),
+    });
+
+    let target_str = target_dir.to_string_lossy().to_string();
+    let output = silent_cmd(&sys_python, &["-m", "venv", &target_str]);
+    if output.is_none() || !output.as_ref().unwrap().status.success() {
+        let err_detail = output
+            .and_then(|o| String::from_utf8(o.stderr).ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(format!("venv creation failed at {}: {}", target_dir.display(), err_detail));
+    }
+
+    let py_exe = python_exe_in_venv(&target_dir);
+    if !py_exe.exists() {
+        return Err(format!("venv created but python.exe not found at {}", py_exe.display()));
+    }
+
+    // Save path to config (None if it's the default)
+    let mut cfg = setup::load_config();
+    let default = setup::default_venv_path();
+    cfg.custom_venv_path = if target_dir == default {
+        None
+    } else {
+        Some(target_str.clone())
+    };
+    setup::save_config(&cfg)?;
 
     Ok(py_exe.to_string_lossy().to_string())
 }
@@ -771,6 +847,34 @@ fn hash_student_id(student_id: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// SHA-256 of the currently running executable. Used for tamper detection.
+fn compute_self_hash() -> Option<String> {
+    use sha2::{Sha256, Digest};
+    use std::io::Read;
+
+    let exe_path = std::env::current_exe().ok()?;
+    let mut file = std::fs::File::open(&exe_path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+#[tauri::command]
+fn get_build_info() -> serde_json::Value {
+    serde_json::json!({
+        "commit_sha": env!("MINT_GIT_SHA"),
+        "build_time": env!("MINT_BUILD_TIME"),
+        "exe_hash": compute_self_hash().unwrap_or_else(|| "unavailable".to_string()),
+    })
+}
+
 #[tauri::command]
 fn submit_exam(
     app_handle: tauri::AppHandle,
@@ -871,13 +975,17 @@ fn submit_exam(
         }
     }
 
-    // 8. Manifest
+    // 8. Manifest (includes IDE integrity fingerprint)
+    let ide_exe_hash = compute_self_hash().unwrap_or_else(|| "unavailable".to_string());
     let manifest = serde_json::json!({
         "student_id": student_id,
         "timestamp": timestamp,
         "hash_check": &password[..16],
         "video_count": video_count,
         "video_obfuscated": true,
+        "ide_commit_sha": env!("MINT_GIT_SHA"),
+        "ide_build_time": env!("MINT_BUILD_TIME"),
+        "ide_exe_hash": ide_exe_hash,
     });
     let _ = std::fs::write(
         submit_dir.join("manifest.json"),
@@ -1062,6 +1170,10 @@ pub fn run() {
             get_home_dir,
             get_recordings_dir,
             get_workspaces_dir,
+            get_current_venv_path,
+            get_default_venv_path,
+            recreate_venv,
+            get_build_info,
             read_setup_config,
             write_setup_config,
             package_list_for_profile,

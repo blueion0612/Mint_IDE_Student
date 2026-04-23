@@ -562,6 +562,15 @@ fn install_exam_packages(py_str: &str, app_handle: &tauri::AppHandle) -> Result<
 }
 
 fn find_system_python() -> Option<String> {
+    // Priority 1: MINT-dedicated Python (installed by install-windows.ps1 — ASCII path + tcl/tk verified).
+    #[cfg(target_os = "windows")]
+    {
+        let mint_py = "C:\\ProgramData\\MINT_Python\\Python312\\python.exe";
+        if std::path::Path::new(mint_py).exists() {
+            return Some(mint_py.to_string());
+        }
+    }
+
     let candidates = if cfg!(target_os = "windows") {
         vec!["python", "python3", "py"]
     } else {

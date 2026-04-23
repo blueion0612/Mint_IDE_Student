@@ -29,6 +29,32 @@ pub fn new_running_process() -> RunningProcess {
     Arc::new(Mutex::new(None))
 }
 
+fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut std::collections::HashSet<String>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let rel = path.strip_prefix(root).unwrap_or(&path)
+                    .to_string_lossy().replace('\\', "/");
+                // Skip dot/underscore prefixed (logs/temp)
+                if rel.starts_with('.') || rel.starts_with('_')
+                   || rel.split('/').any(|seg| seg.starts_with('.') || seg.starts_with('_'))
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.insert(rel);
+                }
+            }
+        }
+    }
+    walk(root, root, &mut out);
+    out
+}
+
 /// Execute code with real-time streaming output via events.
 /// Returns immediately — output comes through "run-output" events.
 pub fn execute_code_streaming(
@@ -39,11 +65,17 @@ pub fn execute_code_streaming(
     python_path: Option<&str>,
     app_handle: AppHandle,
     process_handle: RunningProcess,
+    known_writes: crate::monitor::KnownWrites,
 ) {
     let work_dir = workspace_dir
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("mint-exam-ide"));
     let _ = std::fs::create_dir_all(&work_dir);
+
+    // Snapshot workspace files BEFORE running, so we can register any new
+    // files the student's code creates (e.g. plt.savefig, df.to_csv) as
+    // known writes — preventing tamper_new_file false positives.
+    let pre_snapshot = snapshot_workspace_files(&work_dir);
 
     let lang = language.to_string();
     let code = code.to_string();
@@ -218,6 +250,12 @@ pub fn execute_code_streaming(
         {
             let mut guard = process_handle.lock().unwrap();
             *guard = None;
+        }
+
+        // Register new files created by the student's code as known writes.
+        let post_snapshot = snapshot_workspace_files(&dir);
+        for new_rel in post_snapshot.difference(&pre_snapshot) {
+            crate::monitor::mark_known_write(&known_writes, new_rel);
         }
 
         let elapsed = start.elapsed().as_millis() as u64;

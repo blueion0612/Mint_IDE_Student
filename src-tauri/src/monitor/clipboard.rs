@@ -63,7 +63,6 @@ fn detect_clipboard_source() -> String {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
-    // Use raw Win32 FFI for maximum compatibility
     #[link(name = "user32")]
     extern "system" {
         fn GetClipboardOwner() -> isize;
@@ -83,40 +82,48 @@ fn detect_clipboard_source() -> String {
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
-    unsafe {
+    let exe_name: String = unsafe {
         let hwnd = GetClipboardOwner();
-        if hwnd == 0 {
-            return "unknown".to_string();
-        }
-
+        if hwnd == 0 { return "unknown".to_string(); }
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid == 0 {
-            return "unknown".to_string();
-        }
-
+        if pid == 0 { return "unknown".to_string(); }
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle == 0 {
-            return format!("pid:{}", pid);
-        }
-
+        if handle == 0 { return format!("pid:{}", pid); }
         let mut buf = [0u16; 260];
         let mut size = 260u32;
         let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
         CloseHandle(handle);
-
         if ok != 0 && size > 0 {
-            let path = OsString::from_wide(&buf[..size as usize])
+            OsString::from_wide(&buf[..size as usize])
                 .to_string_lossy()
-                .to_string();
-            path.rsplit('\\')
+                .rsplit('\\')
                 .next()
                 .unwrap_or("unknown")
                 .to_string()
         } else {
-            format!("pid:{}", pid)
+            return format!("pid:{}", pid);
         }
+    };
+
+    // Compare against own exe name (e.g. "mint-exam-ide.exe") and the
+    // Tauri/WebView2 helper process. Both belong to "us" — clipboard activity
+    // from these is internal copy/paste, not a sign of external tools.
+    let own_exe = std::env::current_exe().ok()
+        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+
+    let lc = exe_name.to_ascii_lowercase();
+    if !own_exe.is_empty() && lc == own_exe.to_ascii_lowercase() {
+        return "self".to_string();
     }
+    if lc == "msedgewebview2.exe" {
+        // Tauri Windows bundle uses Edge WebView2; the helper process owns the
+        // clipboard when the user copies/pastes inside our window.
+        return "self".to_string();
+    }
+
+    exe_name
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -7,12 +7,29 @@ interface InputEvent {
   to: number;
 }
 
-const PASTE_THRESHOLD = 100; // chars — above this, flag as paste_large (was 30)
-const BURST_WINDOW_MS = 100; // time window for burst detection
-const BURST_CHAR_THRESHOLD = 20; // chars in burst window = suspicious
+const PASTE_THRESHOLD = 100; // chars — above this, flag as paste_large
+// Burst tuned for "watch-and-type from external source" detection.
+// Normal fast typing rarely sustains 15 chars in 200ms (= 75 cps), but
+// transcribing from an external screen often hits this rate.
+const BURST_WINDOW_MS = 200;
+const BURST_CHAR_THRESHOLD = 15;
 
 let lastInputTime = 0;
 let burstBuffer: { time: number; chars: number }[] = [];
+
+// Buffer the last clipboard event seen by the frontend so paste events can
+// reference where the clipboard content most likely came from.
+interface ClipboardSnapshot {
+  source: string;          // process name (or "self")
+  windowTitle: string;     // foreground window title at copy time, if any
+  isExternal: boolean;
+  epochMs: number;
+}
+let lastClipboard: ClipboardSnapshot | null = null;
+
+export function noteClipboardEvent(snapshot: ClipboardSnapshot): void {
+  lastClipboard = snapshot;
+}
 
 export function handleEditorInput(event: InputEvent): void {
   const now = performance.now();
@@ -55,9 +72,17 @@ export function handleEditorInput(event: InputEvent): void {
       ? event.text.substring(0, 100).replace(/\n/g, "\\n") + "..."
       : event.text.replace(/\n/g, "\\n");
 
+    // Attach source-of-clipboard hint if it was set within the last 5s.
+    let sourceHint = "";
+    if (lastClipboard && Date.now() - lastClipboard.epochMs < 5000) {
+      const tag = lastClipboard.isExternal ? "external" : "self";
+      const titlePart = lastClipboard.windowTitle ? ` (${lastClipboard.windowTitle})` : "";
+      sourceHint = ` [from ${tag}: ${lastClipboard.source}${titlePart}]`;
+    }
+
     invoke("log_editor_event", {
       eventType,
-      detail: `Pasted ${charCount} chars: ${preview}`,
+      detail: `Pasted ${charCount} chars${sourceHint}: ${preview}`,
       charCount,
       timeDeltaMs: timeDelta,
     });

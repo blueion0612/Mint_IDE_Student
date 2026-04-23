@@ -77,11 +77,10 @@ fn check_foreground_window() -> (bool, String) {
         let mut fg_pid: u32 = 0;
         GetWindowThreadProcessId(fg_hwnd, &mut fg_pid);
         let our_pid = GetCurrentProcessId();
-        let is_ours = fg_pid == our_pid;
 
-        let exe_name = if is_ours {
-            "MINT Exam IDE".to_string()
-        } else {
+        // Always extract the exe name first so we can also detect Tauri's
+        // WebView2 helper process (different PID than our main, but still us).
+        let raw_exe = {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, fg_pid);
             if handle == 0 {
                 format!("pid:{}", fg_pid)
@@ -101,6 +100,15 @@ fn check_foreground_window() -> (bool, String) {
                     format!("pid:{}", fg_pid)
                 }
             }
+        };
+
+        let is_ours = fg_pid == our_pid
+            || raw_exe.eq_ignore_ascii_case("msedgewebview2.exe");
+
+        let exe_name = if is_ours {
+            "MINT Exam IDE".to_string()
+        } else {
+            raw_exe
         };
 
         // Window title (e.g. "ChatGPT - Google Chrome")

@@ -152,7 +152,24 @@ fn detect_clipboard_source() -> (String, String) {
     (exe_name, title)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn detect_clipboard_source() -> (String, String) {
+    use std::process::Command;
+    // macOS doesn't expose pasteboard owner directly; the best proxy is the
+    // currently-frontmost app, which is the app the user just copied from.
+    let out = Command::new("osascript")
+        .args(["-e", "tell application \"System Events\" to get name of first application process whose frontmost is true"])
+        .output();
+    let app = match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => return ("unknown".to_string(), String::new()),
+    };
+    let is_self = app.contains("MINT") || app.eq_ignore_ascii_case("mint-exam-ide");
+    let source = if is_self { "self".to_string() } else { app.clone() };
+    (source, String::new())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn detect_clipboard_source() -> (String, String) {
     ("external".to_string(), String::new())
 }

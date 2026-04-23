@@ -74,34 +74,8 @@ if ($missing.Count -gt 0) {
     Write-Host "[2/5] All system deps installed." -ForegroundColor Green
 }
 
-# ─── 3. Create empty exam Python venv (packages installed by IDE wizard) ───
-Write-Host "[3/5] Creating exam Python environment (empty)..." -ForegroundColor Yellow
-
-$venvDir = "$env:LOCALAPPDATA\MINT_Exam_IDE\exam-venv"
-$venvPy = "$venvDir\Scripts\python.exe"
-
-# Find Python
-$pyCmd = $null
-if (Test-Cmd "python") { $pyCmd = "python" }
-elseif (Test-Cmd "py") { $pyCmd = "py" }
-
-if ($pyCmd) {
-    if (-not (Test-Path $venvPy)) {
-        Write-Host "  Creating venv at $venvDir..."
-        & $pyCmd -m venv $venvDir
-    } else {
-        Write-Host "  Venv already exists at $venvDir" -ForegroundColor Green
-    }
-    cmd /c "`"$venvPy`" -m pip install --upgrade pip 2>NUL" | Out-Null
-    Write-Host "  [OK] Empty venv ready. Packages will be installed by the IDE on first launch." -ForegroundColor Green
-} else {
-    Write-Host "  [SKIP] Python not found — exam venv not created" -ForegroundColor Yellow
-}
-
-Write-Host ""
-
-# ─── 4. Download & Install IDE ───
-Write-Host "[4/5] Downloading MINT Exam IDE..." -ForegroundColor Yellow
+# ─── 3. Download & Install IDE (venv is created by the IDE on first launch) ───
+Write-Host "[3/4] Downloading MINT Exam IDE..." -ForegroundColor Yellow
 
 $releases = Invoke-RestMethod "https://api.github.com/repos/blueion0612/Mint_IDE_Student/releases?per_page=10"
 $exeAsset = $null
@@ -115,7 +89,7 @@ if ($exeAsset) {
     Write-Host "  Downloading..."
     Invoke-WebRequest -Uri $exeAsset.browser_download_url -OutFile $tmpPath -UseBasicParsing
 
-    Write-Host "[5/5] Running installer..." -ForegroundColor Yellow
+    Write-Host "[4/4] Running installer..." -ForegroundColor Yellow
     Start-Process -FilePath $tmpPath -Wait
     Remove-Item $tmpPath -ErrorAction SilentlyContinue
 } else {

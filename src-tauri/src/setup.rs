@@ -9,6 +9,8 @@ pub struct SetupConfig {
     pub recording_enabled: bool,
     pub include_sample_code: bool,
     pub config_version: u32,
+    #[serde(default)]
+    pub custom_venv_path: Option<String>,
 }
 
 impl Default for SetupConfig {
@@ -19,16 +21,24 @@ impl Default for SetupConfig {
             custom_packages: Vec::new(),
             recording_enabled: true,
             include_sample_code: true,
-            config_version: 1,
+            config_version: 2,
+            custom_venv_path: None,
         }
     }
 }
 
-pub fn config_path() -> PathBuf {
+pub fn app_data_root() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
         .join("MINT_Exam_IDE")
-        .join("setup_config.json")
+}
+
+pub fn default_venv_path() -> PathBuf {
+    app_data_root().join("exam-venv")
+}
+
+pub fn config_path() -> PathBuf {
+    app_data_root().join("setup_config.json")
 }
 
 pub fn load_config() -> SetupConfig {

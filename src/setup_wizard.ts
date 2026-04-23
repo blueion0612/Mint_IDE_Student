@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 export interface SetupConfig {
   setup_done: boolean;
@@ -8,6 +9,7 @@ export interface SetupConfig {
   recording_enabled: boolean;
   include_sample_code: boolean;
   config_version: number;
+  custom_venv_path?: string | null;
 }
 
 const PROFILE_LABELS: Record<string, string> = {
@@ -49,6 +51,16 @@ export async function showSettingsModal(currentPython: string | null): Promise<S
   try {
     installed = await invoke<string[]>("list_installed_packages", { pythonPath: currentPython });
   } catch { /* ignore */ }
+  let defaultVenv = "";
+  let currentVenv = "";
+  try {
+    defaultVenv = await invoke<string>("get_default_venv_path");
+    currentVenv = await invoke<string>("get_current_venv_path");
+  } catch { /* ignore */ }
+  let buildInfo: { commit_sha: string; build_time: string; exe_hash: string } | null = null;
+  try {
+    buildInfo = await invoke("get_build_info");
+  } catch { /* ignore */ }
   return await openModal({
     mode: "settings",
     initial,
@@ -56,6 +68,9 @@ export async function showSettingsModal(currentPython: string | null): Promise<S
     submitLabel: "변경 사항 적용",
     installedPackages: installed,
     pythonPath: currentPython,
+    defaultVenvPath: defaultVenv,
+    currentVenvPath: currentVenv,
+    buildInfo,
   });
 }
 
@@ -66,6 +81,9 @@ interface ModalOptions {
   submitLabel: string;
   installedPackages?: string[];
   pythonPath?: string | null;
+  defaultVenvPath?: string;
+  currentVenvPath?: string;
+  buildInfo?: { commit_sha: string; build_time: string; exe_hash: string } | null;
 }
 
 function openModal(opts: ModalOptions): Promise<SetupConfig> {
@@ -78,6 +96,8 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
     let profile = opts.initial.package_profile || "basic";
     let recording = opts.initial.recording_enabled;
     let sampleCode = opts.initial.include_sample_code;
+    let venvMode: "default" | "custom" = opts.initial.custom_venv_path ? "custom" : "default";
+    let customVenvPath: string = opts.initial.custom_venv_path ?? "";
 
     overlay.innerHTML = `
       <div class="wizard-modal">
@@ -144,9 +164,42 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
 
           ${opts.mode === "settings" ? `
             <section class="wiz-section">
-              <div class="wiz-section-title">4. 초기 설정</div>
+              <div class="wiz-section-title">4. Python 환경 (venv)</div>
+              <div class="wiz-section-hint">현재: <code>${escapeHtml(opts.currentVenvPath ?? "")}</code></div>
+              <label class="wiz-radio">
+                <input type="radio" name="venv-mode" value="default" ${!opts.initial.custom_venv_path ? "checked" : ""} />
+                <span class="wiz-radio-label">Default 경로 사용 (<code>${escapeHtml(opts.defaultVenvPath ?? "")}</code>)</span>
+              </label>
+              <label class="wiz-radio">
+                <input type="radio" name="venv-mode" value="custom" ${opts.initial.custom_venv_path ? "checked" : ""} />
+                <span class="wiz-radio-label">자체 지정 경로 사용</span>
+              </label>
+              <div id="venv-custom-row" class="wiz-venv-row${opts.initial.custom_venv_path ? "" : " hidden"}">
+                <input type="text" id="venv-custom-path" class="wiz-path-input" readonly value="${escapeAttr(opts.initial.custom_venv_path ?? "")}" placeholder="폴더 선택 버튼을 누르세요" />
+                <button class="wiz-mini-btn" id="venv-browse">폴더 선택...</button>
+              </div>
+              <div class="wiz-extra-actions">
+                <button class="wiz-mini-btn wiz-danger" id="venv-recreate">venv 재설치 (기존 삭제 후 생성)</button>
+              </div>
+              <div class="wiz-section-hint">경로 변경은 [변경 사항 적용] 후 적용됩니다. 재설치는 즉시.</div>
+            </section>
+
+            <section class="wiz-section">
+              <div class="wiz-section-title">5. 초기 설정</div>
               <button class="wiz-mini-btn" id="wiz-rerun-wizard">초기 설정 위자드 다시 열기</button>
             </section>
+
+            ${opts.buildInfo ? `
+              <section class="wiz-section">
+                <div class="wiz-section-title">6. 빌드 정보</div>
+                <div class="wiz-build-info">
+                  <div><span class="wiz-build-label">commit</span> <code>${escapeHtml(opts.buildInfo.commit_sha)}</code></div>
+                  <div><span class="wiz-build-label">build</span> <code>${escapeHtml(opts.buildInfo.build_time)}</code></div>
+                  <div><span class="wiz-build-label">exe SHA-256</span> <code class="wiz-build-hash">${escapeHtml(opts.buildInfo.exe_hash)}</code></div>
+                </div>
+                <div class="wiz-section-hint">제출 시 manifest.json에 자동 기록되어 채점자가 IDE 무결성을 확인할 수 있습니다.</div>
+              </section>
+            ` : ""}
           ` : ""}
 
           <section class="wiz-progress hidden" id="wiz-progress-section">
@@ -219,6 +272,52 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
         const cfg = await showSetupWizard();
         resolve(cfg);
       });
+
+      const venvRadios = overlay.querySelectorAll<HTMLInputElement>('input[name="venv-mode"]');
+      const customRow = overlay.querySelector("#venv-custom-row") as HTMLElement;
+      const customInput = overlay.querySelector("#venv-custom-path") as HTMLInputElement;
+      venvRadios.forEach(r => r.addEventListener("change", () => {
+        if (r.checked) {
+          venvMode = r.value as "default" | "custom";
+          if (venvMode === "custom") customRow.classList.remove("hidden");
+          else customRow.classList.add("hidden");
+        }
+      }));
+
+      overlay.querySelector("#venv-browse")!.addEventListener("click", async () => {
+        const picked = await openDialog({ directory: true, title: "venv를 설치할 폴더를 선택하세요" });
+        if (!picked) return;
+        const dir = typeof picked === "string" ? picked : String(picked);
+        const finalPath = dir.endsWith("exam-venv") || dir.endsWith("exam-venv/") || dir.endsWith("exam-venv\\")
+          ? dir
+          : `${dir.replace(/[\\/]+$/, "")}/exam-venv`;
+        customVenvPath = finalPath;
+        customInput.value = finalPath;
+      });
+
+      overlay.querySelector("#venv-recreate")!.addEventListener("click", async () => {
+        if (!confirm("기존 venv를 삭제하고 새로 생성합니다. 기존 패키지는 모두 지워지며 재설치 필요. 진행하시겠습니까?")) return;
+        const targetPath = venvMode === "custom"
+          ? (customVenvPath || null)
+          : null;
+        if (venvMode === "custom" && !customVenvPath) {
+          alert("자체 지정 모드인데 경로가 비어있습니다. 폴더를 먼저 선택해 주세요.");
+          return;
+        }
+        const btn = overlay.querySelector("#venv-recreate") as HTMLButtonElement;
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = "재설치 중...";
+        try {
+          const newPath = await invoke<string>("recreate_venv", { path: targetPath });
+          alert(`venv 재설치 완료:\n${newPath}\n\n패키지는 [변경 사항 적용] 시 선택한 프로파일로 설치됩니다.`);
+        } catch (e) {
+          alert(`venv 재설치 실패: ${e}`);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      });
     }
 
     overlay.querySelector("#wiz-submit")!.addEventListener("click", async () => {
@@ -228,7 +327,8 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
         custom_packages: profile === "custom" ? collectCustom() : opts.initial.custom_packages,
         recording_enabled: recording,
         include_sample_code: sampleCode,
-        config_version: 1,
+        config_version: 2,
+        custom_venv_path: venvMode === "custom" && customVenvPath ? customVenvPath : null,
       };
 
       const packages = await invoke<string[]>("package_list_for_profile", {

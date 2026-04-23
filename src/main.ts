@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { createEditor, setLanguage, markErrorLines, clearErrors, type SupportedLanguage } from "./editor/setup";
-import { handleEditorInput, flushTypingSummary } from "./monitor/keystroke";
+import { handleEditorInput, flushTypingSummary, noteClipboardEvent } from "./monitor/keystroke";
 import { recordTransaction, setCurrentFile, markNextInputSource, getEditHistoryJSON } from "./monitor/edithistory";
 import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook, isNotebookRunning } from "./editor/notebook";
 import { showSetupWizard, showSettingsModal, loadConfig, type SetupConfig } from "./setup_wizard";
@@ -1594,7 +1594,20 @@ function updateStatusBar(event: ActivityEvent): void {
 // ===== Backend Event Listener =====
 async function listenForBackendEvents(): Promise<void> {
   await listen<ActivityEvent>("activity-event", (event) => {
-    appendLogEntry(event.payload);
+    const ev = event.payload;
+    appendLogEntry(ev);
+    // Capture clipboard events so paste source can be attributed accurately.
+    if (ev.event_type === "clipboard_internal" || ev.event_type === "clipboard_external") {
+      const m = ev.detail.match(/^\[Source: ([^\]\s(]+)(?:\s*\(([^)]*)\))?\]/);
+      const source = m?.[1] ?? "unknown";
+      const windowTitle = m?.[2] ?? "";
+      noteClipboardEvent({
+        source,
+        windowTitle,
+        isExternal: ev.event_type === "clipboard_external",
+        epochMs: Date.now(),
+      });
+    }
   });
 
   // Real-time code output

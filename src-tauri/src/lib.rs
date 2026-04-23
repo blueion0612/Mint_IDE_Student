@@ -89,6 +89,7 @@ fn run_code(
         python_path.as_deref(),
         app_handle,
         (*process).clone(),
+        (*kw).clone(),
     );
 
     Ok(())
@@ -824,10 +825,26 @@ fn ws_read_file_base64(ws: State<WorkspaceState>, path: String) -> Result<String
 }
 
 #[tauri::command]
-fn ws_write_file(ws: State<WorkspaceState>, kw: State<KnownWrites>, path: String, content: String) -> Result<(), String> {
+fn ws_write_file(
+    app_handle: tauri::AppHandle,
+    state: State<AppState>,
+    ws: State<WorkspaceState>,
+    kw: State<KnownWrites>,
+    path: String,
+    content: String,
+) -> Result<(), String> {
     mark_known_write(&kw, &path);
     let guard = ws.lock().map_err(|e| e.to_string())?;
-    guard.as_ref().ok_or("No workspace initialized".to_string())?.write_file(&path, &content)
+    guard.as_ref().ok_or("No workspace initialized".to_string())?.write_file(&path, &content)?;
+    let event = ActivityEvent::new(
+        "file_save",
+        &format!("Saved {} ({} bytes)", path, content.len()),
+        Some(content.len() as u32),
+        None,
+    );
+    state.activity_log.lock().unwrap().add_event(event.clone());
+    let _ = app_handle.emit("activity-event", &event);
+    Ok(())
 }
 
 #[tauri::command]
@@ -838,18 +855,49 @@ fn ws_create_dir(ws: State<WorkspaceState>, kw: State<KnownWrites>, path: String
 }
 
 #[tauri::command]
-fn ws_rename(ws: State<WorkspaceState>, kw: State<KnownWrites>, old_path: String, new_path: String) -> Result<(), String> {
+fn ws_rename(
+    app_handle: tauri::AppHandle,
+    state: State<AppState>,
+    ws: State<WorkspaceState>,
+    kw: State<KnownWrites>,
+    old_path: String,
+    new_path: String,
+) -> Result<(), String> {
     mark_known_write(&kw, &old_path);
     mark_known_write(&kw, &new_path);
     let guard = ws.lock().map_err(|e| e.to_string())?;
-    guard.as_ref().ok_or("No workspace initialized".to_string())?.rename(&old_path, &new_path)
+    guard.as_ref().ok_or("No workspace initialized".to_string())?.rename(&old_path, &new_path)?;
+    let event = ActivityEvent::new(
+        "file_rename",
+        &format!("Renamed: {} → {}", old_path, new_path),
+        None,
+        None,
+    );
+    state.activity_log.lock().unwrap().add_event(event.clone());
+    let _ = app_handle.emit("activity-event", &event);
+    Ok(())
 }
 
 #[tauri::command]
-fn ws_delete(ws: State<WorkspaceState>, kw: State<KnownWrites>, path: String) -> Result<(), String> {
+fn ws_delete(
+    app_handle: tauri::AppHandle,
+    state: State<AppState>,
+    ws: State<WorkspaceState>,
+    kw: State<KnownWrites>,
+    path: String,
+) -> Result<(), String> {
     mark_known_write(&kw, &path);
     let guard = ws.lock().map_err(|e| e.to_string())?;
-    guard.as_ref().ok_or("No workspace initialized".to_string())?.delete(&path)
+    guard.as_ref().ok_or("No workspace initialized".to_string())?.delete(&path)?;
+    let event = ActivityEvent::new(
+        "file_delete",
+        &format!("Deleted: {}", path),
+        None,
+        None,
+    );
+    state.activity_log.lock().unwrap().add_event(event.clone());
+    let _ = app_handle.emit("activity-event", &event);
+    Ok(())
 }
 
 #[tauri::command]
@@ -862,7 +910,14 @@ fn ws_root_path(ws: State<WorkspaceState>) -> Result<String, String> {
 // ===== Move (drag-and-drop) =====
 
 #[tauri::command]
-fn ws_move(ws: State<WorkspaceState>, src_path: String, dest_dir: String) -> Result<String, String> {
+fn ws_move(
+    app_handle: tauri::AppHandle,
+    state: State<AppState>,
+    ws: State<WorkspaceState>,
+    kw: State<KnownWrites>,
+    src_path: String,
+    dest_dir: String,
+) -> Result<String, String> {
     let guard = ws.lock().map_err(|e| e.to_string())?;
     let workspace = guard.as_ref().ok_or("No workspace initialized".to_string())?;
 
@@ -877,7 +932,19 @@ fn ws_move(ws: State<WorkspaceState>, src_path: String, dest_dir: String) -> Res
         return Ok(new_path);
     }
 
+    mark_known_write(&kw, &src_path);
+    mark_known_write(&kw, &new_path);
     workspace.rename(&src_path, &new_path)?;
+
+    let event = ActivityEvent::new(
+        "file_move",
+        &format!("Moved: {} → {}", src_path, new_path),
+        None,
+        None,
+    );
+    state.activity_log.lock().unwrap().add_event(event.clone());
+    let _ = app_handle.emit("activity-event", &event);
+
     Ok(new_path)
 }
 

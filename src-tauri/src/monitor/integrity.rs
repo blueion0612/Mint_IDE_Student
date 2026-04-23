@@ -12,7 +12,14 @@ use tauri::{AppHandle, Emitter};
 struct FileState {
     hash: String,
     size: u64,
+    line_count: usize,
     modified: u64, // mtime as epoch secs
+}
+
+fn count_lines(path: &Path) -> usize {
+    std::fs::read(path)
+        .map(|b| b.iter().filter(|&&c| c == b'\n').count() + 1)
+        .unwrap_or(0)
 }
 
 /// Shared set of "known writes" — the IDE registers a path here
@@ -108,6 +115,7 @@ pub fn start_integrity_monitor(
                 state.insert(rel, FileState {
                     hash: h,
                     size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                    line_count: count_lines(&full),
                     modified: file_mtime(&full),
                 });
             }
@@ -148,32 +156,34 @@ pub fn start_integrity_monitor(
                     }
                 };
 
+                let new_lines = count_lines(full);
                 if let Some(prev) = state.get(rel.as_str()) {
                     if prev.hash != new_hash && !is_known {
-                        // TAMPER DETECTED
+                        let size_delta: i64 = new_size as i64 - prev.size as i64;
+                        let line_delta: i64 = new_lines as i64 - prev.line_count as i64;
                         let detail = format!(
-                            "EXTERNAL MODIFICATION: {} (size {}→{}, hash changed)",
-                            rel, prev.size, new_size
+                            "EXTERNAL MODIFICATION: {} (size {}→{} {:+}, lines {}→{} {:+})",
+                            rel, prev.size, new_size, size_delta,
+                            prev.line_count, new_lines, line_delta
                         );
                         let event = ActivityEvent::new("tamper_detected", &detail, Some(new_size as u32), None);
                         log.add_event(event.clone());
                         let _ = app_handle.emit("activity-event", &event);
                     }
                 } else if !is_known {
-                    // New file appeared externally
                     let detail = format!(
-                        "EXTERNAL FILE ADDED: {} ({} bytes)",
-                        rel, new_size
+                        "EXTERNAL FILE ADDED: {} ({} bytes, {} lines)",
+                        rel, new_size, new_lines
                     );
                     let event = ActivityEvent::new("tamper_new_file", &detail, Some(new_size as u32), None);
                     log.add_event(event.clone());
                     let _ = app_handle.emit("activity-event", &event);
                 }
 
-                // Update state
                 state.insert(rel.clone(), FileState {
                     hash: new_hash,
                     size: new_size,
+                    line_count: new_lines,
                     modified: new_mtime,
                 });
             }

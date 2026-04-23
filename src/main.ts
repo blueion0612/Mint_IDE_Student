@@ -528,6 +528,14 @@ async function openFileByPath(path: string): Promise<void> {
     }
   }
 
+  if (activeFilePath !== path) {
+    invoke("log_editor_event", {
+      eventType: "tab_switch",
+      detail: `Switched to ${path} (lang: ${file.language})`,
+      charCount: null,
+      timeDeltaMs: null,
+    });
+  }
   activeFilePath = path;
   setCurrentFile(path);
   const selector = document.getElementById("lang-selector") as HTMLSelectElement;

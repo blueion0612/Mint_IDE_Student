@@ -54,15 +54,19 @@ fn run_code(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
     ws: State<WorkspaceState>,
+    kw: State<KnownWrites>,
     process: State<runner::RunningProcess>,
     language: String,
     code: String,
     filename: String,
     python_path: Option<String>,
 ) -> Result<(), String> {
-    // Save file to workspace so imports work
+    // Save file to workspace so imports work.
+    // Register the write with known_writes BEFORE write_file so the integrity
+    // monitor's next polling pass doesn't flag our own auto-save as tampering.
     if let Ok(guard) = ws.lock() {
         if let Some(ref workspace) = *guard {
+            mark_known_write(&kw, &filename);
             let _ = workspace.write_file(&filename, &code);
         }
     }

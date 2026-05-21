@@ -90,8 +90,10 @@ function showStudentIdModal(): void {
       input.focus();
       return;
     }
-    if (val.length < 4) {
-      error.textContent = "올바른 학번을 입력해 주세요.";
+    // ASCII alphanumeric, 4~20 chars. Prevents the student-id from breaking
+    // path concatenation (Desktop folder, recording filenames, manifest).
+    if (!/^[A-Za-z0-9]{4,20}$/.test(val)) {
+      error.textContent = "학번은 영문/숫자 4~20자만 사용 가능합니다.";
       input.focus();
       return;
     }
@@ -130,18 +132,26 @@ async function initializeApp(): Promise<void> {
 
   // Keyboard shortcuts
   document.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+    // Block reload shortcuts — F5 / Ctrl+R / Ctrl+Shift+R / Ctrl+F5 — which
+    // would wipe the student's session state (학번, 작업 파일, 로그 등).
+    if (e.key === "F5") { e.preventDefault(); return; }
+
+    if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {
       e.preventDefault();
-      saveCurrentFile();
+      if (!e.shiftKey) saveCurrentFile();
+      return;
     }
-    if ((e.ctrlKey || e.metaKey) && e.key === "r") {
+    // Ctrl+R: run. Ctrl+Shift+R: blocked (would otherwise reload the WebView).
+    if ((e.ctrlKey || e.metaKey) && (e.key === "r" || e.key === "R")) {
       e.preventDefault();
-      runCurrentFile();
+      if (!e.shiftKey) runCurrentFile();
+      return;
     }
     // Ctrl+Shift+C — emergency stop (bypasses event-flooded UI)
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "C" || e.key === "c")) {
       e.preventDefault();
       if (isRunning) stopCurrentRun();
+      return;
     }
   });
 
@@ -1072,12 +1082,14 @@ async function runCurrentFile(): Promise<void> {
   }
 }
 
-async function stopCurrentRun(): Promise<void> {
-  try {
-    const stopped = await invoke<boolean>("stop_code");
-    if (stopped) appendOutput("\n[stopped]\n", "system");
-  } catch { /* ignore */ }
+function stopCurrentRun(): void {
+  if (!isRunning) return;
+  // Reset UI immediately — backend taskkill /F /T can take 100ms+, and we
+  // don't want the user to wonder if the click registered. Fire-and-forget
+  // the actual kill; "run-done" event will arrive shortly after.
+  appendOutput("\n[stopping...]\n", "system");
   resetRunButton();
+  invoke<boolean>("stop_code").catch(() => { /* ignore */ });
 }
 
 function resetRunButton(): void {
@@ -1152,10 +1164,16 @@ async function startAutoRecording(): Promise<void> {
 }
 
 // ===== Submit Exam =====
+let isSubmitting = false;
 async function submitExam(): Promise<void> {
+  if (isSubmitting) return;  // double-click guard
   if (!confirm("제출하시겠습니까?\n제출 후 프로그램이 종료됩니다.")) {
     return;
   }
+  isSubmitting = true;
+  const btn = document.getElementById("btn-submit") as HTMLButtonElement;
+  btn.disabled = true;
+  btn.textContent = "제출 중...";
 
   // Save all open files
   for (const file of openFiles) {
@@ -1169,10 +1187,6 @@ async function submitExam(): Promise<void> {
   flushTypingSummary();
   // Save code edit history before submit
   await invoke("save_code_history", { historyJson: getEditHistoryJSON() });
-
-  const btn = document.getElementById("btn-submit") as HTMLButtonElement;
-  btn.disabled = true;
-  btn.textContent = "제출 중...";
 
   try {
     const result = await invoke<{ folder_path: string; code_zip: string; video_zip: string }>(
@@ -1189,6 +1203,7 @@ async function submitExam(): Promise<void> {
     appendOutput(`Submit failed: ${e}\n`, "error");
     btn.disabled = false;
     btn.textContent = "Submit";
+    isSubmitting = false;
   }
 }
 
@@ -1607,6 +1622,12 @@ async function listenForBackendEvents(): Promise<void> {
         isExternal: ev.event_type === "clipboard_external",
         epochMs: Date.now(),
       });
+    }
+    // Recording health failure: backend detected sub-1KB mp4 after 3s — most
+    // commonly Screen Recording permission denied on macOS. Alert the
+    // student loudly before they finish the exam thinking it was recording.
+    if (ev.event_type === "recording_health_fail") {
+      alert(`[녹화 시작 실패]\n\n${ev.detail}`);
     }
   });
 

@@ -1,7 +1,7 @@
 import { EditorState, Transaction, StateEffect, StateField, RangeSet } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLineGutter, highlightActiveLine, drawSelection, rectangularSelection, crosshairCursor, highlightSpecialChars, Decoration, type DecorationSet } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { syntaxHighlighting, indentOnInput, bracketMatching, foldGutter, foldKeymap, defaultHighlightStyle, HighlightStyle } from "@codemirror/language";
+import { syntaxHighlighting, indentOnInput, bracketMatching, foldGutter, foldKeymap, defaultHighlightStyle, HighlightStyle, indentUnit } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { javascript } from "@codemirror/lang-javascript";
@@ -202,6 +202,8 @@ export function createEditor(
       highlightActiveLine(),
       highlightSelectionMatches(),
       indentOnInput(),
+      indentUnit.of("    "),
+      EditorState.tabSize.of(4),
       bracketMatching(),
       closeBrackets(),
       langExtension,
@@ -244,6 +246,8 @@ export function setLanguage(view: EditorView, language: SupportedLanguage): void
       highlightActiveLine(),
       highlightSelectionMatches(),
       indentOnInput(),
+      indentUnit.of("    "),
+      EditorState.tabSize.of(4),
       bracketMatching(),
       closeBrackets(),
       langExtension,

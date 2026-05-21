@@ -1,4 +1,5 @@
 use super::log::{ActivityEvent, LogHandle};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,11 +10,48 @@ use tauri::{AppHandle, Emitter};
 
 /// Tracks file hashes to detect external modifications.
 /// Any change not made through our IDE is flagged as TAMPER.
+#[derive(Clone, Serialize, Deserialize)]
 struct FileState {
     hash: String,
     size: u64,
     line_count: usize,
     modified: u64, // mtime as epoch secs
+}
+
+/// Persistent on-disk snapshot of the baseline. We dot-prefix the filename
+/// so the integrity monitor itself skips it (scan_dir_recursive filters
+/// `.` / `_` prefixes).
+const BASELINE_FILENAME: &str = ".mint_baseline.json";
+
+#[derive(Serialize, Deserialize)]
+struct BaselineSnapshot {
+    saved_at: u64,
+    files: HashMap<String, FileState>,
+}
+
+fn baseline_path(root: &Path) -> PathBuf {
+    root.join(BASELINE_FILENAME)
+}
+
+fn load_baseline(root: &Path) -> Option<HashMap<String, FileState>> {
+    let text = std::fs::read_to_string(baseline_path(root)).ok()?;
+    let snap: BaselineSnapshot = serde_json::from_str(&text).ok()?;
+    Some(snap.files)
+}
+
+fn save_baseline(root: &Path, state: &HashMap<String, FileState>) {
+    let snap = BaselineSnapshot {
+        saved_at: epoch_secs(),
+        files: state.clone(),
+    };
+    let Ok(text) = serde_json::to_string(&snap) else { return; };
+    // Atomic write: temp file + rename. A torn write would leave the next
+    // restart with no baseline (worse than the previous baseline).
+    let final_path = baseline_path(root);
+    let tmp_path = final_path.with_extension("json.tmp");
+    if std::fs::write(&tmp_path, text.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &final_path);
+    }
 }
 
 fn count_lines(path: &Path) -> usize {
@@ -34,11 +72,24 @@ pub fn new_known_writes() -> KnownWrites {
 /// doesn't flag our own write as tampering.
 pub fn mark_known_write(known: &KnownWrites, relative_path: &str) {
     if let Ok(mut map) = known.lock() {
+        // Grace period: 8s. The integrity loop polls every 2s, but we leave
+        // headroom for filesystem buffer flush + IDE write completion +
+        // network drive latency. Earlier 3s was too tight and triggered
+        // false TAMPER on slow drives.
         map.insert(
-            relative_path.replace('\\', "/"),
-            epoch_secs() + 3, // grace period: ignore changes within 3s
+            normalize_key(relative_path),
+            epoch_secs() + 8,
         );
     }
+}
+
+/// Normalize a path key so a write registered as `테스트.py` (NFC) and a
+/// filesystem read returning `테스트.py` (NFD on macOS) compare equal.
+/// Falls back to byte-identical key on platforms where the normalization
+/// is unavailable.
+fn normalize_key(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    path.replace('\\', "/").nfc().collect::<String>()
 }
 
 fn epoch_secs() -> u64 {
@@ -77,11 +128,12 @@ fn scan_dir_recursive(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>)
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let rel = path
+        let rel_raw = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
-            .replace('\\', "/");
+            .to_string();
+        let rel = normalize_key(&rel_raw);
 
         // Skip our own log files
         if rel.starts_with('_') || rel.starts_with('.') {
@@ -105,26 +157,83 @@ pub fn start_integrity_monitor(
 ) {
     thread::spawn(move || {
         let root = PathBuf::from(&workspace_root);
-        let mut state: HashMap<String, FileState> = HashMap::new();
 
-        // Initial scan — baseline
+        // Restore baseline from disk if available — closes the "restart to
+        // wipe the tamper history" hole. If a student kills the IDE mid-exam
+        // and modifies files externally, the next launch's monitor compares
+        // against the LAST KNOWN baseline rather than re-scanning (which
+        // would treat the modified state as new ground truth).
+        let mut state: HashMap<String, FileState> = load_baseline(&root).unwrap_or_default();
+        let mut state_dirty = false;
+
+        // Initial scan. If we loaded a baseline, re-check every file: missing
+        // entries get added (new files since shutdown), divergences raise an
+        // immediate tamper event so the restart-window gap is auditable.
         thread::sleep(Duration::from_secs(1));
-        for (rel, full) in scan_all_files(&root) {
-            if let Some(h) = hash_file(&full) {
-                let meta = full.metadata().ok();
-                state.insert(rel, FileState {
-                    hash: h,
-                    size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                    line_count: count_lines(&full),
-                    modified: file_mtime(&full),
-                });
+        let initial_files = scan_all_files(&root);
+        let initial_existed = !state.is_empty();
+        for (rel, full) in &initial_files {
+            let Some(new_hash) = hash_file(full) else { continue; };
+            let new_size = full.metadata().map(|m| m.len()).unwrap_or(0);
+            let new_lines = count_lines(full);
+            let new_mtime = file_mtime(full);
+
+            if initial_existed {
+                if let Some(prev) = state.get(rel.as_str()) {
+                    if prev.hash != new_hash {
+                        let detail = format!(
+                            "RESTART-WINDOW MODIFICATION: {} (hash differs from saved baseline)",
+                            rel
+                        );
+                        let event = ActivityEvent::new(
+                            "tamper_detected",
+                            &detail,
+                            Some(new_size as u32),
+                            None,
+                        );
+                        log.add_event(event.clone());
+                        let _ = app_handle.emit("activity-event", &event);
+                    }
+                } else {
+                    let detail = format!(
+                        "RESTART-WINDOW FILE ADDED: {} ({} bytes)",
+                        rel, new_size
+                    );
+                    let event = ActivityEvent::new(
+                        "tamper_new_file",
+                        &detail,
+                        Some(new_size as u32),
+                        None,
+                    );
+                    log.add_event(event.clone());
+                    let _ = app_handle.emit("activity-event", &event);
+                }
             }
+
+            state.insert(rel.clone(), FileState {
+                hash: new_hash,
+                size: new_size,
+                line_count: new_lines,
+                modified: new_mtime,
+            });
+            state_dirty = true;
+        }
+        if state_dirty {
+            save_baseline(&root, &state);
+            state_dirty = false;
         }
 
+        let mut save_counter: u32 = 0;
+
         loop {
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_secs(2));
 
             let now = epoch_secs();
+            // Purge expired known_writes entries up front so the map doesn't
+            // grow unbounded (one entry per IDE write across the exam).
+            if let Ok(mut map) = known_writes.lock() {
+                map.retain(|_, &mut grace_until| grace_until >= now);
+            }
             let files = scan_all_files(&root);
 
             // Check for modified or new files
@@ -136,25 +245,14 @@ pub fn start_integrity_monitor(
                 };
                 let new_size = full.metadata().map(|m| m.len()).unwrap_or(0);
 
-                // Check if this is a known (IDE-initiated) write
-                let is_known = {
-                    if let Ok(mut map) = known_writes.lock() {
-                        if let Some(&grace_until) = map.get(rel.as_str()) {
-                            if now <= grace_until {
-                                // Our write — update state silently
-                                map.remove(rel.as_str());
-                                true
-                            } else {
-                                map.remove(rel.as_str());
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
+                // Check if this is a known (IDE-initiated) write. We do NOT
+                // remove the entry on first hit — within one grace window the
+                // student may save the same file twice (manual save + auto
+                // save). The retain() above handles cleanup on expiry.
+                let is_known = known_writes.lock().ok()
+                    .and_then(|map| map.get(rel.as_str()).copied())
+                    .map(|grace_until| now <= grace_until)
+                    .unwrap_or(false);
 
                 let new_lines = count_lines(full);
                 if let Some(prev) = state.get(rel.as_str()) {
@@ -180,6 +278,9 @@ pub fn start_integrity_monitor(
                     let _ = app_handle.emit("activity-event", &event);
                 }
 
+                if state.get(rel.as_str()).map(|p| p.hash != new_hash).unwrap_or(true) {
+                    state_dirty = true;
+                }
                 state.insert(rel.clone(), FileState {
                     hash: new_hash,
                     size: new_size,
@@ -197,11 +298,10 @@ pub fn start_integrity_monitor(
                 .collect();
 
             for rel in &deleted {
-                let is_known = {
-                    if let Ok(mut map) = known_writes.lock() {
-                        map.remove(rel.as_str()).is_some()
-                    } else { false }
-                };
+                let is_known = known_writes.lock().ok()
+                    .and_then(|mut map| map.remove(rel.as_str()))
+                    .map(|grace_until| now <= grace_until)
+                    .unwrap_or(false);
 
                 if !is_known {
                     let detail = format!("EXTERNAL FILE DELETED: {}", rel);
@@ -210,6 +310,17 @@ pub fn start_integrity_monitor(
                     let _ = app_handle.emit("activity-event", &event);
                 }
                 state.remove(rel);
+                state_dirty = true;
+            }
+
+            // Persist the baseline every ~30s (15 polling cycles) OR sooner if
+            // something actually changed. Atomic temp+rename means a torn
+            // write at IDE crash time just leaves the previous baseline.
+            save_counter += 1;
+            if state_dirty || save_counter >= 15 {
+                save_baseline(&root, &state);
+                state_dirty = false;
+                save_counter = 0;
             }
         }
     });

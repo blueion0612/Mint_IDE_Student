@@ -29,14 +29,27 @@ pub fn new_running_process() -> RunningProcess {
     Arc::new(Mutex::new(None))
 }
 
-fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::HashSet<String> {
+pub fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::HashSet<String> {
+    use unicode_normalization::UnicodeNormalization;
     let mut out = std::collections::HashSet::new();
-    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut std::collections::HashSet<String>) {
+    fn walk(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        out: &mut std::collections::HashSet<String>,
+    ) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let rel = path.strip_prefix(root).unwrap_or(&path)
-                    .to_string_lossy().replace('\\', "/");
+                // NFC-normalize the key so it matches what mark_known_write
+                // stores. macOS APFS returns NFD; without this the post-run
+                // mark would not match the polling-time scan.
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .nfc()
+                    .collect::<String>();
                 // Skip dot/underscore prefixed (logs/temp)
                 if rel.starts_with('.') || rel.starts_with('_')
                    || rel.split('/').any(|seg| seg.starts_with('.') || seg.starts_with('_'))
@@ -124,15 +137,35 @@ pub fn execute_code_streaming(
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1")
             .env("TF_CPP_MIN_LOG_LEVEL", "3")      // suppress TensorFlow warnings
-            .env("TF_ENABLE_ONEDNN_OPTS", "0")      // suppress oneDNN messages
+            .env("TF_ENABLE_ONEDNN_OPTS", "0")     // suppress oneDNN messages
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // matplotlib backend selection:
+        // - Windows: force TkAgg. Our dedicated Python ships with Include_tcltk=1
+        //   so it is always available; without forcing it matplotlib sometimes
+        //   silently falls back to non-interactive Agg and plt.show() does nothing.
+        // - macOS: do NOT force TkAgg. macOS framework Python's native MacOSX
+        //   backend handles retina/DPI/multi-monitor far more reliably than
+        //   X11-based Tk. Let matplotlib auto-select.
+        // - Linux: same as macOS, let matplotlib choose.
+        #[cfg(target_os = "windows")]
+        { command.env("MPLBACKEND", "TkAgg"); }
 
         // Hide console window on Windows (does NOT affect GUI windows like matplotlib)
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        // Put the child in its own process group so we can SIGKILL the entire
+        // tree (including grandchildren from multiprocessing/subprocess.run).
+        // Without setsid, `kill -KILL -<pid>` targets the IDE's group on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
 
         let child = command.spawn();
@@ -238,24 +271,27 @@ pub fn execute_code_streaming(
             }
         }
 
-        let exit_code = {
+        // Take the child OUT of the mutex before waiting so that a concurrent
+        // stop_process() can still acquire the lock and is not blocked behind
+        // a potentially long child.wait().
+        let mut child_opt = {
             let mut guard = process_handle.lock().unwrap();
-            if let Some(ref mut child) = *guard {
-                child.wait().ok().and_then(|s| s.code())
-            } else {
-                None
-            }
+            guard.take()
         };
 
-        {
-            let mut guard = process_handle.lock().unwrap();
-            *guard = None;
-        }
+        let exit_code = if let Some(ref mut child) = child_opt {
+            child.wait().ok().and_then(|s| s.code())
+        } else {
+            None
+        };
 
-        // Register new files created by the student's code as known writes.
+        // Register ALL files present after the run as known writes — both
+        // new files (plt.savefig) and modified-in-place ones (csv append).
+        // pre/post union covers both since anything the student code touched
+        // is by definition IDE-initiated, not external tampering.
         let post_snapshot = snapshot_workspace_files(&dir);
-        for new_rel in post_snapshot.difference(&pre_snapshot) {
-            crate::monitor::mark_known_write(&known_writes, new_rel);
+        for rel in pre_snapshot.union(&post_snapshot) {
+            crate::monitor::mark_known_write(&known_writes, rel);
         }
 
         let elapsed = start.elapsed().as_millis() as u64;
@@ -265,43 +301,48 @@ pub fn execute_code_streaming(
     });
 }
 
-/// Stop the currently running process and its entire descendant tree.
-/// Plain `child.kill()` only kills the parent; subprocesses spawned by Python
-/// (multiprocessing, subprocess, threads with native processes) survive.
+/// Take the child out of the shared handle and kill its descendant tree.
+/// IMPORTANT: callers must take() the child themselves before invoking this
+/// so that a concurrent Run cannot have its fresh child killed by a stale
+/// stop. See `stop_taken_child` for the no-shared-handle variant.
 pub fn stop_process(process_handle: &RunningProcess) -> bool {
-    let mut guard = process_handle.lock().unwrap();
-    if let Some(ref mut child) = *guard {
-        let pid = child.id();
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(0x08000000)
-                .output();
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            // Negative PID targets the process group (same group as the spawned child).
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{}", pid)])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output();
-        }
-
-        // Belt-and-suspenders: also kill the direct child handle and reap.
-        let _ = child.kill();
-        let _ = child.wait();
-        *guard = None;
-        true
-    } else {
-        false
+    let child_opt = process_handle.lock().ok().and_then(|mut g| g.take());
+    match child_opt {
+        Some(child) => { stop_taken_child(child); true }
+        None => false,
     }
+}
+
+/// Kill a previously-taken child and its descendant tree.
+/// On Windows: taskkill /F /T. On Unix: SIGKILL to the child's process group
+/// (works because we set process_group(0) at spawn time).
+pub fn stop_taken_child(mut child: Child) {
+    let pid = child.id();
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .output();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Negative PID = process group. Requires the child to be a group
+        // leader, which we ensured via `process_group(0)` at spawn.
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", pid)])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// pip install packages

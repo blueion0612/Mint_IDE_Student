@@ -4,3 +4,6 @@ src-tauri/target/
 src-tauri/gen/
 .DS_Store
 Thumbs.db
+
+# Local release-note drafts — actual notes go in `gh release edit`.
+.release_notes*.md

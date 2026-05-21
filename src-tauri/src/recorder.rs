@@ -79,41 +79,18 @@ impl ScreenRecorder {
 
     /// Auto-segment: call periodically to split into ~15 min chunks
     pub fn maybe_rotate(&mut self) -> Option<String> {
-        // Only rotate if recording is active
         if self.process.is_none() { return None; }
 
-        // Stop current segment
-        if let Some(mut child) = self.process.take() {
-            if cfg!(target_os = "macos") {
-                let _ = child.kill();
-            } else {
-                if let Some(ref mut stdin) = child.stdin {
-                    use std::io::Write;
-                    let _ = stdin.write_all(b"q");
-                    let _ = stdin.flush();
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let _ = child.wait();
+        if let Some(child) = self.process.take() {
+            graceful_stop_recorder(child);
         }
 
-        // Start new segment
         self.start_segment().ok()
     }
 
     pub fn stop(&mut self) -> Result<String, String> {
-        if let Some(mut child) = self.process.take() {
-            if cfg!(target_os = "macos") {
-                let _ = child.kill();
-            } else {
-                if let Some(ref mut stdin) = child.stdin {
-                    use std::io::Write;
-                    let _ = stdin.write_all(b"q");
-                    let _ = stdin.flush();
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let _ = child.wait();
+        if let Some(child) = self.process.take() {
+            graceful_stop_recorder(child);
         }
 
         self.output_dir
@@ -122,8 +99,25 @@ impl ScreenRecorder {
             .ok_or("No recording dir".to_string())
     }
 
-    pub fn is_recording(&self) -> bool {
-        self.process.is_some()
+    pub fn is_recording(&mut self) -> bool {
+        // Reap the child if FFmpeg crashed silently (driver hang, OOM, etc.).
+        // Without this, `process.is_some()` keeps returning true for a dead
+        // child — the IDE shows "● REC" but no frames are being captured,
+        // and grading later finds 0-byte / truncated mp4 with no warning.
+        if let Some(child) = self.process.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.last_error = Some(format!(
+                        "FFmpeg exited unexpectedly during recording (code {:?})",
+                        status.code()
+                    ));
+                    self.process = None;
+                    return false;
+                }
+                _ => return true,
+            }
+        }
+        false
     }
 
     pub fn recording_dir(&self) -> Option<String> {
@@ -133,6 +127,64 @@ impl ScreenRecorder {
 
 impl Drop for ScreenRecorder {
     fn drop(&mut self) { let _ = self.stop(); }
+}
+
+/// Graceful stop for a recorder child — gives FFmpeg / screencapture a chance
+/// to finalize the mp4 moov atom. Without this the file is unplayable.
+///
+/// - Windows: send CTRL_BREAK_EVENT to the process group + write "q" to stdin
+///   (FFmpeg honors either). Requires the child to have been spawned with
+///   CREATE_NEW_PROCESS_GROUP.
+/// - macOS: SIGINT to screencapture (`kill -2`). SIGKILL/SIGTERM truncates mp4.
+/// - Linux: SIGINT.
+/// - Fallback: 2s wait, then SIGKILL.
+fn graceful_stop_recorder(mut child: Child) {
+    let pid = child.id();
+
+    #[cfg(target_os = "windows")]
+    {
+        // CTRL_BREAK to the process group — FFmpeg's idiomatic stop signal.
+        unsafe { generate_console_ctrl_event_break(pid); }
+        // Belt: also write "q" via stdin pipe (FFmpeg polls stdin even when
+        // it's not a tty).
+        if let Some(ref mut stdin) = child.stdin {
+            use std::io::Write;
+            let _ = stdin.write_all(b"q\n");
+            let _ = stdin.flush();
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // SIGINT (= screencapture/ffmpeg graceful stop). Use `kill -2 <pid>`
+        // — `-pid` would target the process group which we did NOT set for
+        // the recorder (it's a single-process tree).
+        let _ = Command::new("kill")
+            .args(["-2", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+    }
+
+    // Wait up to 2s for graceful exit, then SIGKILL.
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn generate_console_ctrl_event_break(process_group_id: u32) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_group_id: u32) -> i32;
+    }
+    const CTRL_BREAK_EVENT: u32 = 1;
+    GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_group_id);
 }
 
 fn find_ffmpeg() -> Result<String, String> {
@@ -215,30 +267,37 @@ fn walkdir_simple(dir: &std::path::Path, depth: u32) -> Vec<String> {
 #[cfg(target_os = "windows")]
 fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<(Child, String), String> {
     use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW hides the FFmpeg console. CREATE_NEW_PROCESS_GROUP
+    // lets us send CTRL_BREAK_EVENT to it for graceful shutdown — without
+    // it, GenerateConsoleCtrlEvent would target the IDE itself.
     const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
     let strategies: Vec<(&str, Vec<String>)> = vec![
+        // gdigrab default cursor capture is off — without -draw_mouse 1 the
+        // student's pointer doesn't appear in the recording, which makes it
+        // hard to correlate suspicious clicks with timestamps during grading.
         ("CPU/GDI (most compatible)",
-         ["-y", "-f", "gdigrab", "-framerate", "2", "-i", "desktop",
+         ["-y", "-f", "gdigrab", "-framerate", "2", "-draw_mouse", "1", "-i", "desktop",
           "-vf", "scale=iw/2:ih/2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
-          "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", "900", output_path]
+          "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path]
             .iter().map(|s| s.to_string()).collect()),
         ("CPU/DDA",
          ["-y", "-filter_complex", "ddagrab=framerate=2,scale=iw/2:ih/2",
           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
-          "-pix_fmt", "yuv420p", "-t", "900", output_path]
+          "-pix_fmt", "yuv420p", output_path]
             .iter().map(|s| s.to_string()).collect()),
         ("NVIDIA NVENC",
          ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_nvenc",
-          "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
+          "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", output_path]
             .iter().map(|s| s.to_string()).collect()),
         ("Intel QuickSync",
          ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_qsv",
-          "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
+          "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", output_path]
             .iter().map(|s| s.to_string()).collect()),
         ("AMD AMF",
          ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_amf",
-          "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", "-t", "900", output_path]
+          "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", output_path]
             .iter().map(|s| s.to_string()).collect()),
     ];
 
@@ -251,7 +310,7 @@ fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<(Child, St
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
             .spawn();
 
         let mut child = match spawn {
@@ -341,7 +400,7 @@ fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<(Child, St
         .args(["-y", "-f", "x11grab", "-framerate", "2", "-i", ":0.0",
                "-vf", "scale=iw/2:ih/2",
                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
-               "-pix_fmt", "yuv420p", "-t", "900", output_path])
+               "-pix_fmt", "yuv420p", output_path])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -353,12 +412,30 @@ fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<(Child, St
 pub type RecorderState = Mutex<ScreenRecorder>;
 
 /// Obfuscate video file headers so students can't play them.
-/// Fast: only modifies first 1KB. Grader reverses with same function.
+/// Reads ONLY the first 1KB into RAM, XORs in place, writes back the same
+/// 1KB. The naive `fs::read` + `fs::write` loads the entire file into RAM —
+/// a 1~2 GB exam recording on an 8 GB student PC would OOM, leaving a
+/// plaintext mp4 on Desktop (security regression + data loss).
 pub fn obfuscate_video(path: &std::path::Path, key: &[u8]) -> Result<(), String> {
-    let mut data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let len = data.len().min(1024);
-    for i in 0..len {
-        data[i] ^= key[i % key.len()];
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if key.is_empty() {
+        return Err("empty obfuscation key".to_string());
     }
-    std::fs::write(path, &data).map_err(|e| e.to_string())
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open {} failed: {}", path.display(), e))?;
+
+    let mut buf = [0u8; 1024];
+    let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+    for i in 0..n {
+        buf[i] ^= key[i % key.len()];
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())
 }

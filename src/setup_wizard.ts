@@ -321,8 +321,11 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
     }
 
     overlay.querySelector("#wiz-submit")!.addEventListener("click", async () => {
+      // Start with setup_done=false. We only flip to true after install +
+      // verify succeed — otherwise a crashed/canceled wizard would skip
+      // itself on next launch and leave the student with no packages.
       const newConfig: SetupConfig = {
-        setup_done: true,
+        setup_done: false,
         package_profile: profile,
         custom_packages: profile === "custom" ? collectCustom() : opts.initial.custom_packages,
         recording_enabled: recording,
@@ -350,12 +353,42 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
       submitBtn.disabled = true;
       submitBtn.textContent = "처리 중...";
 
+      let installOk = true;
+      let verifyOk = true;
+      try {
+        if (wantsInstall) {
+          installOk = await runInstall(overlay, packages, opts.pythonPath ?? null);
+          verifyOk = await runVerification(
+            overlay.querySelector("#wiz-progress-log") as HTMLElement,
+            opts.pythonPath ?? null,
+          );
+        }
+      } catch (e) {
+        alert("설치 중 오류: " + e);
+        submitBtn.disabled = false;
+        submitBtn.textContent = opts.submitLabel;
+        return;
+      }
+
+      // In wizard mode (first launch), require success before flipping
+      // setup_done. In settings mode, we don't gate — user is just tweaking.
+      if (opts.mode === "wizard" && (!installOk || !verifyOk)) {
+        const proceed = confirm(
+          `설치 또는 검증이 완전하지 않습니다.\n\n` +
+          `${!installOk ? "- 일부 패키지 설치 실패\n" : ""}` +
+          `${!verifyOk ? "- 환경 검증 실패 (plt.show 등 그래프 출력 불가능)\n" : ""}` +
+          `\n[취소] = 위자드 다시 시도, [확인] = 그대로 진행 (비추천)`
+        );
+        if (!proceed) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = opts.submitLabel;
+          return;
+        }
+      }
+
+      newConfig.setup_done = true;
       try {
         await saveConfig(newConfig);
-
-        if (wantsInstall) {
-          await runInstall(overlay, packages, opts.pythonPath ?? null);
-        }
       } catch (e) {
         alert("설정 저장 실패: " + e);
         submitBtn.disabled = false;
@@ -369,37 +402,113 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
   });
 }
 
+interface EnvVerifyResult {
+  ok: boolean;
+  tkinter_ok: boolean;
+  matplotlib_ok: boolean;
+  backend: string;
+  errors: string[];
+}
+
+// Returns true if pip reported [INSTALL_DONE:ok], false on :fail or :partial
+// (so the caller can prompt the student to retry rather than silently
+// proceeding with a half-installed environment).
 async function runInstall(
   overlay: HTMLElement,
   packages: string[],
   pythonPath: string | null,
-): Promise<void> {
+): Promise<boolean> {
   const progressSection = overlay.querySelector("#wiz-progress-section") as HTMLElement;
   const log = overlay.querySelector("#wiz-progress-log") as HTMLElement;
   progressSection.classList.remove("hidden");
   log.textContent = `Installing ${packages.length} packages...\n`;
 
-  return new Promise<void>((resolve) => {
+  return new Promise<boolean>((resolve) => {
     let unlisten: UnlistenFn | null = null;
+    // installDone tracks "did we receive ANY terminal signal" (either
+    // [INSTALL_DONE:*] or an invoke error). installOk only goes true on :ok.
+    // Earlier code conflated these into one boolean and could hang the
+    // wizard forever when the install finished before listen registered.
+    let installDone = false;
+    let installOk = false;
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      installDone = true;
+      installOk = ok;
+      if (unlisten) { unlisten(); unlisten = null; }
+      resolve(ok);
+    };
+
     listen<{ stream: string; text: string }>("run-output", (event) => {
       const { stream, text } = event.payload;
       log.textContent += text;
       log.scrollTop = log.scrollHeight;
       if (stream === "system" && text.startsWith("[INSTALL_DONE")) {
-        if (unlisten) unlisten();
-        resolve();
+        const ok = text.includes(":ok");
+        if (!ok) {
+          log.textContent += `\n[WARN] 일부 패키지 설치 실패 — torch / tensorflow / 또는 네트워크 문제일 수 있습니다.\n`;
+        }
+        finish(ok);
       }
-    }).then(fn => { unlisten = fn; });
+    }).then(fn => {
+      // If install already terminated before listener registered, unlisten
+      // the freshly-registered hook immediately to avoid a ghost listener.
+      if (installDone) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
 
     invoke("install_packages_smart", {
       packages,
       pythonPath,
     }).catch(e => {
       log.textContent += `\nError: ${e}\n`;
-      if (unlisten) unlisten();
-      resolve();
+      finish(false);
     });
   });
+}
+
+async function runVerification(log: HTMLElement, pythonPath: string | null): Promise<boolean> {
+  log.textContent += `\n[Verifying environment — tkinter + matplotlib]\n`;
+  log.scrollTop = log.scrollHeight;
+
+  let py = pythonPath;
+  if (!py) {
+    try {
+      py = await invoke<string>("setup_exam_python");
+    } catch (e) {
+      log.textContent += `  [SKIP] Could not resolve venv python: ${e}\n`;
+      return false;
+    }
+  }
+
+  try {
+    const result = await invoke<EnvVerifyResult>("verify_exam_environment", { pythonPath: py });
+    if (result.ok) {
+      log.textContent += `  [OK] tkinter + matplotlib (${result.backend}) verified.\n`;
+      log.scrollTop = log.scrollHeight;
+      return true;
+    } else {
+      log.textContent += `  [FAIL] Environment is NOT ready for plt.show():\n`;
+      for (const err of result.errors) {
+        log.textContent += `    - ${err}\n`;
+      }
+      log.textContent += `\n`;
+      log.textContent += `  matplotlib GUI 출력이 화면에 표시되지 않을 수 있습니다.\n`;
+      log.textContent += `  관리자 PowerShell에서 install-windows.ps1을 재실행하거나,\n`;
+      log.textContent += `  설정에서 venv 재설치를 시도하세요.\n`;
+      log.scrollTop = log.scrollHeight;
+      return false;
+    }
+  } catch (e) {
+    log.textContent += `  [SKIP] Verification failed to run: ${e}\n`;
+    log.scrollTop = log.scrollHeight;
+    return false;
+  }
 }
 
 function escapeHtml(text: string): string {

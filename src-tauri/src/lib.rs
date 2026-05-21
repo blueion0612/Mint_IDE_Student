@@ -99,16 +99,25 @@ fn run_code(
 #[tauri::command]
 async fn run_code_sync(
     ws: State<'_, WorkspaceState>,
+    known_writes: State<'_, KnownWrites>,
     language: String,
     code: String,
     filename: String,
     python_path: Option<String>,
 ) -> Result<(String, String, Option<i32>), String> {
+    let _ = language; // currently unused — notebook supplies python only
+
     let cwd = ws.lock().ok().and_then(|g| g.as_ref().map(|w| w.root_path()));
     let work_dir = cwd.clone().unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
     let hidden_name = format!(".{}", filename);
     let file_path = std::path::PathBuf::from(&work_dir).join(&hidden_name);
     std::fs::write(&file_path, &code).map_err(|e| e.to_string())?;
+
+    // Snapshot the workspace BEFORE running so we can register any new files
+    // the student's notebook cell creates (plt.savefig, df.to_csv, …) as
+    // known writes — otherwise the integrity monitor flags them as TAMPER.
+    let work_path = std::path::PathBuf::from(&work_dir);
+    let pre_snapshot = runner::snapshot_workspace_files(&work_path);
 
     let py = runner::find_python_cached(python_path.as_deref())
         .unwrap_or("python".to_string());
@@ -124,12 +133,23 @@ async fn run_code_sync(
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
+        command.env("MPLBACKEND", "TkAgg");
     }
 
     let output = command.output().map_err(|e| e.to_string())?;
 
     // Cleanup temp file
     let _ = std::fs::remove_file(&file_path);
+
+    // Register ALL files the cell touched as known writes — both newly-
+    // created (set difference) AND modified-in-place files (e.g. the student
+    // running `with open('data.csv','a') as f: f.write(...)`). The earlier
+    // difference()-only approach left in-place modifications unprotected, so
+    // the integrity monitor flagged every notebook append as TAMPER.
+    let post_snapshot = runner::snapshot_workspace_files(&work_path);
+    for rel in pre_snapshot.union(&post_snapshot) {
+        mark_known_write(&known_writes, rel);
+    }
 
     Ok((
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -140,7 +160,17 @@ async fn run_code_sync(
 
 #[tauri::command]
 fn stop_code(process: State<runner::RunningProcess>) -> bool {
-    runner::stop_process(&process)
+    // Take the child OUT of the shared handle immediately, under the lock.
+    // The slot is now free for a fresh Run — even if it arrives during the
+    // background kill that follows. Without this synchronous take, the kill
+    // thread races with the next run and may SIGKILL the new child.
+    let child = match process.lock().ok().and_then(|mut g| g.take()) {
+        Some(c) => c,
+        None => return false,
+    };
+    // taskkill /F /T can take 100ms+. Do it off the IPC thread.
+    std::thread::spawn(move || runner::stop_taken_child(child));
+    true
 }
 
 #[tauri::command]
@@ -174,6 +204,47 @@ fn start_recording(
     state.activity_log.lock().unwrap().add_event(event.clone());
     let _ = app_handle.emit("activity-event", &event);
 
+    // Health check — confirms the capture process actually wrote frames.
+    // Covers two silent-failure modes:
+    //   1. macOS: Screen Recording / Automation permission denied → 0-byte file.
+    //   2. Windows: gdigrab session disconnected (RDP)、antivirus quarantine.
+    // After 3 seconds a healthy 2 fps recording is ≥ tens of KB; a sub-1KB
+    // file means nothing reached disk. The student gets a clear alert
+    // instead of finding out post-exam that the video is unplayable.
+    {
+        let path_for_check = std::path::PathBuf::from(&path);
+        let ah = app_handle.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let bytes = std::fs::metadata(&path_for_check)
+                .map(|m| m.len()).unwrap_or(0);
+            if bytes < 1024 {
+                let msg = if cfg!(target_os = "macos") {
+                    format!(
+                        "녹화가 시작되지 않았습니다 ({} bytes after 3s). \
+                         시스템 설정 > 개인정보 보호 및 보안 > 화면 기록에서 \
+                         MINT Exam IDE 권한을 허용하고 IDE를 재시작하세요.",
+                        bytes
+                    )
+                } else {
+                    format!(
+                        "녹화가 시작되지 않았습니다 ({} bytes after 3s). \
+                         FFmpeg가 설치되어 있는지, RDP/원격 데스크탑 세션에 \
+                         있지 않은지 확인하세요.",
+                        bytes
+                    )
+                };
+                let event = ActivityEvent::new(
+                    "recording_health_fail",
+                    &msg,
+                    Some(bytes as u32),
+                    None,
+                );
+                let _ = ah.emit("activity-event", &event);
+            }
+        });
+    }
+
     Ok(path)
 }
 
@@ -195,7 +266,8 @@ fn stop_recording(
 
 #[tauri::command]
 fn is_recording(recorder: State<RecorderState>) -> bool {
-    recorder.lock().map(|r| r.is_recording()).unwrap_or(false)
+    // `is_recording` now mutates (reaps dead ffmpeg children). Take a mut lock.
+    recorder.lock().map(|mut r| r.is_recording()).unwrap_or(false)
 }
 
 #[tauri::command]
@@ -501,6 +573,92 @@ fn setup_exam_python(app_handle: tauri::AppHandle) -> Result<String, String> {
             }
             Err(format!("Failed to create Python venv at {}: {}", venv_dir.display(), primary_err))
         }
+    }
+}
+
+/// Verify that the given python can import tkinter + matplotlib and produce
+/// a figure with the TkAgg backend. Used after `install_packages_smart` to
+/// surface broken environments BEFORE the student tries `plt.show()` mid-exam.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvVerifyResult {
+    pub ok: bool,
+    pub tkinter_ok: bool,
+    pub matplotlib_ok: bool,
+    pub backend: String,
+    pub errors: Vec<String>,
+}
+
+#[tauri::command]
+fn verify_exam_environment(python_path: String) -> EnvVerifyResult {
+    // Single-line Python script (no triple-quotes — passed via -c).
+    // Probes tkinter, then matplotlib(TkAgg), reports JSON on stdout.
+    const PROBE: &str = "\
+import json,sys\n\
+r={'tkinter_ok':False,'matplotlib_ok':False,'backend':'','errors':[]}\n\
+try:\n\
+ import tkinter\n\
+ t=tkinter.Tk();t.withdraw();t.destroy()\n\
+ r['tkinter_ok']=True\n\
+except Exception as e:\n\
+ r['errors'].append('tkinter: '+type(e).__name__+': '+str(e))\n\
+try:\n\
+ import matplotlib\n\
+ matplotlib.use('TkAgg',force=True)\n\
+ from matplotlib import pyplot as plt\n\
+ fig=plt.figure();plt.close(fig)\n\
+ r['matplotlib_ok']=True\n\
+ r['backend']=matplotlib.get_backend()\n\
+except Exception as e:\n\
+ r['errors'].append('matplotlib: '+type(e).__name__+': '+str(e))\n\
+sys.stdout.write(json.dumps(r))\n";
+
+    let mut command = std::process::Command::new(&python_path);
+    command
+        .args(["-c", PROBE])
+        .env("MPLBACKEND", "TkAgg")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let fail = |msg: String| EnvVerifyResult {
+        ok: false, tkinter_ok: false, matplotlib_ok: false,
+        backend: String::new(), errors: vec![msg],
+    };
+
+    let output = match command.output() {
+        Ok(o) => o,
+        Err(e) => return fail(format!("Failed to launch python at {}: {}", python_path, e)),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let last = stdout.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap_or("");
+
+    let parsed: serde_json::Value = match serde_json::from_str(last) {
+        Ok(v) => v,
+        Err(_) => return fail(format!(
+            "Verification probe did not emit JSON. stdout={:?} stderr={:?}",
+            stdout.chars().take(200).collect::<String>(),
+            stderr.chars().take(200).collect::<String>()
+        )),
+    };
+
+    let tkinter_ok = parsed.get("tkinter_ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let matplotlib_ok = parsed.get("matplotlib_ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let backend = parsed.get("backend").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let errors: Vec<String> = parsed.get("errors").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    EnvVerifyResult {
+        ok: tkinter_ok && matplotlib_ok,
+        tkinter_ok, matplotlib_ok, backend, errors,
     }
 }
 
@@ -996,6 +1154,24 @@ fn get_build_info() -> serde_json::Value {
     })
 }
 
+// Reentrancy guard for submit_exam. A double-click or rapid keyboard
+// re-trigger of the Submit button would otherwise truncate the half-written
+// zip and silently destroy the student's submission.
+static SUBMITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct SubmitGuard;
+impl SubmitGuard {
+    fn try_acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if SUBMITTING.swap(true, Ordering::SeqCst) { None } else { Some(Self) }
+    }
+}
+impl Drop for SubmitGuard {
+    fn drop(&mut self) {
+        SUBMITTING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[tauri::command]
 fn submit_exam(
     app_handle: tauri::AppHandle,
@@ -1004,6 +1180,19 @@ fn submit_exam(
     ws: State<WorkspaceState>,
     student_id: String,
 ) -> Result<SubmitResult, String> {
+    let _guard = SubmitGuard::try_acquire()
+        .ok_or_else(|| "이미 제출이 진행 중입니다. 잠시 기다려 주세요.".to_string())?;
+
+    // Reject malformed student_id early — it's interpolated into folder
+    // names (Desktop) and SHA-256 password.
+    let id_trim = student_id.trim();
+    if id_trim.is_empty() || id_trim.len() > 32
+        || id_trim.chars().any(|c| !c.is_ascii_alphanumeric())
+    {
+        return Err("학번은 영문/숫자 1~32자만 사용 가능합니다.".to_string());
+    }
+    let student_id = id_trim.to_string();
+
     // 1. Stop recording
     {
         let mut rec = recorder.lock().map_err(|e| e.to_string())?;
@@ -1074,26 +1263,51 @@ fn submit_exam(
     let _ = std::fs::create_dir_all(&video_dir);
     let rec_dir = setup::recordings_dir();
     let mut video_count = 0u32;
+    let mut video_source_count = 0u32;  // mp4/mov files we tried to copy
+    let mut video_errors: Vec<String> = Vec::new();
 
     if rec_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&rec_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default();
                 if ext == "mp4" || ext == "mov" {
+                    video_source_count += 1;
                     let dest = video_dir.join(path.file_name().unwrap());
-                    // Move (not copy) for speed — if same filesystem, instant
-                    if std::fs::rename(&path, &dest).is_err() {
-                        // Different filesystem: fall back to copy
-                        let _ = std::fs::copy(&path, &dest);
+                    // COPY before delete — if anything downstream fails
+                    // (ENOSPC, OneDrive lock), the originals in Recordings/
+                    // are still intact and the student can retry.
+                    if let Err(e) = std::fs::copy(&path, &dest) {
+                        video_errors.push(format!(
+                            "{}: copy failed ({})",
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                            e
+                        ));
+                        continue;
+                    }
+                    if recorder::obfuscate_video(&dest, &password_bytes).is_ok() {
                         let _ = std::fs::remove_file(&path);
                     }
-                    // Obfuscate header so student can't play it
-                    let _ = recorder::obfuscate_video(&dest, &password_bytes);
                     video_count += 1;
                 }
             }
         }
+    }
+
+    // SILENT VIDEO LOSS GUARD: if there ARE source recordings but NONE made
+    // it into the submission folder, refuse to claim "submit complete". The
+    // student gets a clear error and can retry (originals are still in
+    // Recordings/ thanks to copy-before-delete).
+    if video_source_count > 0 && video_count == 0 {
+        return Err(format!(
+            "녹화 파일 {}개를 제출 폴더로 복사하지 못했습니다. 디스크 여유 공간을 확인하세요.\n원본은 {}에 남아 있으니 재시도 가능합니다.\n\n상세:\n{}",
+            video_source_count,
+            rec_dir.display(),
+            video_errors.join("\n")
+        ));
     }
 
     // 8. Manifest (IDE integrity + student setup + suspicious event timestamps)
@@ -1352,6 +1566,7 @@ pub fn run() {
             ws_import_file,
             detect_pythons,
             setup_exam_python,
+            verify_exam_environment,
             log_python_change,
             save_code_history,
             submit_exam,

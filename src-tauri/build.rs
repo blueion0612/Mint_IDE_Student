@@ -18,6 +18,20 @@ fn main() {
     // Rebuild if HEAD changes.
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs/heads/main");
+    println!("cargo:rerun-if-changed=app.manifest");
 
-    tauri_build::build();
+    // Embed our custom Windows app manifest (longPathAware + UTF-8 ANSI
+    // codepage + PerMonitorV2 DPI). Without this, Korean Windows + long
+    // path users hit ERROR_FILENAME_EXCED_RANGE on ws_* operations.
+    #[cfg(windows)]
+    let attributes = tauri_build::Attributes::new().windows_attributes(
+        tauri_build::WindowsAttributes::new_without_app_manifest()
+            .app_manifest(include_str!("app.manifest")),
+    );
+    #[cfg(not(windows))]
+    let attributes = tauri_build::Attributes::new();
+
+    if let Err(error) = tauri_build::try_build(attributes) {
+        panic!("error found during tauri-build: {error:#}");
+    }
 }

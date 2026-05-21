@@ -1,183 +1,102 @@
 #!/bin/bash
-# MINT Exam IDE — macOS Full Installer
-# Installs all dependencies + the IDE app
-# Usage: curl -sL https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-mac.sh | bash
+# MINT Exam IDE — macOS Source Build Installer
+#
+# Apple Developer cert가 없어 signed binary 배포 불가. 학생이 직접 빌드.
+# Usage:
+#   curl -sL https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-mac.sh | bash
 
 set -e
 
-APP_NAME="MINT Exam IDE"
 REPO="blueion0612/Mint_IDE_Student"
+BUILD_DIR="$HOME/MINT_IDE_Source"
 INSTALL_DIR="/Applications"
 
 echo ""
 echo "=============================="
-echo "  MINT Exam IDE Installer"
+echo "  MINT Exam IDE — Source Build"
 echo "=============================="
 echo ""
 
-# ─── Helper ───
 check() { command -v "$1" &>/dev/null; }
-ok()    { echo "  [OK] $1"; }
-miss()  { echo "  [--] $1 — will install"; NEED_INSTALL=1; }
 
-NEED_INSTALL=0
-
-# ─── 1. Check all dependencies ───
-echo "[1/5] Checking dependencies..."
-
-check python3 && ok "Python3 ($(python3 --version 2>&1))" || miss "Python3"
-check node    && ok "Node.js ($(node --version 2>&1))"     || miss "Node.js"
-check gcc     && ok "GCC ($(gcc --version 2>&1 | head -1))" || miss "GCC (Xcode Command Line Tools)"
-check javac   && ok "JDK ($(javac -version 2>&1))"         || miss "JDK"
-check ffmpeg  && ok "FFmpeg"                                 || miss "FFmpeg"
-echo ""
-
-# ─── 2. Install missing dependencies ───
-if [ "$NEED_INSTALL" -eq 1 ]; then
-    echo "[2/5] Installing missing dependencies..."
-
-    # Xcode Command Line Tools (provides gcc, g++, make, git)
-    if ! check gcc; then
-        echo "  Installing Xcode Command Line Tools (gcc, g++, git)..."
-        echo "  A popup may appear — click 'Install' and wait."
-        xcode-select --install 2>/dev/null || true
-        # Wait for installation
-        echo "  Waiting for Xcode CLT installation..."
-        until check gcc; do sleep 5; done
-        echo "  Xcode CLT installed!"
-    fi
-
-    # Homebrew
-    if ! check brew; then
-        echo "  Installing Homebrew..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        # Add to PATH
-        if [ -f "/opt/homebrew/bin/brew" ]; then
-            eval "$(/opt/homebrew/bin/brew shellenv)"
-        elif [ -f "/usr/local/bin/brew" ]; then
-            eval "$(/usr/local/bin/brew shellenv)"
-        fi
-    fi
-
-    # Install missing packages via Homebrew
-    BREW_PKGS=""
-    check python3 || BREW_PKGS="$BREW_PKGS python"
-    check node    || BREW_PKGS="$BREW_PKGS node"
-    check javac   || BREW_PKGS="$BREW_PKGS openjdk"
-    check ffmpeg  || BREW_PKGS="$BREW_PKGS ffmpeg"
-
-    if [ -n "$BREW_PKGS" ]; then
-        echo "  brew install$BREW_PKGS"
-        brew install $BREW_PKGS
-    fi
-
-    # Java symlink (Homebrew openjdk needs this)
-    if [ -d "$(brew --prefix openjdk 2>/dev/null)/libexec/openjdk.jdk" ] 2>/dev/null; then
-        sudo ln -sfn "$(brew --prefix openjdk)/libexec/openjdk.jdk" /Library/Java/JavaVirtualMachines/openjdk.jdk 2>/dev/null || true
-    fi
-
-    echo ""
-    echo "  Dependencies installed!"
-else
-    echo "[2/5] All dependencies already installed. Skipping."
+# ─── 1. Xcode Command Line Tools (gcc, git) ───
+if ! check gcc; then
+    echo "[1/6] Installing Xcode Command Line Tools..."
+    echo "       (Popup appears — click 'Install' and wait ~5 min.)"
+    xcode-select --install 2>/dev/null || true
+    until check gcc; do sleep 5; done
 fi
+echo "[1/6] Xcode CLT: OK"
 
-# ─── 3. Verify ───
-echo "[3/5] Verifying..."
-WARNINGS=""
-check python3 && ok "python3" || WARNINGS="$WARNINGS python3"
-check node    && ok "node"    || WARNINGS="$WARNINGS node"
-check gcc     && ok "gcc"     || WARNINGS="$WARNINGS gcc"
-check javac   && ok "javac"   || WARNINGS="$WARNINGS javac"
-check ffmpeg  && ok "ffmpeg"  || WARNINGS="$WARNINGS ffmpeg"
-
-if [ -n "$WARNINGS" ]; then
-    echo ""
-    echo "  [WARNING] These tools failed to install:$WARNINGS"
-    echo "  Some languages may not work. You can install them manually later."
+# ─── 2. Homebrew ───
+if ! check brew; then
+    echo "[2/6] Installing Homebrew..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
-echo ""
-
-# ─── 3.5 Create empty exam venv (packages installed by IDE wizard) ───
-echo "[3.5/5] Creating exam Python venv (empty)..."
-VENV_DIR="$HOME/Library/Application Support/MINT_Exam_IDE/exam-venv"
-VENV_PY="$VENV_DIR/bin/python"
-if [ ! -x "$VENV_PY" ]; then
-    PY_CMD=""
-    for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
-        if command -v "$c" &>/dev/null || [ -x "$c" ]; then
-            PY_CMD="$c"; break
-        fi
-    done
-    if [ -n "$PY_CMD" ]; then
-        mkdir -p "$(dirname "$VENV_DIR")"
-        "$PY_CMD" -m venv "$VENV_DIR" 2>/dev/null
-        "$VENV_PY" -m pip install --upgrade pip 2>/dev/null >/dev/null
-        echo "  [OK] Empty venv ready at $VENV_DIR"
-    else
-        echo "  [SKIP] Python not found — venv will be created on first launch"
-    fi
-else
-    echo "  [OK] Venv already exists at $VENV_DIR"
+# Ensure brew is on PATH for both Apple Silicon and Intel layouts.
+if [ -x "/opt/homebrew/bin/brew" ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x "/usr/local/bin/brew" ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
 fi
-echo "  Packages will be installed by the IDE wizard on first launch."
-echo ""
+echo "[2/6] Homebrew: OK ($(brew --prefix))"
 
-# ─── 4. Download & Install App ───
-echo "[4/5] Downloading MINT Exam IDE..."
-
-ARCH=$(uname -m)
-if [ "$ARCH" = "arm64" ]; then
-    DMG_PATTERN="aarch64.dmg"
-else
-    DMG_PATTERN="x64.dmg"
+# ─── 3. Brew packages (Python 3.12 + Node + JDK + FFmpeg + Rust) ───
+echo "[3/6] Installing build tools (Python 3.12 / Node / JDK / FFmpeg / Rust)..."
+NEED=""
+check python3.12 || NEED="$NEED python@3.12"
+check node       || NEED="$NEED node"
+check javac      || NEED="$NEED openjdk@21"
+check ffmpeg     || NEED="$NEED ffmpeg"
+check rustc      || NEED="$NEED rust"
+if [ -n "$NEED" ]; then
+    brew install $NEED
 fi
+# Java symlink for IDE auto-detection
+if [ -d "$(brew --prefix openjdk@21 2>/dev/null)/libexec/openjdk.jdk" ]; then
+    sudo ln -sfn "$(brew --prefix openjdk@21)/libexec/openjdk.jdk" \
+        /Library/Java/JavaVirtualMachines/openjdk-21.jdk 2>/dev/null || true
+fi
+echo "[3/6] Tools: OK"
 
-DMG_URL=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" | \
-    grep "browser_download_url.*${DMG_PATTERN}" | \
-    grep -v "Lite" | \
-    head -1 | \
-    cut -d '"' -f 4)
+# ─── 4. Source clone (idempotent — wipe + reclone for clean retry) ───
+echo "[4/6] Cloning source to $BUILD_DIR ..."
+rm -rf "$BUILD_DIR"
+git clone "https://github.com/$REPO.git" "$BUILD_DIR"
+cd "$BUILD_DIR"
 
-if [ -z "$DMG_URL" ]; then
-    echo "  Error: Could not find download URL"
+# ─── 5. Build (npm install + tauri build) ───
+echo "[5/6] Building (5~10 minutes, downloads ~500MB of Rust crates)..."
+npm install
+npm run tauri build
+
+# ─── 6. Install to /Applications + remove quarantine attr ───
+APP_PATH=$(find "$BUILD_DIR/src-tauri/target/release/bundle/macos" -maxdepth 1 -name "*.app" | head -1)
+if [ -z "$APP_PATH" ]; then
+    echo "  [FAIL] Build produced no .app at expected location."
     exit 1
 fi
-
-TMPDIR=$(mktemp -d)
-DMG_PATH="$TMPDIR/mint-ide.dmg"
-curl -L "$DMG_URL" -o "$DMG_PATH" --progress-bar
-
-echo "[5/5] Installing app..."
-MOUNT_POINT=$(hdiutil attach "$DMG_PATH" -nobrowse -quiet | tail -1 | awk '{print $NF}')
-
-APP_FOUND=$(find "$MOUNT_POINT" -name "*.app" -maxdepth 1 | head -1)
-if [ -n "$APP_FOUND" ]; then
-    APP_NAME=$(basename "$APP_FOUND" .app)
-    rm -rf "$INSTALL_DIR/$APP_NAME.app"
-    cp -R "$APP_FOUND" "$INSTALL_DIR/"
-else
-    echo "  Error: No .app found"
-    hdiutil detach "$MOUNT_POINT" -quiet
-    exit 1
-fi
-
-hdiutil detach "$MOUNT_POINT" -quiet
+APP_NAME=$(basename "$APP_PATH" .app)
+echo "[6/6] Installing $APP_NAME.app to $INSTALL_DIR ..."
+rm -rf "$INSTALL_DIR/$APP_NAME.app"
+cp -R "$APP_PATH" "$INSTALL_DIR/"
+# Strip Gatekeeper quarantine — unsigned app would otherwise show
+# "damaged and can't be opened".
 xattr -cr "$INSTALL_DIR/$APP_NAME.app"
-rm -rf "$TMPDIR"
 
-# ─── Done ───
 echo ""
 echo "=============================="
-echo "  Installation complete!"
+echo "  Build complete!"
 echo "=============================="
 echo ""
-echo "  App:     $INSTALL_DIR/$APP_NAME.app"
-echo "  Python:  $(python3 --version 2>&1 || echo 'not found')"
-echo "  Node.js: $(node --version 2>&1 || echo 'not found')"
-echo "  GCC:     $(gcc --version 2>&1 | head -1 || echo 'not found')"
-echo "  Java:    $(javac -version 2>&1 || echo 'not found')"
-echo "  FFmpeg:  $(ffmpeg -version 2>&1 | head -1 || echo 'not found')"
+echo "  App:    $INSTALL_DIR/$APP_NAME.app"
+echo "  Source: $BUILD_DIR"
+echo ""
+echo "  ⚠ 첫 실행 시 권한 다이얼로그가 뜹니다. 모두 [허용] 누르세요:"
+echo "    1. Screen Recording  — 시험 영상 녹화에 필수"
+echo "    2. Automation        — 클립보드/포커스 모니터링에 필수"
+echo ""
+echo "  거부 시: 시스템 설정 > 개인정보 보호 및 보안 에서 수동 허용."
 echo ""
 
 open "$INSTALL_DIR/$APP_NAME.app"

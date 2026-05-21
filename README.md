@@ -26,4 +26,24 @@ npx tauri build
 
 ## Install
 
-Download the installer from [Releases](../../releases) and run it. Desktop shortcut is created automatically.
+### Windows (관리자 PowerShell)
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+irm https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-windows.ps1 | iex
+```
+
+Python 3.12.8 + Node + JDK + FFmpeg + WebView2 + IDE를 한 번에 설치.
+한글 username PC도 자동 처리 (LongPathsEnabled + venv ASCII fallback).
+
+### macOS (source build — Apple Developer cert 없음)
+
+```bash
+curl -sL https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-mac.sh | bash
+```
+
+Xcode CLT + Homebrew + Python 3.12 + Rust + Node + JDK + FFmpeg 설치 후 소스
+clone → `npm run tauri build` → `/Applications`에 복사. 5~10분 소요, ~500MB 다운로드.
+
+**첫 실행 권한**: 시스템 설정 > 개인정보 보호 및 보안 에서
+**Screen Recording** + **Automation** 둘 다 허용 필수. 거부 시 녹화/모니터링 작동 안 함.

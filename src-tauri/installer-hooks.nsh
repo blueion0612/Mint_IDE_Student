@@ -5,5 +5,9 @@
     ExecWait '$R9 /S'
     Sleep 2000
   ${EndIf}
-  Delete "$LOCALAPPDATA\MINT_Exam_IDE\setup_config.json"
+  ; Do NOT delete setup_config.json on update — that would wipe the student's
+  ; custom_venv_path (set when a non-ASCII %LOCALAPPDATA% forced the
+  ; ProgramData fallback). Wiping it makes the Korean-username PC retry the
+  ; broken venv every update. The wizard's first-launch check (setup_done)
+  ; gates re-entry; we don't need to nuke the file.
 !macroend

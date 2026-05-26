@@ -39,6 +39,10 @@ let activeFilePath: string | null = null;
 let editorView: ReturnType<typeof createEditor> | null = null;
 let warningCount = 0;
 let isRunning = false;
+// Tracks whether any "run-output" stream chunk arrived during the current
+// Run. Used by the run-done handler to decide if the fallback collected-
+// output dump is needed. Reset to false at the start of every Run.
+let streamingOutputReceived = false;
 let isRecording = false;
 let workspaceRoot = "";
 let studentId = "";
@@ -1037,6 +1041,7 @@ async function runCurrentFile(): Promise<void> {
   // saveCurrentFile are awaiting, causing the same file to run twice —
   // the student sees their print() output duplicated.
   isRunning = true;
+  streamingOutputReceived = false;
 
   // If notebook is active, delegate to notebook's Run All. Release the
   // main isRunning lock since notebook tracks its own running state.
@@ -1644,11 +1649,13 @@ async function listenForBackendEvents(): Promise<void> {
     if (isNotebookRunning()) return; // notebook handles its own output
     const { stream, text } = event.payload;
     if (stream === "stderr") {
+      streamingOutputReceived = true;
       appendOutput(text, "error");
       highlightErrorLine(text);
     } else if (stream === "system") {
       appendOutput(text, "system");
     } else {
+      streamingOutputReceived = true;
       appendOutput(text, "stdout");
     }
   });
@@ -1659,11 +1666,13 @@ async function listenForBackendEvents(): Promise<void> {
 
     const { exit_code, duration_ms, stdout, stderr } = event.payload;
 
-    // Fallback: if streaming events didn't show output, display collected output now
-    const outputEl = document.getElementById("output-content")!;
-    const currentText = outputEl.textContent || "";
-    const headerOnly = currentText.split("\n").filter(l => l.trim() && !l.startsWith("$")).length === 0;
-    if (headerOnly) {
+    // Fallback ONLY if no run-output stream events arrived. The previous
+    // heuristic (read outputEl.textContent and check for non-header lines)
+    // raced with appendOutput's rAF batching: a fast program would emit
+    // stdout via run-output, the DOM flush hadn't happened yet, run-done
+    // saw an "empty" output panel and re-appended the collected stdout —
+    // result: "Hello, MINT" printed twice for a single Run.
+    if (!streamingOutputReceived) {
       if (stdout) appendOutput(stdout, "stdout");
       if (stderr) {
         appendOutput(stderr, "error");
@@ -1672,6 +1681,7 @@ async function listenForBackendEvents(): Promise<void> {
         }
       }
     }
+    streamingOutputReceived = false;  // reset for next run
 
     const status = exit_code === 0 ? "OK" : `exit code ${exit_code}`;
     appendOutput(`--- Finished (${status}, ${duration_ms}ms) ---\n\n`, "system");

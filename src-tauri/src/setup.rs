@@ -67,10 +67,19 @@ pub fn mint_exam_root() -> PathBuf {
         .join("MINT_Exam")
 }
 
+/// Workspaces live under %LOCALAPPDATA%\MINT_Exam_IDE\Workspaces — NOT in
+/// Documents — so a casual student opening File Explorer doesn't trip over
+/// their own source. AppData\Local is hidden by default on Windows shell.
+/// Combined with the explicit hidden attribute set in Workspace::init this
+/// keeps honest students from accidentally editing files outside the IDE.
 pub fn workspaces_dir() -> PathBuf {
-    mint_exam_root().join("Workspaces")
+    app_data_root().join("Workspaces")
 }
 
+/// Recordings stay under Documents — large files, no reason to bury them
+/// under AppData (which sits on the same drive as Documents anyway). The
+/// student can see them but cannot tamper since obfuscation happens on
+/// submit and the in-progress mp4 is held open by ffmpeg.
 pub fn recordings_dir() -> PathBuf {
     mint_exam_root().join("Recordings")
 }

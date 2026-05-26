@@ -16,8 +16,15 @@ pub struct Workspace {
 
 impl Workspace {
     /// Creates a new isolated workspace in a temp-like location.
-    /// The directory is created if it doesn't exist.
+    /// The directory is created if it doesn't exist. On Windows we also tag
+    /// the parent (Workspaces/) with the HIDDEN attribute so the casual
+    /// File Explorer view doesn't surface the student's source files — they
+    /// can still be found by a determined user but no longer by accident.
     pub fn init(base_dir: &Path, session_name: &str) -> Result<Self, String> {
+        let _ = std::fs::create_dir_all(base_dir);
+        #[cfg(target_os = "windows")]
+        hide_directory(base_dir);
+
         let root = base_dir.join(session_name);
         std::fs::create_dir_all(&root)
             .map_err(|e| format!("Failed to create workspace: {}", e))?;
@@ -126,6 +133,29 @@ impl Workspace {
         }
 
         Ok(full)
+    }
+}
+
+/// Set FILE_ATTRIBUTE_HIDDEN on a directory (Windows-only). Best-effort —
+/// failures are ignored: hidden attr is defense-in-depth, not security.
+#[cfg(target_os = "windows")]
+fn hide_directory(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
+    }
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    unsafe {
+        let current = GetFileAttributesW(wide.as_ptr());
+        if current == INVALID_FILE_ATTRIBUTES { return; }
+        SetFileAttributesW(wide.as_ptr(), current | FILE_ATTRIBUTE_HIDDEN);
     }
 }
 

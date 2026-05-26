@@ -1032,25 +1032,33 @@ async function deleteItem(path: string): Promise<void> {
 async function runCurrentFile(): Promise<void> {
   if (isRunning || !activeFilePath) return;
 
-  // If notebook is active, delegate to notebook's Run All
+  // CRITICAL: claim the run BEFORE any await. Without this a fast
+  // double-click of Run sneaks past the guard while syncCurrentEditor /
+  // saveCurrentFile are awaiting, causing the same file to run twice —
+  // the student sees their print() output duplicated.
+  isRunning = true;
+
+  // If notebook is active, delegate to notebook's Run All. Release the
+  // main isRunning lock since notebook tracks its own running state.
   if (isNotebookActive() && activeFilePath.endsWith(".ipynb")) {
+    isRunning = false;
     const runAllBtn = document.getElementById("nb-run-all");
     if (runAllBtn) runAllBtn.click();
     return;
   }
 
   const file = openFiles.find((f) => f.path === activeFilePath);
-  if (!file) return;
+  if (!file) { isRunning = false; return; }
 
   await syncCurrentEditor();
   await saveCurrentFile();
 
   if (!file.content.trim()) {
     appendOutput("No code to run.\n", "system");
+    isRunning = false;
     return;
   }
 
-  isRunning = true;
   const btn = document.getElementById("btn-run") as HTMLButtonElement;
   btn.innerHTML = "&#9632; Stop";
   btn.classList.remove("btn-run");

@@ -84,8 +84,10 @@ pub fn recordings_dir() -> PathBuf {
     mint_exam_root().join("Recordings")
 }
 
-/// Hardcoded, mutually-verified package versions for Python 3.12.8.
-/// Bump in sync whenever the dedicated Python version changes.
+/// Hardcoded, mutually-verified package versions for Python 3.12.x.
+/// Wheel ABI is `cp312-*` so any 3.12.X patch works (the installer
+/// ships Astral's portable Python 3.12.13). Bump in sync only when the
+/// dedicated Python's minor version changes.
 pub fn package_list_for_profile(profile: &str, custom: &[String]) -> Vec<String> {
     match profile {
         "basic" => vec![

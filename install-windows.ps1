@@ -36,8 +36,13 @@ Write-Host ""
 function Test-Cmd($cmd) { $null -ne (Get-Command $cmd -ErrorAction SilentlyContinue) }
 
 # ─── Configuration (hardcoded for reproducibility) ───
-$MINT_PY_VERSION = "3.12.8"
-$MINT_PY_URL     = "https://www.python.org/ftp/python/$MINT_PY_VERSION/python-$MINT_PY_VERSION-amd64.exe"
+# Astral python-build-standalone — fully portable CPython distribution.
+# Avoids python.org MSI installer entirely (no more 1638 conflicts with
+# existing Python 3.12.x on the student's PC). bit-identical across all
+# student machines.
+$MINT_PY_VERSION = "3.12.13"
+$MINT_PY_BUILD   = "20260510"
+$MINT_PY_URL     = "https://github.com/astral-sh/python-build-standalone/releases/download/$MINT_PY_BUILD/cpython-$MINT_PY_VERSION%2B$MINT_PY_BUILD-x86_64-pc-windows-msvc-install_only.tar.gz"
 $MINT_PY_ROOT    = "C:\ProgramData\MINT_Python\Python312"
 $MINT_PY_EXE     = "$MINT_PY_ROOT\python.exe"
 
@@ -57,126 +62,78 @@ try {
 }
 Write-Host ""
 
-# ─── 1. Dedicated Python install (ASCII path, tcl/tk included) ───
-Write-Host "[1/5] Installing dedicated Python $MINT_PY_VERSION (with tcl/tk)..." -ForegroundColor Yellow
+# ─── 1. Portable Python (extracted from Astral python-build-standalone) ───
+Write-Host "[1/5] Setting up portable Python $MINT_PY_VERSION..." -ForegroundColor Yellow
 
+# Already extracted from a previous run? Skip download.
 if (Test-Path $MINT_PY_EXE) {
     $ver = & $MINT_PY_EXE --version 2>&1
-    Write-Host "  [OK] Already installed: $ver at $MINT_PY_ROOT" -ForegroundColor Green
+    Write-Host "  [OK] Already present: $ver at $MINT_PY_ROOT" -ForegroundColor Green
 } else {
-    Write-Host "  Downloading $MINT_PY_URL ..."
-    $tmpInstaller = "$env:TEMP\mint-python-$MINT_PY_VERSION.exe"
+    # Sanity check: tar.exe ships with Windows 10 1803+. Older builds will
+    # not have it. Fall back is manual download instructions.
+    if (-not (Test-Cmd "tar")) {
+        Write-Host "  [FAIL] tar.exe not found. Need Windows 10 1803+ or newer." -ForegroundColor Red
+        Write-Host "         Manual: download $MINT_PY_URL and extract its 'python\' folder" -ForegroundColor Yellow
+        Write-Host "         to $MINT_PY_ROOT (rename 'python' to 'Python312')." -ForegroundColor Yellow
+        Read-Host "Press Enter to close"
+        exit 1
+    }
+
+    $tarPath = "$env:TEMP\mint-cpython-$MINT_PY_VERSION.tar.gz"
+    Write-Host "  Downloading portable Python (~45 MB) ..."
+    Write-Host "  $MINT_PY_URL" -ForegroundColor DarkGray
     try {
-        Invoke-WebRequest -Uri $MINT_PY_URL -OutFile $tmpInstaller -UseBasicParsing
+        Invoke-WebRequest -Uri $MINT_PY_URL -OutFile $tarPath -UseBasicParsing
     } catch {
         Write-Host "  [FAIL] Download failed: $_" -ForegroundColor Red
-        Write-Host "  Manual download (then double-click to install with same options):" -ForegroundColor Yellow
-        Write-Host "    $MINT_PY_URL" -ForegroundColor Cyan
-        Write-Host "  Or pick another Python $MINT_PY_VERSION installer from:" -ForegroundColor Yellow
-        Write-Host "    https://www.python.org/downloads/release/python-3128/" -ForegroundColor Cyan
+        Write-Host "         Check internet, or download manually from:" -ForegroundColor Yellow
+        Write-Host "         https://github.com/astral-sh/python-build-standalone/releases/tag/$MINT_PY_BUILD" -ForegroundColor Cyan
         Read-Host "Press Enter to close"
         exit 1
     }
 
-    Write-Host "  Installing to $MINT_PY_ROOT (silent, tcl/tk included)..."
-    $pyArgs = @(
-        "/quiet",
-        "InstallAllUsers=1",
-        "TargetDir=$MINT_PY_ROOT",
-        "PrependPath=0",
-        "Include_tcltk=1",
-        "Include_pip=1",
-        "Include_launcher=0",
-        "Include_test=0",
-        "Include_doc=0",
-        "AssociateFiles=0",
-        "Shortcuts=0",
-        "CompileAll=0"
-    )
-    # Capture exit code — silent installer otherwise hides UAC rejection,
-    # antivirus blocks, MSI rollback. Test-Path is necessary but not sufficient.
-    $pyProc = Start-Process -FilePath $tmpInstaller -Wait -ArgumentList $pyArgs -PassThru
-    Remove-Item $tmpInstaller -ErrorAction SilentlyContinue
+    # Extract — the tarball top-level contains a single 'python\' directory.
+    # We extract into ProgramData\MINT_Python\, then rename python → Python312
+    # so the rest of the script and the IDE can keep using $MINT_PY_ROOT.
+    $extractParent = "C:\ProgramData\MINT_Python"
+    $stagingDir    = "$extractParent\python"
+    if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force }
+    if (Test-Path $MINT_PY_ROOT) { Remove-Item $MINT_PY_ROOT -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $extractParent | Out-Null
 
-    # MSI exit 1638 = "another version of this product is already installed".
-    # python.org installer enforces a single Python 3.12.x system-wide regardless
-    # of TargetDir. Fall back to that existing install if it has tcl/tk.
-    if ($pyProc.ExitCode -eq 1638) {
-        Write-Host "  [INFO] Another Python 3.12.x is already installed on this PC." -ForegroundColor Yellow
-        Write-Host "  Searching for an existing usable Python 3.12..." -ForegroundColor Yellow
-
-        $existingPy = $null
-        # 1) py launcher
-        if (Test-Cmd "py") {
-            $pyPath = & py -3.12 -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0 -and $pyPath -and (Test-Path $pyPath)) {
-                $existingPy = $pyPath
-            }
-        }
-        # 2) Common install locations
-        if (-not $existingPy) {
-            $candidates = @(
-                "C:\Python312\python.exe",
-                "C:\Program Files\Python312\python.exe",
-                "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
-            )
-            foreach ($c in $candidates) {
-                if (Test-Path $c) { $existingPy = $c; break }
-            }
-        }
-
-        if (-not $existingPy) {
-            Write-Host "  [FAIL] 1638 reported but Python 3.12 was not found at known paths." -ForegroundColor Red
-            Write-Host "         Open Settings > Apps and uninstall 'Python 3.12.x'," -ForegroundColor Yellow
-            Write-Host "         then re-run this installer." -ForegroundColor Yellow
-            Read-Host "Press Enter to close"
-            exit 1
-        }
-
-        Write-Host "  Found: $existingPy" -ForegroundColor Cyan
-        $tkCheck = & $existingPy -c "import tkinter; tkinter.Tk().destroy(); print('tkinter OK')" 2>&1
-        if ($tkCheck -notmatch "tkinter OK") {
-            Write-Host "  [FAIL] Existing Python 3.12 lacks tkinter:" -ForegroundColor Red
-            Write-Host "         $tkCheck" -ForegroundColor DarkGray
-            Write-Host "         matplotlib plt.show() will not work at exam time." -ForegroundColor Yellow
-            Write-Host "         Fix: Settings > Apps > uninstall 'Python 3.12.x'," -ForegroundColor Yellow
-            Write-Host "              then re-run this installer (it will reinstall with tcl/tk)." -ForegroundColor Yellow
-            Read-Host "Press Enter to close"
-            exit 1
-        }
-        Write-Host "  [OK] Existing Python 3.12 has tkinter — using it." -ForegroundColor Green
-        # Redirect the rest of the script to the existing Python. IDE's
-        # find_system_python will still pick up MINT_PY_EXE if it exists
-        # later; here we just verify the environment is usable.
-        $MINT_PY_EXE = $existingPy
-        # Skip the rest of the install-block; the verified Python is good.
+    Write-Host "  Extracting to $extractParent ..."
+    tar -xzf $tarPath -C $extractParent
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$stagingDir\python.exe")) {
+        Write-Host "  [FAIL] Extraction produced no python.exe at $stagingDir" -ForegroundColor Red
+        Write-Host "         tar exit code: $LASTEXITCODE" -ForegroundColor Yellow
+        Remove-Item $tarPath -ErrorAction SilentlyContinue
+        Read-Host "Press Enter to close"
+        exit 1
     }
-    elseif ($pyProc.ExitCode -ne 0) {
-        Write-Host "  [FAIL] Python installer exited with code $($pyProc.ExitCode)." -ForegroundColor Red
-        Write-Host "  Common causes: antivirus blocked the installer, UAC denied, low disk space." -ForegroundColor Yellow
+    Rename-Item -Path $stagingDir -NewName "Python312"
+    Remove-Item $tarPath -ErrorAction SilentlyContinue
+
+    if (-not (Test-Path $MINT_PY_EXE)) {
+        Write-Host "  [FAIL] Expected python.exe missing after rename: $MINT_PY_EXE" -ForegroundColor Red
         Read-Host "Press Enter to close"
         exit 1
     }
 
-    if (Test-Path $MINT_PY_EXE) {
-        $ver = & $MINT_PY_EXE --version 2>&1
-        Write-Host "  [OK] Installed: $ver" -ForegroundColor Green
+    $ver = & $MINT_PY_EXE --version 2>&1
+    Write-Host "  [OK] Extracted: $ver" -ForegroundColor Green
 
-        # Verify tkinter loads — matplotlib GUI (plt.show) depends on it.
-        # Fail fast here rather than letting the student discover it mid-exam.
-        $tkCheck = & $MINT_PY_EXE -c "import tkinter; tkinter.Tk().destroy(); print('tkinter OK')" 2>&1
-        if ($tkCheck -match "tkinter OK") {
-            Write-Host "  [OK] tkinter/TCL verified" -ForegroundColor Green
-        } else {
-            Write-Host "  [FAIL] tkinter self-check failed: $tkCheck" -ForegroundColor Red
-            Write-Host "  This blocks matplotlib plt.show() at exam time." -ForegroundColor Red
-            Write-Host "  Likely cause: python.org installer ran without Include_tcltk=1." -ForegroundColor Yellow
-            Write-Host "  Remove $MINT_PY_ROOT and re-run this script." -ForegroundColor Yellow
-            Read-Host "Press Enter to close"
-            exit 1
-        }
+    # Verify tkinter loads — matplotlib GUI (plt.show) depends on it.
+    # python-build-standalone install_only ships tcl/tk by default, so this
+    # is sanity-check only. If it fails, the asset on Astral changed.
+    $tkCheck = & $MINT_PY_EXE -c "import tkinter; tkinter.Tk().destroy(); print('tkinter OK')" 2>&1
+    if ($tkCheck -match "tkinter OK") {
+        Write-Host "  [OK] tkinter/TCL verified" -ForegroundColor Green
     } else {
-        Write-Host "  [FAIL] Python install did not produce $MINT_PY_EXE" -ForegroundColor Red
+        Write-Host "  [FAIL] tkinter self-check failed in portable Python:" -ForegroundColor Red
+        Write-Host "         $tkCheck" -ForegroundColor DarkGray
+        Write-Host "         The python-build-standalone asset may have changed structure." -ForegroundColor Yellow
+        Write-Host "         Report to https://github.com/blueion0612/Mint_IDE_Student/issues" -ForegroundColor Cyan
         Read-Host "Press Enter to close"
         exit 1
     }

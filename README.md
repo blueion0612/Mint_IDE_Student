@@ -33,7 +33,10 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 irm https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-windows.ps1 | iex
 ```
 
-Python 3.12.8 + Node + JDK + FFmpeg + WebView2 + IDE를 한 번에 설치.
+Portable Python 3.12.13 (Astral python-build-standalone) + Node + JDK +
+FFmpeg + WebView2 + IDE를 한 번에 설치. MSI 충돌 없음 — 기존 Python
+3.12.x가 있어도 그대로 같이 두고 우리 전용 portable Python을 별도
+경로(`C:\ProgramData\MINT_Python\Python312`)에 압축 해제.
 한글 username PC도 자동 처리 (LongPathsEnabled + venv ASCII fallback).
 
 ### macOS (source build — Apple Developer cert 없음)

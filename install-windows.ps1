@@ -97,7 +97,61 @@ if (Test-Path $MINT_PY_EXE) {
     # antivirus blocks, MSI rollback. Test-Path is necessary but not sufficient.
     $pyProc = Start-Process -FilePath $tmpInstaller -Wait -ArgumentList $pyArgs -PassThru
     Remove-Item $tmpInstaller -ErrorAction SilentlyContinue
-    if ($pyProc.ExitCode -ne 0) {
+
+    # MSI exit 1638 = "another version of this product is already installed".
+    # python.org installer enforces a single Python 3.12.x system-wide regardless
+    # of TargetDir. Fall back to that existing install if it has tcl/tk.
+    if ($pyProc.ExitCode -eq 1638) {
+        Write-Host "  [INFO] Another Python 3.12.x is already installed on this PC." -ForegroundColor Yellow
+        Write-Host "  Searching for an existing usable Python 3.12..." -ForegroundColor Yellow
+
+        $existingPy = $null
+        # 1) py launcher
+        if (Test-Cmd "py") {
+            $pyPath = & py -3.12 -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $pyPath -and (Test-Path $pyPath)) {
+                $existingPy = $pyPath
+            }
+        }
+        # 2) Common install locations
+        if (-not $existingPy) {
+            $candidates = @(
+                "C:\Python312\python.exe",
+                "C:\Program Files\Python312\python.exe",
+                "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
+            )
+            foreach ($c in $candidates) {
+                if (Test-Path $c) { $existingPy = $c; break }
+            }
+        }
+
+        if (-not $existingPy) {
+            Write-Host "  [FAIL] 1638 reported but Python 3.12 was not found at known paths." -ForegroundColor Red
+            Write-Host "         Open Settings > Apps and uninstall 'Python 3.12.x'," -ForegroundColor Yellow
+            Write-Host "         then re-run this installer." -ForegroundColor Yellow
+            Read-Host "Press Enter to close"
+            exit 1
+        }
+
+        Write-Host "  Found: $existingPy" -ForegroundColor Cyan
+        $tkCheck = & $existingPy -c "import tkinter; tkinter.Tk().destroy(); print('tkinter OK')" 2>&1
+        if ($tkCheck -notmatch "tkinter OK") {
+            Write-Host "  [FAIL] Existing Python 3.12 lacks tkinter:" -ForegroundColor Red
+            Write-Host "         $tkCheck" -ForegroundColor DarkGray
+            Write-Host "         matplotlib plt.show() will not work at exam time." -ForegroundColor Yellow
+            Write-Host "         Fix: Settings > Apps > uninstall 'Python 3.12.x'," -ForegroundColor Yellow
+            Write-Host "              then re-run this installer (it will reinstall with tcl/tk)." -ForegroundColor Yellow
+            Read-Host "Press Enter to close"
+            exit 1
+        }
+        Write-Host "  [OK] Existing Python 3.12 has tkinter — using it." -ForegroundColor Green
+        # Redirect the rest of the script to the existing Python. IDE's
+        # find_system_python will still pick up MINT_PY_EXE if it exists
+        # later; here we just verify the environment is usable.
+        $MINT_PY_EXE = $existingPy
+        # Skip the rest of the install-block; the verified Python is good.
+    }
+    elseif ($pyProc.ExitCode -ne 0) {
         Write-Host "  [FAIL] Python installer exited with code $($pyProc.ExitCode)." -ForegroundColor Red
         Write-Host "  Common causes: antivirus blocked the installer, UAC denied, low disk space." -ForegroundColor Yellow
         Read-Host "Press Enter to close"

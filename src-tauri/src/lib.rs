@@ -97,6 +97,12 @@ fn run_code(
     Ok(())
 }
 
+/// PID of the currently-running notebook cell child (0 = none). Published by
+/// run_code_sync so the focus monitor can exempt the student's own program
+/// window (matplotlib/tkinter) — which lives in this python process — from
+/// focus_lost, just like the streaming runner does via RunningProcess.
+pub static NOTEBOOK_CHILD_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Blocking code execution — for notebooks. Returns stdout+stderr directly.
 #[tauri::command]
 async fn run_code_sync(
@@ -138,7 +144,15 @@ async fn run_code_sync(
         command.env("MPLBACKEND", "TkAgg");
     }
 
-    let output = command.output().map_err(|e| e.to_string())?;
+    // Spawn (instead of .output()) so we can publish the child PID for the
+    // focus monitor's window-exemption, then capture output the same way.
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let child = command.spawn().map_err(|e| e.to_string())?;
+    NOTEBOOK_CHILD_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+    let output_result = child.wait_with_output();
+    NOTEBOOK_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    let output = output_result.map_err(|e| e.to_string())?;
 
     // Cleanup temp file
     let _ = std::fs::remove_file(&file_path);
@@ -158,7 +172,7 @@ async fn run_code_sync(
     // outputs are never flagged; source files stay monitored.)
     let post_paths = runner::snapshot_workspace_paths(&work_path);
     for (rel, path) in &post_paths {
-        match monitor::hash_file(path) {
+        match monitor::hash_file_retry(path) {
             Some(h) => mark_known_write_hash(&known_writes, rel, &h),
             None => mark_known_write(&known_writes, rel),
         }
@@ -964,7 +978,9 @@ fn ws_import_file(
     // Read source and write into workspace (goes through resolve_safe)
     let content = std::fs::read(src)
         .map_err(|e| format!("Failed to read source: {}", e))?;
-    mark_known_write(&kw, &rel_dest);
+    // Content-pin the imported bytes (not a blind time grace) so the file's
+    // appearance isn't flagged, and only THIS content is excused at that path.
+    mark_known_write_hash(&kw, &rel_dest, &sha256_hex(&content));
     let full_dest = workspace.resolve_safe_for_write(&rel_dest)?;
     if let Some(parent) = full_dest.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1101,10 +1117,18 @@ fn ws_rename(
     old_path: String,
     new_path: String,
 ) -> Result<(), String> {
-    mark_known_write(&kw, &old_path);
-    mark_known_write(&kw, &new_path);
+    mark_known_write(&kw, &old_path); // old path disappears — deletion grace
     let guard = ws.lock().map_err(|e| e.to_string())?;
-    guard.as_ref().ok_or("No workspace initialized".to_string())?.rename(&old_path, &new_path)?;
+    let workspace = guard.as_ref().ok_or("No workspace initialized".to_string())?;
+    // Content-pin the dest from the SOURCE bytes BEFORE renaming (the same
+    // bytes survive the move), so the new path is already content-known the
+    // instant it appears — no unpinned window for the 2s poll. A content pin
+    // (not a blind time grace) means a delete-then-recreate of a DIFFERENT file
+    // can't be laundered.
+    if let Ok(src) = workspace.resolve_safe_for_write(&old_path) {
+        if let Some(h) = monitor::hash_file_retry(&src) { mark_known_write_hash(&kw, &new_path, &h); }
+    }
+    workspace.rename(&old_path, &new_path)?;
     let event = ActivityEvent::new(
         "file_rename",
         &format!("Renamed: {} → {}", old_path, new_path),
@@ -1170,8 +1194,12 @@ fn ws_move(
         return Ok(new_path);
     }
 
-    mark_known_write(&kw, &src_path);
-    mark_known_write(&kw, &new_path);
+    mark_known_write(&kw, &src_path); // source disappears — deletion grace
+    // Content-pin the dest from the SOURCE bytes BEFORE moving (no unpinned
+    // window; content pin so an unrelated recreate isn't laundered).
+    if let Ok(src) = workspace.resolve_safe_for_write(&src_path) {
+        if let Some(h) = monitor::hash_file_retry(&src) { mark_known_write_hash(&kw, &new_path, &h); }
+    }
     workspace.rename(&src_path, &new_path)?;
 
     let event = ActivityEvent::new(

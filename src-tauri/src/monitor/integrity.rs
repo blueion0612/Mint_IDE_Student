@@ -226,6 +226,21 @@ pub fn hash_file(path: &Path) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
+/// hash_file with a brief retry — for KNOWN-WRITE PIN sites (post-run pin,
+/// rename/move) where a transient read failure (e.g. a Windows AV/Defender
+/// deny-share lock right after a write) would otherwise leave the file unpinned
+/// and raise a one-time false tamper under the content-aware grace. The scanner
+/// itself still uses plain hash_file (a read failure there just skips that poll).
+pub fn hash_file_retry(path: &Path) -> Option<String> {
+    for _ in 0..3 {
+        if let Some(h) = hash_file(path) {
+            return Some(h);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    hash_file(path)
+}
+
 fn file_mtime(path: &Path) -> u64 {
     path.metadata()
         .and_then(|m| m.modified())
@@ -454,10 +469,18 @@ pub fn start_integrity_monitor(
                 let is_known = known_writes.lock().ok()
                     .and_then(|map| map.get(rel.as_str()).cloned())
                     .map(|(expected, grace_until)| {
+                        // Content-aware: a pinned hash must match the on-disk
+                        // content. A time-only (None) grace does NOT excuse an
+                        // in-place change or a recreate — otherwise an IDE
+                        // delete/rename/move registering a blind None grace
+                        // would let an external recreate of that path within the
+                        // window pass as "known". (None still excuses a pure
+                        // DELETION in the deletion loop below.) All IDE ops that
+                        // produce content now pin the hash (mark_known_write_hash).
                         now <= grace_until
                             && match expected {
                                 Some(h) => h == new_hash,
-                                None => true,
+                                None => false,
                             }
                     })
                     .unwrap_or(false);

@@ -336,6 +336,14 @@ pub fn execute_code_streaming(
         // DELETED get a time-only deletion grace so program-driven removals are
         // not flagged. (Previously the pre/post UNION was marked time-only,
         // which let `print(1)` launder the ENTIRE workspace for 8s.)
+        // Register the files this run touched as known writes, each PINNED to
+        // its post-run content hash (so a program output isn't flagged, while
+        // an external overwrite of any path with DIFFERENT content within the
+        // grace window still raises tamper). Files the program DELETED get a
+        // time-only deletion grace so program-driven removals aren't flagged.
+        // (Monitoring is content-pinned and not suppressed during runs, so an
+        // external edit is still flagged by the live poll; generated-output
+        // file types are excluded from monitoring entirely — see integrity.rs.)
         let post_paths = snapshot_workspace_paths(&dir);
         for (rel, path) in &post_paths {
             match crate::monitor::hash_file(path) {

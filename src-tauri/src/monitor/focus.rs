@@ -5,7 +5,11 @@ use tauri::{AppHandle, Emitter};
 
 /// Monitors which window has foreground focus.
 /// Logs focus_lost and focus_returned events with duration.
-pub fn start_focus_monitor(log: LogHandle, app_handle: AppHandle) {
+pub fn start_focus_monitor(
+    log: LogHandle,
+    app_handle: AppHandle,
+    running: crate::runner::RunningProcess,
+) {
     thread::spawn(move || {
         let mut was_focused = true;
         let mut lost_focus_at: Option<i64> = None;
@@ -13,7 +17,12 @@ pub fn start_focus_monitor(log: LogHandle, app_handle: AppHandle) {
         loop {
             thread::sleep(Duration::from_millis(250));
 
-            let (is_our_app, foreground_app) = check_foreground_window();
+            // The student's own program window (matplotlib/tkinter, same python
+            // process) lives in the run-child PID — exempt that exact PID so
+            // viewing it isn't logged as focus_lost. A spawned browser has a
+            // DIFFERENT PID, so it is still flagged.
+            let run_child_pid = running.lock().ok().and_then(|g| g.as_ref().map(|(_, c)| c.id()));
+            let (is_our_app, foreground_app) = check_foreground_window(run_child_pid);
 
             if was_focused && !is_our_app {
                 lost_focus_at = Some(chrono::Local::now().timestamp_millis());
@@ -42,7 +51,7 @@ pub fn start_focus_monitor(log: LogHandle, app_handle: AppHandle) {
 }
 
 #[cfg(target_os = "windows")]
-fn check_foreground_window() -> (bool, String) {
+fn check_foreground_window(run_child_pid: Option<u32>) -> (bool, String) {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -107,6 +116,7 @@ fn check_foreground_window() -> (bool, String) {
         // basename treated ANY WebView2-hosted app (Office, chat apps, …) as
         // self, silently suppressing focus_lost when a student switched to one.
         let is_ours = fg_pid == our_pid
+            || Some(fg_pid) == run_child_pid
             || (raw_exe.eq_ignore_ascii_case("msedgewebview2.exe")
                 && pid_is_descendant_of(fg_pid, our_pid));
 
@@ -140,7 +150,7 @@ fn check_foreground_window() -> (bool, String) {
 }
 
 #[cfg(target_os = "macos")]
-fn check_foreground_window() -> (bool, String) {
+fn check_foreground_window(_run_child_pid: Option<u32>) -> (bool, String) {
     use std::process::Command;
 
     let output = Command::new("osascript")
@@ -158,7 +168,7 @@ fn check_foreground_window() -> (bool, String) {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn check_foreground_window() -> (bool, String) {
+fn check_foreground_window(_run_child_pid: Option<u32>) -> (bool, String) {
     (true, "unknown".to_string())
 }
 

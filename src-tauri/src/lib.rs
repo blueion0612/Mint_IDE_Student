@@ -9,7 +9,7 @@ use recorder::{RecorderState, ScreenRecorder};
 use setup::SetupConfig;
 use workspace::{FileNode, Workspace, WorkspaceState};
 use std::sync::Mutex;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 struct AppState {
     activity_log: Mutex<ActivityLog>,
@@ -152,6 +152,10 @@ async fn run_code_sync(
     // and give a time-only deletion grace to files the cell removed — same
     // policy as the streaming runner. (Marking the pre/post UNION time-only
     // previously laundered the whole workspace for 8s after every cell run.)
+    // Pin each touched file to its post-run content hash; deleted files get a
+    // time-only deletion grace. (Generated-output file types are excluded from
+    // monitoring entirely in integrity.rs, so a notebook cell's plot/data
+    // outputs are never flagged; source files stay monitored.)
     let post_paths = runner::snapshot_workspace_paths(&work_path);
     for (rel, path) in &post_paths {
         match monitor::hash_file(path) {
@@ -211,6 +215,15 @@ fn start_recording(
 ) -> Result<String, String> {
     let mut rec = recorder.lock().map_err(|e| e.to_string())?;
     let dir = output_dir.unwrap_or_else(|| setup::recordings_dir().to_string_lossy().to_string());
+    // Ensure the recordings dir exists and is HIDDEN. It lives on the LOCAL
+    // (non-OneDrive) %LOCALAPPDATA% drive so ffmpeg's live write can't stall on
+    // OneDrive sync/locking, and a casual student doesn't stumble onto it.
+    {
+        let p = std::path::PathBuf::from(&dir);
+        let _ = std::fs::create_dir_all(&p);
+        #[cfg(target_os = "windows")]
+        crate::workspace::hide_directory(&p);
+    }
     let path = rec.start(&dir)?;
     let recording_epoch =
         RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -273,27 +286,35 @@ fn start_recording(
             //    disconnect, display sleep, GPU encoder hang) leaves ffmpeg
             //    resident while the file simply stops growing. The one-shot 3s
             //    probe already passed, so without this nothing re-checks.
+            // Require SEVERAL consecutive no-growth samples before alarming so
+            // normal ffmpeg write-buffering (size can stay flat for a sample or
+            // two even while healthy) doesn't trip a false "stalled" alert. A
+            // genuine freeze stays flat indefinitely and still gets caught.
             let mut last_size = bytes;
+            let mut flat_samples: u32 = 0;
             let mut stalled_reported = false;
+            const FLAT_SAMPLES_BEFORE_ALARM: u32 = 3; // 3 × 20s ≈ 60s of no growth
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(20));
                 if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
                     return; // recording stopped or a new one started
                 }
                 let now_size = std::fs::metadata(&path_for_check).map(|m| m.len()).unwrap_or(0);
-                if now_size > 1024 && now_size <= last_size {
-                    if !stalled_reported {
+                if now_size > last_size {
+                    flat_samples = 0;
+                    stalled_reported = false; // growing again — re-arm
+                } else if now_size > 1024 {
+                    flat_samples += 1;
+                    if flat_samples >= FLAT_SAMPLES_BEFORE_ALARM && !stalled_reported {
                         let event = ActivityEvent::new(
                             "recording_health_fail",
-                            "녹화 파일이 더 이상 커지지 않습니다. 화면 캡처가 중단되었을 수 있습니다(RDP 연결 해제 / 디스플레이 절전 / 인코더 오류). 녹화 상태를 확인하세요.",
+                            "녹화 파일이 약 1분간 커지지 않았습니다. 화면 캡처가 중단되었을 수 있습니다(RDP 연결 해제 / 디스플레이 절전 / 인코더 오류). 녹화 상태를 확인하세요.",
                             Some(now_size as u32),
                             None,
                         );
                         let _ = ah.emit("activity-event", &event);
                         stalled_reported = true;
                     }
-                } else if now_size > last_size {
-                    stalled_reported = false; // growing again — re-arm
                 }
                 last_size = now_size;
             }
@@ -1715,8 +1736,9 @@ pub fn run() {
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            let running = app.state::<runner::RunningProcess>().inner().clone();
             monitor::start_clipboard_monitor(log_handle.clone(), app_handle.clone());
-            monitor::start_focus_monitor(log_handle.clone(), app_handle);
+            monitor::start_focus_monitor(log_handle.clone(), app_handle, running);
             Ok(())
         })
         .run(tauri::generate_context!())

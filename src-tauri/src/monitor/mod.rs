@@ -5,5 +5,5 @@ mod log;
 
 pub use clipboard::start_clipboard_monitor;
 pub use focus::start_focus_monitor;
-pub use integrity::{start_integrity_monitor, new_known_writes, mark_known_write, mark_known_write_hash, hash_file, KnownWrites};
+pub use integrity::{start_integrity_monitor, new_known_writes, mark_known_write, mark_known_write_hash, hash_file_retry, KnownWrites};
 pub use log::{ActivityEvent, ActivityLog};

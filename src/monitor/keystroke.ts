@@ -76,9 +76,14 @@ export function handleEditorInput(event: InputEvent): void {
       ? event.text.substring(0, 100).replace(/\n/g, "\\n") + "..."
       : event.text.replace(/\n/g, "\\n");
 
-    // Attach source-of-clipboard hint if it was set within the last 5s.
+    // Attach the source-of-clipboard hint within a generous freshness window.
+    // The backend clipboard monitor only refreshes lastClipboard on detected
+    // TEXT changes (non-text / identical / empty copies aren't tracked), so a
+    // much older snapshot could be stale. 30s comfortably covers repeated or
+    // slightly-delayed pastes of the same copied content (the case the old 5s
+    // window wrongly cut off) while bounding stale mis-attribution.
     let sourceHint = "";
-    if (lastClipboard && Date.now() - lastClipboard.epochMs < 5000) {
+    if (lastClipboard && Date.now() - lastClipboard.epochMs < 30000) {
       const tag = lastClipboard.isExternal ? "external" : "self";
       const titlePart = lastClipboard.windowTitle ? ` (${lastClipboard.windowTitle})` : "";
       sourceHint = ` [from ${tag}: ${lastClipboard.source}${titlePart}]`;

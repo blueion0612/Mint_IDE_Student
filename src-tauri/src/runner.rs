@@ -346,7 +346,7 @@ pub fn execute_code_streaming(
         // file types are excluded from monitoring entirely — see integrity.rs.)
         let post_paths = snapshot_workspace_paths(&dir);
         for (rel, path) in &post_paths {
-            match crate::monitor::hash_file(path) {
+            match crate::monitor::hash_file_retry(path) {
                 Some(h) => crate::monitor::mark_known_write_hash(&known_writes, rel, &h),
                 None => crate::monitor::mark_known_write(&known_writes, rel),
             }

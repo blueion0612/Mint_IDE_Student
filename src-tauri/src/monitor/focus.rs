@@ -21,7 +21,16 @@ pub fn start_focus_monitor(
             // process) lives in the run-child PID — exempt that exact PID so
             // viewing it isn't logged as focus_lost. A spawned browser has a
             // DIFFERENT PID, so it is still flagged.
-            let run_child_pid = running.lock().ok().and_then(|g| g.as_ref().map(|(_, c)| c.id()));
+            // Exempt the current run-child window: the streaming runner's child
+            // (RunningProcess) OR the notebook cell's child (NOTEBOOK_CHILD_PID).
+            // The student's own matplotlib/tkinter window lives in that python
+            // process; a spawned browser has a different PID and stays flagged.
+            let run_child_pid = running.lock().ok()
+                .and_then(|g| g.as_ref().map(|(_, c)| c.id()))
+                .or_else(|| {
+                    let nb = crate::NOTEBOOK_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+                    if nb != 0 { Some(nb) } else { None }
+                });
             let (is_our_app, foreground_app) = check_foreground_window(run_child_pid);
 
             if was_focused && !is_our_app {

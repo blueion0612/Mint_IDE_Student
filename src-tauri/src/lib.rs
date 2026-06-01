@@ -4,7 +4,7 @@ mod runner;
 mod setup;
 mod workspace;
 
-use monitor::{ActivityEvent, ActivityLog, KnownWrites, new_known_writes, mark_known_write};
+use monitor::{ActivityEvent, ActivityLog, KnownWrites, new_known_writes, mark_known_write, mark_known_write_hash};
 use recorder::{RecorderState, ScreenRecorder};
 use setup::SetupConfig;
 use workspace::{FileNode, Workspace, WorkspaceState};
@@ -66,7 +66,9 @@ fn run_code(
     // monitor's next polling pass doesn't flag our own auto-save as tampering.
     if let Ok(guard) = ws.lock() {
         if let Some(ref workspace) = *guard {
-            mark_known_write(&kw, &filename);
+            // Pin the exact bytes we're about to write so an external overwrite
+            // of this file within the grace window is still flagged as tamper.
+            mark_known_write_hash(&kw, &filename, &sha256_hex(code.as_bytes()));
             let _ = workspace.write_file(&filename, &code);
         }
     }
@@ -146,8 +148,19 @@ async fn run_code_sync(
     // running `with open('data.csv','a') as f: f.write(...)`). The earlier
     // difference()-only approach left in-place modifications unprotected, so
     // the integrity monitor flagged every notebook append as TAMPER.
-    let post_snapshot = runner::snapshot_workspace_files(&work_path);
-    for rel in pre_snapshot.union(&post_snapshot) {
+    // Pin each touched file to its post-run content hash (content-aware grace),
+    // and give a time-only deletion grace to files the cell removed — same
+    // policy as the streaming runner. (Marking the pre/post UNION time-only
+    // previously laundered the whole workspace for 8s after every cell run.)
+    let post_paths = runner::snapshot_workspace_paths(&work_path);
+    for (rel, path) in &post_paths {
+        match monitor::hash_file(path) {
+            Some(h) => mark_known_write_hash(&known_writes, rel, &h),
+            None => mark_known_write(&known_writes, rel),
+        }
+    }
+    let post_rels: std::collections::HashSet<String> = post_paths.into_keys().collect();
+    for rel in pre_snapshot.difference(&post_rels) {
         mark_known_write(&known_writes, rel);
     }
 
@@ -164,7 +177,7 @@ fn stop_code(process: State<runner::RunningProcess>) -> bool {
     // The slot is now free for a fresh Run — even if it arrives during the
     // background kill that follows. Without this synchronous take, the kill
     // thread races with the next run and may SIGKILL the new child.
-    let child = match process.lock().ok().and_then(|mut g| g.take()) {
+    let child = match process.lock().ok().and_then(|mut g| g.take().map(|(_, c)| c)) {
         Some(c) => c,
         None => return false,
     };
@@ -184,6 +197,11 @@ fn pip_install_packages(
 
 // ===== Screen Recording =====
 
+// Monotonic recording generation. Bumped on every start AND stop so the
+// health watchdog thread for a given recording exits as soon as that recording
+// stops or a new one starts (it never holds the recorder lock).
+static RECORDING_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[tauri::command]
 fn start_recording(
     app_handle: tauri::AppHandle,
@@ -194,6 +212,8 @@ fn start_recording(
     let mut rec = recorder.lock().map_err(|e| e.to_string())?;
     let dir = output_dir.unwrap_or_else(|| setup::recordings_dir().to_string_lossy().to_string());
     let path = rec.start(&dir)?;
+    let recording_epoch =
+        RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let strategy = rec.last_strategy().unwrap_or_else(|| "unknown".to_string());
 
     let event = ActivityEvent::new(
@@ -214,8 +234,14 @@ fn start_recording(
     {
         let path_for_check = std::path::PathBuf::from(&path);
         let ah = app_handle.clone();
+        let my_epoch = recording_epoch;
         std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            // 1. Fast-failure probe at 3s: permission-denied / immediate 0-byte.
             std::thread::sleep(std::time::Duration::from_secs(3));
+            if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
+                return; // already stopped / superseded
+            }
             let bytes = std::fs::metadata(&path_for_check)
                 .map(|m| m.len()).unwrap_or(0);
             if bytes < 1024 {
@@ -242,6 +268,35 @@ fn start_recording(
                 );
                 let _ = ah.emit("activity-event", &event);
             }
+
+            // 2. Periodic watchdog: a capture that dies/freezes mid-exam (RDP
+            //    disconnect, display sleep, GPU encoder hang) leaves ffmpeg
+            //    resident while the file simply stops growing. The one-shot 3s
+            //    probe already passed, so without this nothing re-checks.
+            let mut last_size = bytes;
+            let mut stalled_reported = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
+                    return; // recording stopped or a new one started
+                }
+                let now_size = std::fs::metadata(&path_for_check).map(|m| m.len()).unwrap_or(0);
+                if now_size > 1024 && now_size <= last_size {
+                    if !stalled_reported {
+                        let event = ActivityEvent::new(
+                            "recording_health_fail",
+                            "녹화 파일이 더 이상 커지지 않습니다. 화면 캡처가 중단되었을 수 있습니다(RDP 연결 해제 / 디스플레이 절전 / 인코더 오류). 녹화 상태를 확인하세요.",
+                            Some(now_size as u32),
+                            None,
+                        );
+                        let _ = ah.emit("activity-event", &event);
+                        stalled_reported = true;
+                    }
+                } else if now_size > last_size {
+                    stalled_reported = false; // growing again — re-arm
+                }
+                last_size = now_size;
+            }
         });
     }
 
@@ -256,6 +311,8 @@ fn stop_recording(
 ) -> Result<String, String> {
     let mut rec = recorder.lock().map_err(|e| e.to_string())?;
     let path = rec.stop()?;
+    // Invalidate the health watchdog for the recording we just stopped.
+    RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let event = ActivityEvent::new("recording_stop", &format!("Screen recording saved: {}", path), None, None);
     state.activity_log.lock().unwrap().add_event(event.clone());
@@ -991,7 +1048,9 @@ fn ws_write_file(
     path: String,
     content: String,
 ) -> Result<(), String> {
-    mark_known_write(&kw, &path);
+    // Content-pinned: an external overwrite of this path within the grace
+    // window (different bytes) is still flagged as tampering.
+    mark_known_write_hash(&kw, &path, &sha256_hex(content.as_bytes()));
     let guard = ws.lock().map_err(|e| e.to_string())?;
     guard.as_ref().ok_or("No workspace initialized".to_string())?.write_file(&path, &content)?;
     let event = ActivityEvent::new(
@@ -1115,6 +1174,15 @@ struct SubmitResult {
     video_zip: String,
 }
 
+/// SHA-256 hex of arbitrary bytes. Used to pin the exact content the IDE
+/// writes into the integrity monitor's known-writes (content-aware grace).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 /// Hash the student ID with SHA-256 to produce the zip encryption password.
 /// The grading tool uses the same hash to decrypt.
 fn hash_student_id(student_id: &str) -> String {
@@ -1200,6 +1268,8 @@ fn submit_exam(
             let _ = rec.stop();
         }
     }
+    // Invalidate any recording health watchdog so it doesn't fire during submit.
+    RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     // 2. Workspace root
     let ws_root = {
@@ -1207,7 +1277,35 @@ fn submit_exam(
         guard.as_ref().ok_or("No workspace initialized".to_string())?.root_path()
     };
 
-    // 3. Save activity logs as separate files
+    // 3. Create submission folder on Desktop FIRST, so the exam_submitted
+    //    marker recorded below is captured in the zipped logs.
+    let desktop = dirs::desktop_dir()
+        .ok_or("Cannot find Desktop directory")?;
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let folder_name = format!("MINT_Exam_{}_{}", timestamp, student_id);
+    let submit_dir = desktop.join(&folder_name);
+    std::fs::create_dir_all(&submit_dir)
+        .map_err(|e| format!("Failed to create submission folder: {}", e))?;
+
+    // 4. Record the submission event BEFORE serializing logs so it actually
+    //    appears in the zipped _log_app_focus.json / _log_complete.json (the
+    //    focus filter lists "exam_submitted"; previously it was added after the
+    //    zip was built, so the filter claimed an event that was never present).
+    {
+        let event = ActivityEvent::new(
+            "exam_submitted",
+            &format!("Submitted by {}: {}", student_id, submit_dir.to_string_lossy()),
+            None, None,
+        );
+        state.activity_log.lock().unwrap().add_event(event.clone());
+        let _ = app_handle.emit("activity-event", &event);
+    }
+
+    // 5. Save activity logs as separate files. Propagate write errors — these
+    //    files ARE the on-disk anti-cheat evidence zipped at the next step, so
+    //    silently swallowing a failure would ship a submission with missing or
+    //    stale evidence while reporting success. Returning Err lets the student
+    //    retry while the in-memory log is still intact.
     {
         let events = state.activity_log.lock().unwrap().get_events();
 
@@ -1230,24 +1328,15 @@ fn submit_exam(
             .cloned().collect();
 
         let ws_path = std::path::PathBuf::from(&ws_root);
-        let _ = std::fs::write(ws_path.join("_log_app_focus.json"),
-            serde_json::to_string_pretty(&focus_log).unwrap_or_default());
-        let _ = std::fs::write(ws_path.join("_log_background.json"),
-            serde_json::to_string_pretty(&background_log).unwrap_or_default());
-        let _ = std::fs::write(ws_path.join("_log_editor_activity.json"),
-            serde_json::to_string_pretty(&editor_log).unwrap_or_default());
-        let _ = std::fs::write(ws_path.join("_log_complete.json"),
-            serde_json::to_string_pretty(&events).unwrap_or_default());
+        let write_log = |name: &str, body: String| -> Result<(), String> {
+            std::fs::write(ws_path.join(name), body)
+                .map_err(|e| format!("활동 로그 저장 실패({}): {}", name, e))
+        };
+        write_log("_log_app_focus.json", serde_json::to_string_pretty(&focus_log).unwrap_or_default())?;
+        write_log("_log_background.json", serde_json::to_string_pretty(&background_log).unwrap_or_default())?;
+        write_log("_log_editor_activity.json", serde_json::to_string_pretty(&editor_log).unwrap_or_default())?;
+        write_log("_log_complete.json", serde_json::to_string_pretty(&events).unwrap_or_default())?;
     }
-
-    // 4. Create submission folder on Desktop
-    let desktop = dirs::desktop_dir()
-        .ok_or("Cannot find Desktop directory")?;
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let folder_name = format!("MINT_Exam_{}_{}", timestamp, student_id);
-    let submit_dir = desktop.join(&folder_name);
-    std::fs::create_dir_all(&submit_dir)
-        .map_err(|e| format!("Failed to create submission folder: {}", e))?;
 
     // 5. Encryption password
     let password = hash_student_id(&student_id);
@@ -1266,6 +1355,19 @@ fn submit_exam(
     let mut video_source_count = 0u32;  // mp4/mov files we tried to copy
     let mut video_errors: Vec<String> = Vec::new();
 
+    // Recording-start epoch for THIS session — used both to scope which
+    // recordings belong to this student and (in the manifest below) to compute
+    // video offsets. If recording never started this session, there are no
+    // recordings of ours to collect.
+    let rec_start_ms: Option<i64> = state.activity_log.lock().unwrap().get_events().iter()
+        .find(|e| e.event_type == "recording_start")
+        .map(|e| e.epoch_ms);
+    // mtime floor (secs), 60s margin for clock/mtime skew. Recordings older
+    // than this belong to a previous/other session (shared exam PC) and must
+    // not be bundled into — or counted toward — this student's submission.
+    let session_start_secs: Option<u64> =
+        rec_start_ms.map(|ms| ((ms / 1000) as u64).saturating_sub(60));
+
     if rec_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&rec_dir) {
             for entry in entries.flatten() {
@@ -1274,24 +1376,61 @@ fn submit_exam(
                     .and_then(|e| e.to_str())
                     .map(|s| s.to_ascii_lowercase())
                     .unwrap_or_default();
-                if ext == "mp4" || ext == "mov" {
-                    video_source_count += 1;
-                    let dest = video_dir.join(path.file_name().unwrap());
-                    // COPY before delete — if anything downstream fails
-                    // (ENOSPC, OneDrive lock), the originals in Recordings/
-                    // are still intact and the student can retry.
-                    if let Err(e) = std::fs::copy(&path, &dest) {
+                if ext != "mp4" && ext != "mov" {
+                    continue;
+                }
+
+                let meta = match std::fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                // Skip truncated/empty captures (failed-strategy leftovers,
+                // 0-byte permission failures): neither count nor ship them, so
+                // the silent-loss guard below stays meaningful.
+                if meta.len() < 1024 {
+                    continue;
+                }
+                // Scope to this session by mtime.
+                let mtime_secs = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match session_start_secs {
+                    Some(floor) => { if mtime_secs < floor { continue; } }
+                    None => continue, // recording disabled / never started this session
+                }
+
+                video_source_count += 1;
+                let dest = video_dir.join(path.file_name().unwrap());
+                // COPY before delete — if anything downstream fails (ENOSPC,
+                // OneDrive lock), the originals in Recordings/ are intact and
+                // the student can retry.
+                if let Err(e) = std::fs::copy(&path, &dest) {
+                    video_errors.push(format!(
+                        "{}: copy failed ({})",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        e
+                    ));
+                    continue;
+                }
+                // Obfuscation MUST succeed before we count it. On failure, remove
+                // the plaintext copy (original stays in Recordings/ for retry)
+                // and DON'T count it — never ship a plaintext recording that the
+                // manifest claims is obfuscated (the grader would otherwise
+                // double-XOR and corrupt it).
+                match recorder::obfuscate_video(&dest, &password_bytes) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&path);
+                        video_count += 1;
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&dest);
                         video_errors.push(format!(
-                            "{}: copy failed ({})",
+                            "{}: obfuscate failed ({})",
                             path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                             e
                         ));
-                        continue;
                     }
-                    if recorder::obfuscate_video(&dest, &password_bytes).is_ok() {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    video_count += 1;
                 }
             }
         }
@@ -1314,10 +1453,7 @@ fn submit_exam(
     let ide_exe_hash = compute_self_hash().unwrap_or_else(|| "unavailable".to_string());
     let cfg = setup::load_config();
 
-    // Recording start epoch_ms — used to compute video offset for suspicious events.
-    let rec_start_ms: Option<i64> = state.activity_log.lock().unwrap().get_events().iter()
-        .find(|e| e.event_type == "recording_start")
-        .map(|e| e.epoch_ms);
+    // (rec_start_ms was computed above, before the video loop.)
 
     // Suspicious events with seconds-from-recording-start (helps grader jump to video).
     let suspect_types = [
@@ -1344,7 +1480,7 @@ fn submit_exam(
         "timestamp": timestamp,
         "hash_check": &password[..16],
         "video_count": video_count,
-        "video_obfuscated": true,
+        "video_obfuscated": video_count > 0,
         "ide_commit_sha": env!("MINT_GIT_SHA"),
         "ide_build_time": env!("MINT_BUILD_TIME"),
         "ide_exe_hash": ide_exe_hash,
@@ -1358,22 +1494,28 @@ fn submit_exam(
         "recording_start_epoch_ms": rec_start_ms,
         "suspect_events": suspect_events,
     });
-    let _ = std::fs::write(
-        submit_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
-    );
+    // Atomic + error-propagating: a missing/empty manifest makes the whole
+    // submission invisible to the grader (scan_submissions skips manifest-less
+    // folders). Write to a temp file then rename, and return Err on failure so
+    // the student retries (the code zip & videos are already written, originals
+    // intact) instead of being told "제출 완료" over a broken submission.
+    {
+        let manifest_str = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| format!("manifest 직렬화 실패: {}", e))?;
+        let manifest_path = submit_dir.join("manifest.json");
+        let manifest_tmp = submit_dir.join("manifest.json.tmp");
+        std::fs::write(&manifest_tmp, manifest_str.as_bytes())
+            .map_err(|e| format!("manifest 저장 실패: {}", e))?;
+        std::fs::rename(&manifest_tmp, &manifest_path)
+            .map_err(|e| format!("manifest 저장(rename) 실패: {}", e))?;
+    }
 
     let folder_str = submit_dir.to_string_lossy().to_string();
     let code_str = code_zip_path.to_string_lossy().to_string();
     let video_str = video_dir.to_string_lossy().to_string();
 
-    let event = ActivityEvent::new(
-        "exam_submitted",
-        &format!("Submitted by {}: {}", student_id, folder_str),
-        None, None,
-    );
-    state.activity_log.lock().unwrap().add_event(event.clone());
-    let _ = app_handle.emit("activity-event", &event);
+    // (The exam_submitted activity event is recorded earlier, before the logs
+    //  are serialized, so it is present in the zipped evidence.)
 
     Ok(SubmitResult { folder_path: folder_str, code_zip: code_str, video_zip: video_str })
 }

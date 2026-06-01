@@ -18,13 +18,19 @@ echo "=============================="
 echo ""
 
 check() { command -v "$1" &>/dev/null; }
+# /usr/bin/javac is a stub even with no JDK — probe the actual version.
+have_jdk21() { javac -version 2>&1 | grep -q ' 21\.'; }
 
 # ─── 1. Xcode Command Line Tools (gcc, git) ───
 if ! check gcc; then
     echo "[1/6] Installing Xcode Command Line Tools..."
     echo "       (Popup appears — click 'Install' and wait ~5 min.)"
     xcode-select --install 2>/dev/null || true
-    until check gcc; do sleep 5; done
+    for i in $(seq 1 60); do check gcc && break; sleep 5; done
+    if ! check gcc; then
+        echo "  [FAIL] Xcode Command Line Tools 설치가 완료되지 않았습니다. 'xcode-select --install'를 직접 실행해 대화상자를 완료한 뒤 다시 시도하세요."
+        exit 1
+    fi
 fi
 echo "[1/6] Xcode CLT: OK"
 
@@ -46,16 +52,22 @@ echo "[3/6] Installing build tools (Python 3.12 / Node / JDK / FFmpeg / Rust)...
 NEED=""
 check python3.12 || NEED="$NEED python@3.12"
 check node       || NEED="$NEED node"
-check javac      || NEED="$NEED openjdk@21"
+have_jdk21       || NEED="$NEED openjdk@21"
 check ffmpeg     || NEED="$NEED ffmpeg"
 check rustc      || NEED="$NEED rust"
 if [ -n "$NEED" ]; then
     brew install $NEED
 fi
-# Java symlink for IDE auto-detection
-if [ -d "$(brew --prefix openjdk@21 2>/dev/null)/libexec/openjdk.jdk" ]; then
-    sudo ln -sfn "$(brew --prefix openjdk@21)/libexec/openjdk.jdk" \
-        /Library/Java/JavaVirtualMachines/openjdk-21.jdk 2>/dev/null || true
+# Java symlink for IDE auto-detection — keg-only openjdk@21 isn't linked into
+# JavaVirtualMachines automatically, so (re)create it whenever brew has it.
+JDK_DIR="$(brew --prefix openjdk@21 2>/dev/null)/libexec/openjdk.jdk"
+if [ -d "$JDK_DIR" ]; then
+    sudo mkdir -p /Library/Java/JavaVirtualMachines
+    sudo ln -sfn "$JDK_DIR" /Library/Java/JavaVirtualMachines/openjdk-21.jdk
+fi
+if ! have_jdk21; then
+    echo "  [FAIL] JDK 21을 확인할 수 없습니다. 'brew install openjdk@21' 후 다시 시도하세요."
+    exit 1
 fi
 echo "[3/6] Tools: OK"
 

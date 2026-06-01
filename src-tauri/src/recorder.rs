@@ -114,7 +114,14 @@ impl ScreenRecorder {
                     self.process = None;
                     return false;
                 }
-                _ => return true,
+                Ok(None) => return true, // still running
+                Err(e) => {
+                    // Couldn't query the owned child (should not happen). Record
+                    // it but keep reporting "recording" so a live capture is not
+                    // spuriously declared stopped.
+                    self.last_error = Some(format!("try_wait failed: {}", e));
+                    return true;
+                }
             }
         }
         false
@@ -144,7 +151,13 @@ fn graceful_stop_recorder(mut child: Child) {
     #[cfg(target_os = "windows")]
     {
         // CTRL_BREAK to the process group — FFmpeg's idiomatic stop signal.
-        unsafe { generate_console_ctrl_event_break(pid); }
+        // The IDE is a GUI process with no console, so this is usually a no-op
+        // (returns false); the stdin "q" below is the real graceful-stop path.
+        // Capture/log the result so the dead strand is visible.
+        let ctrl_ok = unsafe { generate_console_ctrl_event_break(pid) };
+        if !ctrl_ok {
+            eprintln!("[recorder] GenerateConsoleCtrlEvent(CTRL_BREAK) returned false (expected for a GUI process); relying on stdin 'q'");
+        }
         // Belt: also write "q" via stdin pipe (FFmpeg polls stdin even when
         // it's not a tty).
         if let Some(ref mut stdin) = child.stdin {
@@ -173,18 +186,21 @@ fn graceful_stop_recorder(mut child: Child) {
             _ => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
     }
+    // Graceful stop timed out — SIGKILL truncates the mp4 (no moov atom), so the
+    // segment may be unplayable. Log it so the fallback is not silent.
+    eprintln!("[recorder] graceful stop timed out after 2s; SIGKILL — recording segment may be truncated/unplayable");
     let _ = child.kill();
     let _ = child.wait();
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn generate_console_ctrl_event_break(process_group_id: u32) {
+unsafe fn generate_console_ctrl_event_break(process_group_id: u32) -> bool {
     #[link(name = "kernel32")]
     extern "system" {
         fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_group_id: u32) -> i32;
     }
     const CTRL_BREAK_EVENT: u32 = 1;
-    GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_group_id);
+    GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_group_id) != 0
 }
 
 fn find_ffmpeg() -> Result<String, String> {
@@ -329,11 +345,24 @@ fn build_recording_command(ffmpeg: &str, output_path: &str) -> Result<(Child, St
                     use std::io::Read;
                     let _ = stderr.read_to_string(&mut stderr_text);
                 }
+                // Char-boundary-safe tail: ffmpeg echoes the output path, which
+                // on a Korean-locale account contains 3-byte Hangul; a raw byte
+                // slice at len-400 could split a UTF-8 sequence and PANIC. That
+                // panic runs while the recorder MutexGuard is held → poisons it
+                // → recording dead for the whole session.
                 let tail = if stderr_text.len() > 400 {
-                    stderr_text[stderr_text.len()-400..].to_string()
+                    let mut idx = stderr_text.len() - 400;
+                    while idx < stderr_text.len() && !stderr_text.is_char_boundary(idx) {
+                        idx += 1;
+                    }
+                    stderr_text[idx..].to_string()
                 } else {
                     stderr_text
                 };
+                // With -y this failed strategy may have left a 0-byte / moov-less
+                // partial file at output_path; remove it so the submit collector
+                // never bundles a truncated recording (next strategy re-creates).
+                let _ = std::fs::remove_file(output_path);
                 errors.push(format!("{} (exit {:?}): {}", label, status.code(), tail.replace('\n', " | ")));
                 continue;
             }

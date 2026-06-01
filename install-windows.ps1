@@ -168,7 +168,20 @@ if (Test-Cmd "winget") {
             winget install -e --id Microsoft.EdgeWebView2Runtime --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
         } catch {
             Write-Host "    [WARN] WebView2 install failed: $_" -ForegroundColor Yellow
-            Write-Host "    IDE first launch may show a blank window." -ForegroundColor Yellow
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "    [WARN] WebView2 install exit code $LASTEXITCODE" -ForegroundColor Yellow
+        }
+        # winget reports failure via $LASTEXITCODE, not an exception — re-probe
+        # the registry to confirm WebView2 actually landed.
+        $wv2Installed = $false
+        foreach ($k in $wv2Keys) {
+            if (Test-Path $k) { $wv2Installed = $true; break }
+        }
+        if (-not $wv2Installed) {
+            Write-Host "    [WARN] WebView2 still missing after winget install." -ForegroundColor Yellow
+            Write-Host "    IDE first launch may show a blank window. Install manually:" -ForegroundColor Yellow
+            Write-Host "    https://developer.microsoft.com/microsoft-edge/webview2/" -ForegroundColor Cyan
         }
     }
 }

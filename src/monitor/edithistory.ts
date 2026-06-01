@@ -78,6 +78,7 @@ export function recordTransaction(
         last.len += 1;
         last.text = `[${last.len} chars deleted]`;
         last.t = now;
+        last.pos = c.from; // backspaces move left; track the left-most boundary
       } else {
         history.push({
           t: now, f: currentFile, op: "del", src,

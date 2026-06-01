@@ -27,9 +27,15 @@ pub fn start_clipboard_monitor(log: LogHandle, app_handle: AppHandle) {
             };
 
             if current != last_content && !current.is_empty() {
-                let char_count = current.len() as u32;
-                let truncated = if current.len() > 200 {
-                    format!("{}...", &current[..200])
+                // Truncate on CHARACTER boundaries, not bytes. A byte slice at
+                // [..200] panics when byte 200 is mid-UTF-8 (e.g. 67 Korean
+                // chars = 201 bytes) — that panic kills this monitor thread for
+                // the whole session (no catch_unwind), permanently disabling
+                // clipboard monitoring. A student could trip it deliberately.
+                let char_count = current.chars().count() as u32;
+                let truncated = if char_count > 200 {
+                    let head: String = current.chars().take(200).collect();
+                    format!("{}...", head)
                 } else {
                     current.clone()
                 };
@@ -105,7 +111,7 @@ fn detect_clipboard_source() -> (String, String) {
         }
     }
 
-    let (exe_name, title): (String, String) = unsafe {
+    let (exe_name, title, owner_pid): (String, String, u32) = unsafe {
         let hwnd = GetClipboardOwner();
         if hwnd == 0 { return ("unknown".to_string(), String::new()); }
         let mut pid: u32 = 0;
@@ -135,7 +141,7 @@ fn detect_clipboard_source() -> (String, String) {
         if t.is_empty() {
             t = read_title(GetForegroundWindow());
         }
-        (exe, t)
+        (exe, t, pid)
     };
 
     let own_exe = std::env::current_exe().ok()
@@ -143,8 +149,12 @@ fn detect_clipboard_source() -> (String, String) {
         .unwrap_or_default();
 
     let lc = exe_name.to_ascii_lowercase();
+    // msedgewebview2.exe counts as "self" ONLY when it descends from our
+    // process (our own WebView2 child) — not for any unrelated WebView2 app a
+    // student copied from, which must be logged as clipboard_external.
     if (!own_exe.is_empty() && lc == own_exe.to_ascii_lowercase())
-        || lc == "msedgewebview2.exe"
+        || (lc == "msedgewebview2.exe"
+            && super::focus::pid_is_descendant_of(owner_pid, std::process::id()))
     {
         return ("self".to_string(), title);
     }

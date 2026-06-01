@@ -15,6 +15,12 @@ const MAX_OUTPUT_LINES_BEFORE_AUTO_STOP: u64 = 200_000;
 // Cached Python path — found once, reused forever
 static CACHED_PYTHON: Mutex<Option<String>> = Mutex::new(None);
 
+// Monotonic run generation. Each streaming run claims the next id and stores
+// it alongside its child; the post-wait reaper only takes/emits for ITS id, so
+// a lingering thread from a stopped run can neither steal a newer run's child
+// nor emit a misattributed run-done for it.
+static RUN_GEN: AtomicU64 = AtomicU64::new(0);
+
 /// Event sent to frontend for each line of output
 #[derive(Debug, Clone, Serialize)]
 pub struct RunOutputLine {
@@ -22,27 +28,68 @@ pub struct RunOutputLine {
     pub text: String,
 }
 
-/// Shared handle to the running process so it can be stopped
-pub type RunningProcess = Arc<Mutex<Option<Child>>>;
+/// Shared handle to the running process so it can be stopped. The `u64` is the
+/// run generation that owns this child (see RUN_GEN).
+pub type RunningProcess = Arc<Mutex<Option<(u64, Child)>>>;
 
 pub fn new_running_process() -> RunningProcess {
     Arc::new(Mutex::new(None))
 }
 
 pub fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::HashSet<String> {
-    use unicode_normalization::UnicodeNormalization;
-    let mut out = std::collections::HashSet::new();
+    snapshot_workspace_paths(root).into_keys().collect()
+}
+
+/// rel (normalized, '/'-joined, NFC) -> actual on-disk path. The actual path is
+/// kept so callers can re-open the file even on macOS, where the on-disk name
+/// is NFD but the rel key is NFC. Mirrors the integrity scanner's traversal:
+/// recurses into ALL real directories, skips symlinks/junctions (no infinite
+/// recursion), and skips only the IDE's own artifact files.
+pub fn snapshot_workspace_paths(
+    root: &std::path::Path,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    let mut out = std::collections::HashMap::new();
+    fn is_ide_artifact(rel: &str) -> bool {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        name.starts_with("_log_")
+            || name == ".mint_baseline.json"
+            || name == ".mint_baseline.json.tmp"
+            || name.starts_with("._notebook_")
+    }
+    fn entry_is_link(entry: &std::fs::DirEntry) -> bool {
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_symlink() {
+                return true;
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if let Ok(md) = entry.metadata() {
+                if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
     fn walk(
         dir: &std::path::Path,
         root: &std::path::Path,
-        out: &mut std::collections::HashSet<String>,
+        out: &mut std::collections::HashMap<String, std::path::PathBuf>,
+        depth: u32,
     ) {
+        use unicode_normalization::UnicodeNormalization;
+        if depth > 64 {
+            return;
+        }
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
+                if entry_is_link(&entry) {
+                    continue;
+                }
                 let path = entry.path();
-                // NFC-normalize the key so it matches what mark_known_write
-                // stores. macOS APFS returns NFD; without this the post-run
-                // mark would not match the polling-time scan.
                 let rel = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
@@ -50,21 +97,15 @@ pub fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::Has
                     .replace('\\', "/")
                     .nfc()
                     .collect::<String>();
-                // Skip dot/underscore prefixed (logs/temp)
-                if rel.starts_with('.') || rel.starts_with('_')
-                   || rel.split('/').any(|seg| seg.starts_with('.') || seg.starts_with('_'))
-                {
-                    continue;
-                }
                 if path.is_dir() {
-                    walk(&path, root, out);
-                } else {
-                    out.insert(rel);
+                    walk(&path, root, out, depth + 1);
+                } else if !is_ide_artifact(&rel) {
+                    out.insert(rel, path);
                 }
             }
         }
     }
-    walk(root, root, &mut out);
+    walk(root, root, &mut out, 0);
     out
 }
 
@@ -179,20 +220,18 @@ pub fn execute_code_streaming(
             }
         };
 
-        // Store process handle for Stop button
-        {
-            let mut guard = process_handle.lock().unwrap();
-            *guard = None; // will set after taking stdout/stderr
-        }
-
-        // Stream stdout
+        // Take stdout/stderr first, then publish the child exactly once. (The
+        // old pre-store `*guard = None` left a spawn-to-store gap where a Stop
+        // arriving in that window found None, killed nothing, yet the run
+        // proceeded — UI showed stopped while Python kept running.)
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        // Now store the child for stop
+        // Claim a run generation and publish the child under it.
+        let my_id = RUN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut guard = process_handle.lock().unwrap();
-            *guard = Some(child);
+            *guard = Some((my_id, child));
         }
 
         let ah1 = app_handle.clone();
@@ -207,12 +246,12 @@ pub fn execute_code_streaming(
         let line_counter = Arc::new(AtomicU64::new(0));
         let lc1 = line_counter.clone();
         let proc_handle1 = process_handle.clone();
-        let t1 = thread::spawn(move || {
+        let t1 = thread::spawn(move || -> bool {
+            let mut auto_stopped = false;
             if let Some(out) = stdout {
                 let reader = BufReader::new(out);
                 let mut buffer = String::new();
                 let mut last_flush = Instant::now();
-                let mut auto_stopped = false;
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         let count = lc1.fetch_add(1, Ordering::Relaxed) + 1;
@@ -245,6 +284,7 @@ pub fn execute_code_streaming(
                     emit_line(&ah1, "stdout", &buffer);
                 }
             }
+            auto_stopped
         });
 
         // stderr: collect silently, display AFTER stdout finishes
@@ -260,7 +300,7 @@ pub fn execute_code_streaming(
         });
 
         // Wait for stdout to finish first
-        t1.join().ok();
+        let auto_stopped = t1.join().unwrap_or(false);
         t2.join().ok();
 
         // Now emit stderr all at once (after stdout)
@@ -271,33 +311,53 @@ pub fn execute_code_streaming(
             }
         }
 
-        // Take the child OUT of the mutex before waiting so that a concurrent
-        // stop_process() can still acquire the lock and is not blocked behind
-        // a potentially long child.wait().
-        let mut child_opt = {
+        // Reap OUR child only if it is still the active one. If the user pressed
+        // Stop (child taken by stop_code) and a newer run has since published
+        // its own child, the slot holds a DIFFERENT generation — we must not
+        // take/wait/emit for it, or we'd steal the new run's child and fire a
+        // misattributed run-done. Taking under the lock keeps a concurrent Stop
+        // unblocked.
+        let my_child = {
             let mut guard = process_handle.lock().unwrap();
-            guard.take()
+            match guard.as_ref() {
+                Some((id, _)) if *id == my_id => guard.take().map(|(_, c)| c),
+                _ => None,
+            }
         };
+        let owned = my_child.is_some();
+        let exit_code = my_child.and_then(|mut c| c.wait().ok().and_then(|s| s.code()));
 
-        let exit_code = if let Some(ref mut child) = child_opt {
-            child.wait().ok().and_then(|s| s.code())
-        } else {
-            None
-        };
-
-        // Register ALL files present after the run as known writes — both
-        // new files (plt.savefig) and modified-in-place ones (csv append).
-        // pre/post union covers both since anything the student code touched
-        // is by definition IDE-initiated, not external tampering.
-        let post_snapshot = snapshot_workspace_files(&dir);
-        for rel in pre_snapshot.union(&post_snapshot) {
+        // Register the files this run touched as known writes, each PINNED to
+        // its post-run content hash: a legitimate program output (plt.savefig,
+        // csv append) is not flagged, but an EXTERNAL overwrite of any path
+        // within the grace window (different content) still raises tamper.
+        // Untouched files are pinned to their unchanged hash (harmless — only a
+        // no-op equal-content "change" could be excused). Files the program
+        // DELETED get a time-only deletion grace so program-driven removals are
+        // not flagged. (Previously the pre/post UNION was marked time-only,
+        // which let `print(1)` launder the ENTIRE workspace for 8s.)
+        let post_paths = snapshot_workspace_paths(&dir);
+        for (rel, path) in &post_paths {
+            match crate::monitor::hash_file(path) {
+                Some(h) => crate::monitor::mark_known_write_hash(&known_writes, rel, &h),
+                None => crate::monitor::mark_known_write(&known_writes, rel),
+            }
+        }
+        let post_rels: std::collections::HashSet<String> = post_paths.into_keys().collect();
+        for rel in pre_snapshot.difference(&post_rels) {
             crate::monitor::mark_known_write(&known_writes, rel);
         }
 
-        let elapsed = start.elapsed().as_millis() as u64;
-        let stdout_str = stdout_collected.lock().unwrap().clone();
-        let stderr_str = stderr_collected.lock().unwrap().clone();
-        emit_done_with_output(&app_handle, exit_code, elapsed, &stdout_str, &stderr_str);
+        // Emit run-done only if we owned the child (normal completion) or we
+        // auto-stopped this run ourselves. Staying silent when the user's Stop
+        // already reset the UI (and a new run may be active) prevents the
+        // straggler/misattributed run-done class of bugs.
+        if owned || auto_stopped {
+            let elapsed = start.elapsed().as_millis() as u64;
+            let stdout_str = stdout_collected.lock().unwrap().clone();
+            let stderr_str = stderr_collected.lock().unwrap().clone();
+            emit_done_with_output(&app_handle, exit_code, elapsed, &stdout_str, &stderr_str);
+        }
     });
 }
 
@@ -306,7 +366,7 @@ pub fn execute_code_streaming(
 /// so that a concurrent Run cannot have its fresh child killed by a stale
 /// stop. See `stop_taken_child` for the no-shared-handle variant.
 pub fn stop_process(process_handle: &RunningProcess) -> bool {
-    let child_opt = process_handle.lock().ok().and_then(|mut g| g.take());
+    let child_opt = process_handle.lock().ok().and_then(|mut g| g.take().map(|(_, c)| c));
     match child_opt {
         Some(child) => { stop_taken_child(child); true }
         None => false,

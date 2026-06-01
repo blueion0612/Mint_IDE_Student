@@ -166,6 +166,10 @@ export function createEditor(
       }
     },
     beforeinput(event: InputEvent, view: EditorView) {
+      // IME composition fires cumulative insertCompositionText/deleteComposition*
+      // beforeinput events for normal CJK typing — do NOT forward these as normal
+      // input, or the burst detector sums them and false-flags input_burst.
+      if (event.inputType === "insertCompositionText" || event.inputType?.startsWith("deleteComposition")) return;
       if (onInput && event.data) {
         onInput({
           inputType: event.inputType || "unknown",

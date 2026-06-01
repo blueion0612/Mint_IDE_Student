@@ -139,7 +139,7 @@ impl Workspace {
 /// Set FILE_ATTRIBUTE_HIDDEN on a directory (Windows-only). Best-effort —
 /// failures are ignored: hidden attr is defense-in-depth, not security.
 #[cfg(target_os = "windows")]
-fn hide_directory(path: &Path) {
+pub(crate) fn hide_directory(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]

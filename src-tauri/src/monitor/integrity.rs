@@ -173,6 +173,36 @@ pub fn mark_known_write_hash(known: &KnownWrites, relative_path: &str, expected_
     }
 }
 
+/// Generated-OUTPUT file extensions that are NOT integrity-monitored. A
+/// student program legitimately writes these (plt.savefig, df.to_csv/to_excel,
+/// json dumps, model checkpoints, media), and there is no reliable way to tell
+/// a program's own output from an external edit via hash polling — so rather
+/// than suppress tamper during runs (which opened laundering holes), we simply
+/// do not monitor these artifact types at all. SOURCE/answer file types
+/// (.py/.ipynb/.c/.cpp/.java/.js/.ts/.txt/.md/...) ARE always monitored, so an
+/// external edit of an answer is still flagged immediately — including during a
+/// run. ASSUMPTION: exam answers are CODE, not hand-authored data files. If an
+/// exam's answer is itself a data file (e.g. a .csv), that file would not be
+/// integrity-monitored.
+fn is_unmonitored_output(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let ext = match name.rsplit_once('.') {
+        Some((_, e)) => e.to_ascii_lowercase(),
+        None => return false,
+    };
+    matches!(
+        ext.as_str(),
+        // images
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tiff" | "tif" | "webp" | "ico" | "svg"
+        // tabular / data
+        | "csv" | "tsv" | "xlsx" | "xls" | "parquet" | "feather" | "arrow"
+        // serialized / model / scientific
+        | "npy" | "npz" | "pkl" | "pickle" | "joblib" | "h5" | "hdf5" | "pt" | "pth" | "onnx" | "ckpt" | "pb"
+        // docs / media
+        | "pdf" | "docx" | "pptx" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "mp3" | "wav"
+    )
+}
+
 /// Normalize a path key so a write registered as `테스트.py` (NFC) and a
 /// filesystem read returning `테스트.py` (NFD on macOS) compare equal.
 /// Falls back to byte-identical key on platforms where the normalization
@@ -246,8 +276,11 @@ fn scan_dir_recursive_depth(dir: &Path, root: &Path, out: &mut Vec<(String, Path
             // student could hide cheat material in.)
             scan_dir_recursive_depth(&path, root, out, depth + 1);
         } else {
-            // Skip only the IDE's own artifact files; monitor everything else.
-            if is_ide_artifact_file(&rel) {
+            // Skip the IDE's own artifact files AND generated-output file types
+            // (program outputs are not security-relevant and there's no reliable
+            // way to tell them from external edits via hashing). Everything else
+            // — source/answer files — is monitored, always, even during a run.
+            if is_ide_artifact_file(&rel) || is_unmonitored_output(&rel) {
                 continue;
             }
             out.push((rel, path));
@@ -309,6 +342,12 @@ pub fn start_integrity_monitor(
                 BaselineLoad::Missing => (HashMap::new(), false),
                 BaselineLoad::Invalid => (HashMap::new(), true),
             };
+        // Drop any baseline entries for now-unmonitored output types (e.g. a
+        // baseline written by an older build that still tracked .png/.csv). They
+        // are excluded from the scan now, so without this the first poll's
+        // deletion check would emit a one-time spurious tamper_deleted for files
+        // that still exist on disk.
+        state.retain(|rel, _| !is_unmonitored_output(rel));
         let mut state_dirty = false;
 
         // A present-but-unverifiable baseline means the signed baseline was

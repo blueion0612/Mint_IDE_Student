@@ -60,13 +60,6 @@ pub fn save_config(cfg: &SetupConfig) -> Result<(), String> {
     std::fs::write(&path, text).map_err(|e| e.to_string())
 }
 
-pub fn mint_exam_root() -> PathBuf {
-    dirs::document_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("MINT_Exam")
-}
-
 /// Workspaces live under %LOCALAPPDATA%\MINT_Exam_IDE\Workspaces — NOT in
 /// Documents — so a casual student opening File Explorer doesn't trip over
 /// their own source. AppData\Local is hidden by default on Windows shell.
@@ -76,12 +69,15 @@ pub fn workspaces_dir() -> PathBuf {
     app_data_root().join("Workspaces")
 }
 
-/// Recordings stay under Documents — large files, no reason to bury them
-/// under AppData (which sits on the same drive as Documents anyway). The
-/// student can see them but cannot tamper since obfuscation happens on
-/// submit and the in-progress mp4 is held open by ffmpeg.
+/// Recordings live under %LOCALAPPDATA%\MINT_Exam_IDE\Recordings — a LOCAL,
+/// non-redirected, hidden location. Documents is frequently OneDrive-redirected,
+/// and ffmpeg writing the live mp4 into a OneDrive-synced folder stalls/locks
+/// (observed: a 48-byte capture that never grows). LOCALAPPDATA is local and
+/// not synced, so capture is reliable, and the student can't casually reach it.
+/// At submit the obfuscated copy is written to the Desktop submission folder
+/// and the local original is deleted.
 pub fn recordings_dir() -> PathBuf {
-    mint_exam_root().join("Recordings")
+    app_data_root().join("Recordings")
 }
 
 /// Hardcoded, mutually-verified package versions for Python 3.12.x.

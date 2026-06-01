@@ -68,7 +68,8 @@ export function mountNotebook(container: HTMLElement, content: string, filePath:
   for (const cell of (nb.cells || [])) {
     if (cell.cell_type === "code" || cell.cell_type === "markdown") {
       const src = Array.isArray(cell.source) ? cell.source.join("") : String(cell.source || "");
-      addCellToDOM(cellsContainer, cell.cell_type, src, "");
+      const out = extractCellOutput(cell);
+      addCellToDOM(cellsContainer, cell.cell_type, src, out);
     }
   }
 
@@ -78,6 +79,19 @@ export function mountNotebook(container: HTMLElement, content: string, filePath:
   document.getElementById("nb-run-all")!.addEventListener("click", runAllCells);
   document.getElementById("nb-add-code")!.addEventListener("click", () => { addCellToDOM(document.getElementById("nb-cells")!, "code", "", ""); onModified?.(); });
   document.getElementById("nb-add-md")!.addEventListener("click", () => { addCellToDOM(document.getElementById("nb-cells")!, "markdown", "", ""); onModified?.(); });
+}
+
+// Reconstruct CellState.output (a plain string) from an parsed .ipynb cell's
+// nbformat outputs so loaded outputs round-trip faithfully through getNotebookJSON.
+function extractCellOutput(cell: any): string {
+  const norm = (v: any): string => Array.isArray(v) ? v.join("") : (typeof v === "string" ? v : "");
+  const parts: string[] = [];
+  for (const output of (cell.outputs ?? [])) {
+    if (output == null) continue;
+    if (output.text !== undefined) parts.push(norm(output.text));            // stream
+    else if (output.data?.["text/plain"] !== undefined) parts.push(norm(output.data["text/plain"])); // execute_result / display_data
+  }
+  return parts.join("");
 }
 
 function addCellToDOM(container: HTMLElement, type: "code" | "markdown", source: string, output: string): void {
@@ -100,15 +114,18 @@ function addCellToDOM(container: HTMLElement, type: "code" | "markdown", source:
 
   container.appendChild(el);
 
+  const cell: CellState = { type, editor: null, element: el, output, running: false };
+
   const editor = createEditor(
     el.querySelector(".nb-cell-editor") as HTMLElement, "python" as SupportedLanguage, source,
     (event) => { if (event.inputType === "insertFromPaste") markNextInputSource("paste"); handleEditorInput(event); onModified?.(); },
-    (changes, userEvent) => { setCurrentFile(`${notebookPath}#cell${idx}`); recordTransaction(changes, userEvent); },
+    (changes, userEvent) => { setCurrentFile(`${notebookPath}#cell${cells.indexOf(cell)}`); recordTransaction(changes, userEvent); },
   );
+  cell.editor = editor;
 
-  cells.push({ type, editor, element: el, output, running: false });
+  cells.push(cell);
 
-  el.querySelector(".nb-run-cell")?.addEventListener("click", () => runSingleCell(idx));
+  el.querySelector(".nb-run-cell")?.addEventListener("click", () => runSingleCell(cells.indexOf(cell)));
   el.querySelector(".nb-del-cell")!.addEventListener("click", () => {
     const i = cells.indexOf(cells.find(c => c.element === el)!);
     if (i >= 0) { cells.splice(i, 1); el.remove(); renumberCells(); onModified?.(); }

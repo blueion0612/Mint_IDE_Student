@@ -18,10 +18,16 @@ struct FileState {
     modified: u64, // mtime as epoch secs
 }
 
-/// Persistent on-disk snapshot of the baseline. We dot-prefix the filename
-/// so the integrity monitor itself skips it (scan_dir_recursive filters
-/// `.` / `_` prefixes).
-const BASELINE_FILENAME: &str = ".mint_baseline.json";
+/// Persistent baseline. Stored OUTSIDE the student-writable workspace (under
+/// %LOCALAPPDATA%\MINT_Exam_IDE\baselines\) and HMAC-signed so a student can
+/// neither delete it from the workspace nor hand-edit it to match externally
+/// modified files to wipe the tamper history on the next launch.
+///
+/// NOTE: the HMAC key is embedded in the binary, so this is tamper-EVIDENCE,
+/// not secrecy against a determined reverse-engineer. It defeats the realistic
+/// "delete the obvious .mint_baseline.json / edit it in Notepad" attack that
+/// the previous in-workspace plaintext baseline allowed.
+const BASELINE_HMAC_KEY: &[u8] = b"MINT_EXAM_IDE_baseline_v2_integrity_key_2026";
 
 #[derive(Serialize, Deserialize)]
 struct BaselineSnapshot {
@@ -29,14 +35,73 @@ struct BaselineSnapshot {
     files: HashMap<String, FileState>,
 }
 
-fn baseline_path(root: &Path) -> PathBuf {
-    root.join(BASELINE_FILENAME)
+#[derive(Serialize, Deserialize)]
+struct SignedBaseline {
+    payload: String, // serialized BaselineSnapshot
+    sig: String,     // HMAC-SHA256(payload)
 }
 
-fn load_baseline(root: &Path) -> Option<HashMap<String, FileState>> {
-    let text = std::fs::read_to_string(baseline_path(root)).ok()?;
-    let snap: BaselineSnapshot = serde_json::from_str(&text).ok()?;
-    Some(snap.files)
+enum BaselineLoad {
+    Missing,
+    Invalid,
+    Ok(HashMap<String, FileState>),
+}
+
+/// HMAC-SHA256 (RFC 2104) over `msg` with the embedded key, hex-encoded.
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        let mut h = Sha256::new();
+        h.update(key);
+        block[..32].copy_from_slice(&h.finalize());
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= block[i];
+        opad[i] ^= block[i];
+    }
+    let mut hi = Sha256::new();
+    hi.update(&ipad[..]);
+    hi.update(msg);
+    let inner = hi.finalize();
+    let mut ho = Sha256::new();
+    ho.update(&opad[..]);
+    ho.update(&inner);
+    hex::encode(ho.finalize())
+}
+
+/// Baseline file path: in app-data (NOT the workspace), keyed by a hash of the
+/// workspace root so different workspaces don't collide.
+fn baseline_path(root: &Path) -> PathBuf {
+    let key = {
+        let mut h = Sha256::new();
+        h.update(normalize_key(&root.to_string_lossy()).as_bytes());
+        hex::encode(h.finalize())
+    };
+    crate::setup::app_data_root()
+        .join("baselines")
+        .join(format!("{}.json", key))
+}
+
+fn load_baseline(root: &Path) -> BaselineLoad {
+    let text = match std::fs::read_to_string(baseline_path(root)) {
+        Ok(t) => t,
+        Err(_) => return BaselineLoad::Missing,
+    };
+    let signed: SignedBaseline = match serde_json::from_str(&text) {
+        Ok(s) => s,
+        Err(_) => return BaselineLoad::Invalid,
+    };
+    if hmac_sha256_hex(BASELINE_HMAC_KEY, signed.payload.as_bytes()) != signed.sig {
+        return BaselineLoad::Invalid;
+    }
+    match serde_json::from_str::<BaselineSnapshot>(&signed.payload) {
+        Ok(snap) => BaselineLoad::Ok(snap.files),
+        Err(_) => BaselineLoad::Invalid,
+    }
 }
 
 fn save_baseline(root: &Path, state: &HashMap<String, FileState>) {
@@ -44,10 +109,15 @@ fn save_baseline(root: &Path, state: &HashMap<String, FileState>) {
         saved_at: epoch_secs(),
         files: state.clone(),
     };
-    let Ok(text) = serde_json::to_string(&snap) else { return; };
+    let Ok(payload) = serde_json::to_string(&snap) else { return; };
+    let sig = hmac_sha256_hex(BASELINE_HMAC_KEY, payload.as_bytes());
+    let Ok(text) = serde_json::to_string(&SignedBaseline { payload, sig }) else { return; };
     // Atomic write: temp file + rename. A torn write would leave the next
     // restart with no baseline (worse than the previous baseline).
     let final_path = baseline_path(root);
+    if let Some(parent) = final_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let tmp_path = final_path.with_extension("json.tmp");
     if std::fs::write(&tmp_path, text.as_bytes()).is_ok() {
         let _ = std::fs::rename(&tmp_path, &final_path);
@@ -60,25 +130,45 @@ fn count_lines(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Shared set of "known writes" — the IDE registers a path here
-/// right before writing, so the integrity checker skips that change.
-pub type KnownWrites = Arc<Mutex<HashMap<String, u64>>>;
+/// Shared set of "known writes" — the IDE registers a path here right before
+/// writing, so the integrity checker skips that change. The value is
+/// `(expected_hash, grace_until)`: when `expected_hash` is `Some`, a change is
+/// only treated as an own-write if the on-disk content hash matches it, so an
+/// external overwrite of the same path within the grace window (different
+/// content) is STILL flagged. `None` means time-only (used for renames /
+/// deletes / dir creation where pinning a resulting hash is not meaningful).
+pub type KnownWrites = Arc<Mutex<HashMap<String, (Option<String>, u64)>>>;
 
 pub fn new_known_writes() -> KnownWrites {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Call this from ws_write_file / ws_rename etc. so the next scan
-/// doesn't flag our own write as tampering.
+/// Grace period in seconds. The integrity loop polls every 2s; we leave
+/// headroom for filesystem buffer flush + IDE write completion + network
+/// drive latency. (Content-pinning via mark_known_write_hash means this
+/// window no longer blindly excuses arbitrary external overwrites.)
+const KNOWN_WRITE_GRACE_SECS: u64 = 8;
+
+/// Time-only known-write (no content pin). Use for rename / delete / dir
+/// creation where the resulting on-disk hash is not predictable.
 pub fn mark_known_write(known: &KnownWrites, relative_path: &str) {
     if let Ok(mut map) = known.lock() {
-        // Grace period: 8s. The integrity loop polls every 2s, but we leave
-        // headroom for filesystem buffer flush + IDE write completion +
-        // network drive latency. Earlier 3s was too tight and triggered
-        // false TAMPER on slow drives.
         map.insert(
             normalize_key(relative_path),
-            epoch_secs() + 8,
+            (None, epoch_secs() + KNOWN_WRITE_GRACE_SECS),
+        );
+    }
+}
+
+/// Content-pinned known-write. The scan treats a change as our own write ONLY
+/// if the on-disk content hash equals `expected_hash` within the grace window
+/// — so an external overwrite to the same path (different content) is still
+/// flagged as tampering even right after a legitimate IDE write/run.
+pub fn mark_known_write_hash(known: &KnownWrites, relative_path: &str, expected_hash: &str) {
+    if let Ok(mut map) = known.lock() {
+        map.insert(
+            normalize_key(relative_path),
+            (Some(expected_hash.to_string()), epoch_secs() + KNOWN_WRITE_GRACE_SECS),
         );
     }
 }
@@ -99,7 +189,7 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
-fn hash_file(path: &Path) -> Option<String> {
+pub fn hash_file(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
@@ -122,11 +212,26 @@ fn scan_all_files(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 fn scan_dir_recursive(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) {
+    scan_dir_recursive_depth(dir, root, out, 0);
+}
+
+fn scan_dir_recursive_depth(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>, depth: u32) {
+    // Depth backstop: even if a reparse point slips past entry_is_link, a loop
+    // cannot crash the monitor thread via unbounded recursion.
+    if depth > 64 {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        // Never follow symlinks / junctions — a workspace-local junction loop
+        // would otherwise infinitely recurse and kill the monitor thread, and
+        // a junction to an external tree would stall/bloat the scan.
+        if entry_is_link(&entry) {
+            continue;
+        }
         let path = entry.path();
         let rel_raw = path
             .strip_prefix(root)
@@ -135,17 +240,52 @@ fn scan_dir_recursive(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>)
             .to_string();
         let rel = normalize_key(&rel_raw);
 
-        // Skip our own log files
-        if rel.starts_with('_') || rel.starts_with('.') {
-            continue;
-        }
-
         if path.is_dir() {
-            scan_dir_recursive(&path, root, out);
+            // Always recurse into REAL directories. (Previously `_`/`.`-prefixed
+            // dirs were skipped wholesale, leaving an unmonitored subtree a
+            // student could hide cheat material in.)
+            scan_dir_recursive_depth(&path, root, out, depth + 1);
         } else {
+            // Skip only the IDE's own artifact files; monitor everything else.
+            if is_ide_artifact_file(&rel) {
+                continue;
+            }
             out.push((rel, path));
         }
     }
+}
+
+/// True for the IDE's own files that legitimately appear in the workspace and
+/// must not be flagged as tampering (submission logs, notebook run temp, and
+/// the legacy in-workspace baseline). Everything else — including arbitrary
+/// `_`/`.`-prefixed student files — is monitored.
+fn is_ide_artifact_file(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    name.starts_with("_log_")
+        || name == ".mint_baseline.json"
+        || name == ".mint_baseline.json.tmp"
+        || name.starts_with("._notebook_")
+}
+
+/// True if a directory entry is a symlink (any OS) or a Windows reparse point
+/// (junction / mount point). `DirEntry::metadata()` does not traverse the link.
+fn entry_is_link(entry: &std::fs::DirEntry) -> bool {
+    if let Ok(ft) = entry.file_type() {
+        if ft.is_symlink() {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if let Ok(md) = entry.metadata() {
+            if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Start a background thread that polls workspace files every 2 seconds.
@@ -163,8 +303,28 @@ pub fn start_integrity_monitor(
         // and modifies files externally, the next launch's monitor compares
         // against the LAST KNOWN baseline rather than re-scanning (which
         // would treat the modified state as new ground truth).
-        let mut state: HashMap<String, FileState> = load_baseline(&root).unwrap_or_default();
+        let (mut state, baseline_tampered): (HashMap<String, FileState>, bool) =
+            match load_baseline(&root) {
+                BaselineLoad::Ok(files) => (files, false),
+                BaselineLoad::Missing => (HashMap::new(), false),
+                BaselineLoad::Invalid => (HashMap::new(), true),
+            };
         let mut state_dirty = false;
+
+        // A present-but-unverifiable baseline means the signed baseline was
+        // hand-edited / corrupted offline. Don't silently re-baseline — surface
+        // it loudly (the previous code adopted whatever was on disk with no
+        // event, defeating the persisted-baseline anti-restart-wipe protection).
+        if baseline_tampered {
+            let event = ActivityEvent::new(
+                "tamper_detected",
+                "INTEGRITY BASELINE INVALID: saved baseline failed signature verification (possible offline tampering). Re-establishing baseline from current disk state.",
+                None,
+                None,
+            );
+            log.add_event(event.clone());
+            let _ = app_handle.emit("activity-event", &event);
+        }
 
         // Initial scan. If we loaded a baseline, re-check every file: missing
         // entries get added (new files since shutdown), divergences raise an
@@ -232,7 +392,7 @@ pub fn start_integrity_monitor(
             // Purge expired known_writes entries up front so the map doesn't
             // grow unbounded (one entry per IDE write across the exam).
             if let Ok(mut map) = known_writes.lock() {
-                map.retain(|_, &mut grace_until| grace_until >= now);
+                map.retain(|_, v| v.1 >= now);
             }
             let files = scan_all_files(&root);
 
@@ -245,13 +405,22 @@ pub fn start_integrity_monitor(
                 };
                 let new_size = full.metadata().map(|m| m.len()).unwrap_or(0);
 
-                // Check if this is a known (IDE-initiated) write. We do NOT
-                // remove the entry on first hit — within one grace window the
-                // student may save the same file twice (manual save + auto
-                // save). The retain() above handles cleanup on expiry.
+                // Is this our own (IDE-initiated) write? We do NOT remove the
+                // entry on first hit — within one grace window the student may
+                // save the same file twice (manual + auto save). retain() above
+                // handles cleanup on expiry. CONTENT-AWARE: a pinned hash must
+                // match the on-disk content; otherwise (e.g. an external
+                // overwrite of the same path within the window) it is NOT known
+                // and is still flagged as tampering.
                 let is_known = known_writes.lock().ok()
-                    .and_then(|map| map.get(rel.as_str()).copied())
-                    .map(|grace_until| now <= grace_until)
+                    .and_then(|map| map.get(rel.as_str()).cloned())
+                    .map(|(expected, grace_until)| {
+                        now <= grace_until
+                            && match expected {
+                                Some(h) => h == new_hash,
+                                None => true,
+                            }
+                    })
                     .unwrap_or(false);
 
                 let new_lines = count_lines(full);
@@ -300,7 +469,7 @@ pub fn start_integrity_monitor(
             for rel in &deleted {
                 let is_known = known_writes.lock().ok()
                     .and_then(|mut map| map.remove(rel.as_str()))
-                    .map(|grace_until| now <= grace_until)
+                    .map(|(_, grace_until)| now <= grace_until)
                     .unwrap_or(false);
 
                 if !is_known {

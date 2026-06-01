@@ -102,8 +102,13 @@ fn check_foreground_window() -> (bool, String) {
             }
         };
 
+        // A foreground msedgewebview2.exe is "ours" ONLY if it descends from
+        // our process (our own Tauri WebView2 child). Matching the bare
+        // basename treated ANY WebView2-hosted app (Office, chat apps, …) as
+        // self, silently suppressing focus_lost when a student switched to one.
         let is_ours = fg_pid == our_pid
-            || raw_exe.eq_ignore_ascii_case("msedgewebview2.exe");
+            || (raw_exe.eq_ignore_ascii_case("msedgewebview2.exe")
+                && pid_is_descendant_of(fg_pid, our_pid));
 
         let exe_name = if is_ours {
             "MINT Exam IDE".to_string()
@@ -155,4 +160,70 @@ fn check_foreground_window() -> (bool, String) {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn check_foreground_window() -> (bool, String) {
     (true, "unknown".to_string())
+}
+
+/// Walk the parent-PID chain from `pid` upward; true if `ancestor` is reached.
+/// Used to tell OUR Tauri WebView2 child (legit, descends from us) apart from
+/// an unrelated WebView2-hosted app that merely shares the msedgewebview2.exe
+/// image name. Cheap one-shot Toolhelp snapshot; bounded walk guards PID reuse.
+#[cfg(target_os = "windows")]
+pub(crate) fn pid_is_descendant_of(mut pid: u32, ancestor: u32) -> bool {
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    if pid == 0 || ancestor == 0 {
+        return false;
+    }
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        // child PID -> parent PID
+        let mut parent_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut entry: ProcessEntry32W = std::mem::zeroed();
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                parent_of.insert(entry.th32_process_id, entry.th32_parent_process_id);
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+
+        let mut guard = 0;
+        while pid != 0 && guard < 64 {
+            if pid == ancestor {
+                return true;
+            }
+            match parent_of.get(&pid) {
+                Some(&parent) if parent != pid => pid = parent,
+                _ => break,
+            }
+            guard += 1;
+        }
+    }
+    false
 }

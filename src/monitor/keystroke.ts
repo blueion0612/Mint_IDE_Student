@@ -32,6 +32,10 @@ export function noteClipboardEvent(snapshot: ClipboardSnapshot): void {
 }
 
 export function handleEditorInput(event: InputEvent): void {
+  // IME composition events arrive cumulatively (1+2+3+... chars) for normal CJK
+  // typing; never let them enter burst accounting or they false-flag input_burst.
+  if (event.inputType === "insertCompositionText" || event.inputType.startsWith("deleteComposition")) return;
+
   const now = performance.now();
   const timeDelta = lastInputTime > 0 ? now - lastInputTime : 0;
   lastInputTime = now;

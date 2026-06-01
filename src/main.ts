@@ -610,15 +610,31 @@ function renderTabs(): void {
     el.querySelector(".tab-name")!.addEventListener("click", () => openFileByPath(file.path));
     el.querySelector(".tab-close")!.addEventListener("click", (e) => {
       e.stopPropagation();
-      closeFile(file.path);
+      void closeFile(file.path);
     });
     tabBar.appendChild(el);
   }
 }
 
-function closeFile(path: string): void {
+async function closeFile(path: string): Promise<void> {
   const idx = openFiles.findIndex((f) => f.path === path);
   if (idx < 0) return;
+
+  const file = openFiles[idx];
+  // Capture the live buffer before removal (covers active notebook where editorView is null)
+  if (path === activeFilePath) {
+    if (isNotebookActive() && path.endsWith(".ipynb")) {
+      file.content = getNotebookJSON();
+    } else if (editorView) {
+      file.content = editorView.state.doc.toString();
+    }
+  }
+  // Auto-save unsaved changes so closing never loses work
+  if (file.modified) {
+    await invoke("ws_write_file", { path: file.path, content: file.content });
+    file.modified = false;
+  }
+
   openFiles.splice(idx, 1);
 
   if (openFiles.length === 0) {
@@ -1189,6 +1205,7 @@ async function submitExam(): Promise<void> {
   btn.textContent = "제출 중...";
 
   // Save all open files
+  await syncCurrentEditor(); // capture live buffer (covers active notebook where editorView is null)
   for (const file of openFiles) {
     if (file.path === activeFilePath && editorView) {
       file.content = editorView.state.doc.toString();
@@ -1377,6 +1394,12 @@ function setupOutputPanel(): void {
   });
   document.getElementById("output-clear")!.addEventListener("click", () => {
     document.getElementById("output-content")!.textContent = "";
+    // Reset rAF batch so a buffered chunk doesn't re-appear on the next frame
+    pendingOutput = [];
+    if (pendingFlushHandle !== null) {
+      cancelAnimationFrame(pendingFlushHandle);
+      pendingFlushHandle = null;
+    }
   });
 
   // Resize handle — drag to resize output panel height
@@ -1646,6 +1669,7 @@ async function listenForBackendEvents(): Promise<void> {
 
   // Real-time code output
   await listen<{ stream: string; text: string }>("run-output", (event) => {
+    if (!isRunning) return; // ignore straggler chunks after Stop/from a previous run
     if (isNotebookRunning()) return; // notebook handles its own output
     const { stream, text } = event.payload;
     if (stream === "stderr") {

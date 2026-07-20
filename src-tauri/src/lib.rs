@@ -390,36 +390,64 @@ fn start_recording(
                 result
             };
 
-            // 1. Fast-failure probe at 3s: permission-denied / immediate 0-byte.
+            // 1. Fast-failure probe. A LIVE encoder with a tiny file at 3s is
+            //    NORMAL — at 2fps, x264's frame delay plus the mp4 muxer's
+            //    write buffering keeps the on-disk file under 1KB for the
+            //    first several seconds (field-confirmed: a healthy recording
+            //    averaged ~1.3KB/s, so the 3s check false-alarmed on real
+            //    exams). Alarm at 3s only if the capture process is DEAD;
+            //    a small-but-alive capture gets re-checked at ~12s and alarms
+            //    only if the file is STILL under 1KB.
             std::thread::sleep(std::time::Duration::from_secs(3));
             if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
                 return; // already stopped / superseded
             }
-            let bytes = std::fs::metadata(&path_for_check)
+            let mut bytes = std::fs::metadata(&path_for_check)
                 .map(|m| m.len()).unwrap_or(0);
-            let (alive, last_err) = probe_recorder(&ah);
+            let (alive, mut last_err) = probe_recorder(&ah);
             // Re-check the epoch: stop_recording may hold the recorder lock
             // through its (bounded) graceful stop, so the probe could have
             // blocked above while this recording was being stopped.
             if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
                 return;
             }
-            let start_failed = if size_based { bytes < 1024 } else { !alive };
+            let mut start_failed = if size_based { !alive && bytes < 1024 } else { !alive };
+            let mut probe_window = "3s";
+            if !start_failed && size_based && bytes < 1024 {
+                // Alive but nothing on disk yet — grace period, then re-verify.
+                std::thread::sleep(std::time::Duration::from_secs(9));
+                if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
+                    return;
+                }
+                bytes = std::fs::metadata(&path_for_check)
+                    .map(|m| m.len()).unwrap_or(0);
+                let (alive2, err2) = probe_recorder(&ah);
+                if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
+                    return;
+                }
+                last_err = err2;
+                // Dead OR still no real data after 12s — genuine start failure
+                // (permission denied / capture device error).
+                start_failed = !alive2 || bytes < 1024;
+                probe_window = "12s";
+            }
             if start_failed {
                 let msg = if cfg!(target_os = "macos") {
                     format!(
-                        "녹화가 시작되지 않았습니다 ({} bytes after 3s{}). \
+                        "녹화가 시작되지 않았습니다 ({} bytes after {}{}). \
                          시스템 설정 > 개인정보 보호 및 보안 > 화면 기록에서 \
                          MINT Exam IDE 권한을 허용하고 IDE를 재시작하세요.",
                         bytes,
+                        probe_window,
                         last_err.as_deref().map(|e| format!(", {}", e)).unwrap_or_default()
                     )
                 } else {
                     format!(
-                        "녹화가 시작되지 않았습니다 ({} bytes after 3s). \
+                        "녹화가 시작되지 않았습니다 ({} bytes after {}). \
                          FFmpeg가 설치되어 있는지, RDP/원격 데스크탑 세션에 \
                          있지 않은지 확인하세요.",
-                        bytes
+                        bytes,
+                        probe_window
                     )
                 };
                 let event = ActivityEvent::new(

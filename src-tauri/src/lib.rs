@@ -1551,6 +1551,23 @@ fn compute_self_hash() -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
+/// App version from tauri.conf.json — shown in the toolbar/title so a student
+/// (and proctor) can SEE at a glance whether the latest build is installed.
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// True when the exam venv's python actually exists on disk. The first-launch
+/// flow shows the setup wizard when this is false EVEN IF setup_done=true —
+/// a stale config from an earlier install otherwise skipped the wizard on a
+/// machine whose venv/packages are gone, silently leaving the student with a
+/// package-less environment.
+#[tauri::command]
+fn exam_venv_ready() -> bool {
+    python_exe_in_venv(&venv_dir_from_config()).exists()
+}
+
 #[tauri::command]
 fn get_build_info() -> serde_json::Value {
     serde_json::json!({
@@ -2030,6 +2047,8 @@ pub fn run() {
             get_default_venv_path,
             recreate_venv,
             get_build_info,
+            get_app_version,
+            exam_venv_ready,
             read_setup_config,
             write_setup_config,
             package_list_for_profile,

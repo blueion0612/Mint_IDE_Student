@@ -235,6 +235,29 @@ fn find_ffmpeg() -> Result<String, String> {
 #[cfg(target_os = "windows")]
 fn discover_ffmpeg_windows() -> Vec<String> {
     let mut paths = Vec::new();
+
+    // winget Links dirs FIRST — stable symlink location that exists the moment
+    // winget finishes, independent of this process's PATH. Critical right after
+    // install-windows.ps1: it installs Gyan.FFmpeg with --scope MACHINE, but an
+    // IDE launched from the Start Menu inherits Explorer's PRE-INSTALL PATH, so
+    // the PATH probe fails — and the old discovery only scanned the USER-scope
+    // WinGet dir, never the machine one. Result: first-launch "녹화 실패"
+    // until reboot. (User scope: %LOCALAPPDATA%\Microsoft\WinGet\Links;
+    // machine scope: %ProgramFiles%\WinGet\Links.)
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        let link = std::path::PathBuf::from(&pf).join("WinGet").join("Links").join("ffmpeg.exe");
+        if link.exists() {
+            paths.push(link.to_string_lossy().to_string());
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let link = std::path::PathBuf::from(&local)
+            .join("Microsoft").join("WinGet").join("Links").join("ffmpeg.exe");
+        if link.exists() {
+            paths.push(link.to_string_lossy().to_string());
+        }
+    }
+
     if let Ok(user_path) = std::env::var("PATH") {
         for dir in user_path.split(';') {
             let candidate = std::path::PathBuf::from(dir).join("ffmpeg.exe");
@@ -243,9 +266,19 @@ fn discover_ffmpeg_windows() -> Vec<String> {
             }
         }
     }
+
+    // winget Packages trees — BOTH scopes (Links above normally suffices, but
+    // some winget versions have shipped broken/missing symlinks).
+    let mut package_roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        package_roots.push(std::path::PathBuf::from(pf).join("WinGet").join("Packages"));
+    }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let winget_dir = std::path::PathBuf::from(&local)
-            .join("Microsoft").join("WinGet").join("Packages");
+        package_roots.push(
+            std::path::PathBuf::from(local).join("Microsoft").join("WinGet").join("Packages"),
+        );
+    }
+    for winget_dir in package_roots {
         if let Ok(entries) = std::fs::read_dir(&winget_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_lowercase();
@@ -257,6 +290,12 @@ fn discover_ffmpeg_windows() -> Vec<String> {
             }
         }
     }
+
+    // Common manual-install location.
+    if std::path::Path::new("C:\\ffmpeg\\bin\\ffmpeg.exe").exists() {
+        paths.push("C:\\ffmpeg\\bin\\ffmpeg.exe".to_string());
+    }
+
     paths
 }
 

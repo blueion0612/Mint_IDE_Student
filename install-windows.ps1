@@ -318,6 +318,25 @@ if ($exeAsset) {
         Write-Host "  [WARN] IDE installer exit code $($ideProc.ExitCode) — install may be incomplete." -ForegroundColor Yellow
         $script:hadWarnings = $true
     }
+
+    # Re-arm the setup wizard: a config left by an EARLIER install has
+    # setup_done=true, so after this reinstall the IDE would skip the wizard
+    # entirely. Reset ONLY that flag — custom_venv_path and the other choices
+    # are preserved as wizard defaults. (BOM-less write: the IDE's JSON parser
+    # rejects a UTF-8 BOM and would fall back to a blank default config,
+    # losing custom_venv_path.)
+    $cfgPath = Join-Path $env:LOCALAPPDATA "MINT_Exam_IDE\setup_config.json"
+    if (Test-Path $cfgPath) {
+        try {
+            $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+            $cfg.setup_done = $false
+            $json = $cfg | ConvertTo-Json -Depth 8
+            [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "  [OK] Setup wizard will run on next IDE launch" -ForegroundColor Green
+        } catch {
+            Write-Host "  [WARN] Could not re-arm setup wizard: $_" -ForegroundColor Yellow
+        }
+    }
 } else {
     Write-Host "  [FAIL] No installer found in recent releases." -ForegroundColor Red
     Write-Host "         Manual download: https://github.com/blueion0612/Mint_IDE_Student/releases/latest" -ForegroundColor Cyan

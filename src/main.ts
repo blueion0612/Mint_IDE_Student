@@ -114,7 +114,12 @@ function showStudentIdModal(): void {
     overlay.remove();
 
     setupConfig = await loadConfig();
-    if (!setupConfig.setup_done) {
+    // Run the wizard when setup was never completed OR the exam venv is gone
+    // (fresh/repaved machine with a stale setup_done=true config) — skipping it
+    // then would silently hand the student a package-less environment.
+    let venvReady = false;
+    try { venvReady = await invoke<boolean>("exam_venv_ready"); } catch { /* treat as not ready */ }
+    if (!setupConfig.setup_done || !venvReady) {
       // Prepare venv first so wizard installs packages into it (not system Python)
       try {
         selectedPythonPath = await invoke<string>("setup_exam_python");
@@ -133,7 +138,18 @@ function showStudentIdModal(): void {
   });
 }
 
+let appVersion = "";
+
 async function initializeApp(): Promise<void> {
+  // Version in the toolbar + OS title bar: instant visual check that the
+  // LATEST build is installed (previously indistinguishable from an old one).
+  try { appVersion = await invoke<string>("get_app_version"); } catch { /* keep blank */ }
+  if (appVersion) {
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().setTitle(`MINT Exam IDE v${appVersion}`);
+    } catch { /* title stays default */ }
+  }
   buildToolbar();
   buildStatusBar();
   setupLogPanel();
@@ -297,7 +313,7 @@ async function createSampleFiles(): Promise<void> {
 function buildToolbar(): void {
   const toolbar = document.getElementById("toolbar")!;
   toolbar.innerHTML = `
-    <span class="toolbar-title">MINT Exam IDE</span>
+    <span class="toolbar-title">MINT Exam IDE${appVersion ? ` <span class="toolbar-version">v${escapeHtml(appVersion)}</span>` : ""}</span>
     <div class="toolbar-group">
       <select id="lang-selector" class="lang-select">
         <option value="python">Python</option>

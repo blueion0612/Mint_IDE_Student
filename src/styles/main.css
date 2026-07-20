@@ -70,6 +70,13 @@ body {
   letter-spacing: 0.5px;
 }
 
+#toolbar .toolbar-version {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0;
+}
+
 #toolbar .toolbar-separator {
   width: 1px;
   height: 20px;

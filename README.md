@@ -48,5 +48,7 @@ curl -sL https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/ins
 Xcode CLT + Homebrew + Python 3.12 + Rust + Node + JDK + FFmpeg 설치 후 소스
 clone → `npm run tauri build` → `/Applications`에 복사. 5~10분 소요, ~500MB 다운로드.
 
-**첫 실행 권한**: 시스템 설정 > 개인정보 보호 및 보안 에서
-**Screen Recording** + **Automation** 둘 다 허용 필수. 거부 시 녹화/모니터링 작동 안 함.
+**첫 실행 권한**: 다이얼로그가 뜨면 **화면 기록(Screen Recording)** + **자동화(Automation →
+System Events)** 둘 다 허용 필수. 화면 기록은 허용하면 15초 내 자동으로 녹화가 시작되고,
+자동화는 허용 후 IDE 재시작 필요. 다이얼로그를 놓쳤다면 시스템 설정 > 개인정보 보호 및
+보안 > 화면 기록 / 자동화 에서 'MINT Exam IDE'를 켜고 IDE를 재시작.

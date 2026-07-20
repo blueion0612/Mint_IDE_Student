@@ -29,3 +29,7 @@ unicode-normalization = "0.1"
 
 
 
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Without this key, macOS DENIES our osascript (System Events) calls
+	     silently and never shows the Automation permission prompt — killing
+	     focus + clipboard-source monitoring on every Mac. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>시험 감독을 위해 현재 활성화된 앱 정보를 확인합니다 (포커스/클립보드 출처 모니터링).</string>
+	<!-- App Nap throttles a backgrounded/occluded app's timers and I/O — which
+	     is EXACTLY when our monitoring matters (the student is looking at some
+	     other app). Keep the focus/clipboard/integrity poll threads and the
+	     recording watchdog running at full cadence for the whole exam. -->
+	<key>NSAppSleepDisabled</key>
+	<true/>
+</dict>
+</plist>

@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { createEditor, setLanguage, markErrorLines, clearErrors, type SupportedLanguage } from "./editor/setup";
 import { handleEditorInput, flushTypingSummary, noteClipboardEvent } from "./monitor/keystroke";
 import { recordTransaction, setCurrentFile, markNextInputSource, getEditHistoryJSON } from "./monitor/edithistory";
-import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook, isNotebookRunning } from "./editor/notebook";
+import { mountNotebook, getNotebookJSON, isNotebookActive, clearNotebook, isNotebookRunning, stopNotebook } from "./editor/notebook";
 import { showSetupWizard, showSettingsModal, loadConfig, type SetupConfig } from "./setup_wizard";
 
 // ===== Types =====
@@ -31,7 +31,16 @@ interface OpenFile {
   language: SupportedLanguage;
   content: string;
   modified: boolean;
+  // Oversized file opened as an info panel only (never mounted into
+  // CodeMirror / the table parser — a 100MB doc froze low-spec machines).
+  tooLarge?: boolean;
+  sizeBytes?: number;
 }
+
+// Above this size a file opens as an info panel instead of an editor/table.
+const MAX_PREVIEW_BYTES = 20 * 1024 * 1024;
+// Rows rendered (and parsed) by the CSV/TSV table viewer.
+const MAX_TABLE_ROWS = 500;
 
 // ===== State =====
 let openFiles: OpenFile[] = [];
@@ -134,6 +143,13 @@ async function initializeApp(): Promise<void> {
 
   document.addEventListener("click", closeContextMenu);
 
+  // Suppress the WebView's NATIVE context menu everywhere. Its "새로 고침 /
+  // Reload" item (WebView2 on Windows, WKWebView on macOS) reloads the page
+  // and wipes the whole session (학번, open buffers, edit history) — the same
+  // reload the F5/Ctrl+R blocks below exist to prevent. Our own file-tree
+  // context menu is built by element-level handlers and is unaffected.
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
+
   // Keyboard shortcuts
   document.addEventListener("keydown", (e) => {
     // Block reload shortcuts — F5 / Ctrl+R / Ctrl+Shift+R / Ctrl+F5 — which
@@ -155,6 +171,7 @@ async function initializeApp(): Promise<void> {
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "C" || e.key === "c")) {
       e.preventDefault();
       if (isRunning) stopCurrentRun();
+      if (isNotebookRunning()) stopNotebook();
       return;
     }
   });
@@ -177,7 +194,15 @@ async function initializeApp(): Promise<void> {
     await refreshFileTree();
     openFileByPath("main.py");
   } catch (e) {
+    // A failed workspace init leaves EVERY ws_* command broken — nothing
+    // saves, submit cannot work. Silently logging to a console the student
+    // can't see meant they'd discover it only at submit time.
     console.error("Workspace init failed:", e);
+    alert(
+      `[치명적] 작업 폴더를 만들지 못했습니다.\n\n${e}\n\n` +
+      `이 상태로는 파일 저장과 제출이 동작하지 않습니다. ` +
+      `감독관에게 즉시 알리고 IDE를 재시작하세요.`
+    );
   }
 
   invoke("log_editor_event", {
@@ -203,6 +228,55 @@ async function initializeApp(): Promise<void> {
     if (pyEl) pyEl.textContent = "Python: Exam Env";
   } else {
     setupExamPython();
+  }
+
+  registerCloseGuard();
+}
+
+// Confirm + best-effort flush before the window closes (X / Alt+F4). Without
+// this, an accidental close mid-exam silently discards unsaved buffers AND the
+// entire in-memory edit-history (a grading artifact only persisted on submit).
+let closeInProgress = false;
+async function registerCloseGuard(): Promise<void> {
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const win = getCurrentWindow();
+    await win.onCloseRequested(async (event) => {
+      if (closeInProgress) return;         // already flushing → let it proceed
+      event.preventDefault();              // we control the actual close
+      if (isSubmitting) return;            // submit runs its own exit(0); block manual close meanwhile
+      const ok = confirm(
+        "시험을 종료하시겠습니까?\n\n" +
+        "제출하지 않고 종료하면 이번 세션의 편집 기록이 저장되지 않습니다.\n" +
+        "제출하려면 [취소]를 누르고 Submit 버튼을 사용하세요."
+      );
+      if (!ok) return;                     // stay open
+      closeInProgress = true;
+      // Stop live children so nothing is orphaned past the exit (the backend
+      // Exit hook is the guarantee; this keeps their final writes out of the
+      // buffer flush below).
+      if (isRunning) stopCurrentRun();
+      if (isNotebookRunning()) { try { await stopNotebook(); } catch { /* best effort */ } }
+      try {
+        await syncCurrentEditor();
+        for (const f of openFiles) {
+          if (f.path === activeFilePath && editorView) f.content = editorView.state.doc.toString();
+          if (f.modified || (f.path === activeFilePath && editorView)) {
+            await invoke("ws_write_file", { path: f.path, content: f.content });
+            f.modified = false;
+          }
+        }
+        await invoke("save_code_history", { historyJson: getEditHistoryJSON() });
+      } catch { /* best effort — still close below */ }
+      // Authorize the exit with the backend gate (which otherwise vetoes
+      // ExitRequested — that veto is what blocks macOS Cmd+Q from bypassing
+      // this guard entirely).
+      try { await invoke("allow_exit"); } catch { /* proceed anyway */ }
+      const { exit } = await import("@tauri-apps/plugin-process");
+      await exit(0);
+    });
+  } catch (e) {
+    console.warn("close guard registration failed:", e);
   }
 }
 
@@ -290,7 +364,33 @@ async function openSettingsModal(): Promise<void> {
 }
 
 // ===== Workspace / File Tree =====
-async function refreshFileTree(): Promise<void> {
+// Most actions trigger 2~3 refreshes (e.g. deleteItem → refreshFileTree, and
+// openFileByPath → refreshFileTree). Each one is a full backend directory walk
+// + JSON round-trip + complete DOM rebuild, which is visible on a low-spec
+// machine once the workspace holds an imported dataset. Coalesce: at most one
+// refresh in flight plus one queued. An awaited call still resolves only after
+// a refresh that STARTED at or after the call, so callers that immediately
+// query the freshly-rendered DOM (startRenameInSidebar) stay correct.
+let treeRefreshInFlight: Promise<void> | null = null;
+let treeRefreshQueued: Promise<void> | null = null;
+
+function refreshFileTree(): Promise<void> {
+  if (treeRefreshInFlight === null) {
+    treeRefreshInFlight = doRefreshFileTree().finally(() => {
+      treeRefreshInFlight = null;
+    });
+    return treeRefreshInFlight;
+  }
+  if (treeRefreshQueued === null) {
+    treeRefreshQueued = treeRefreshInFlight.then(() => {
+      treeRefreshQueued = null;
+      return refreshFileTree();
+    });
+  }
+  return treeRefreshQueued;
+}
+
+async function doRefreshFileTree(): Promise<void> {
   try {
     dropTargets.length = 0; // clear old drop targets before re-render
     const tree = await invoke<FileNode[]>("ws_list_tree");
@@ -454,12 +554,28 @@ async function openFileByPath(path: string): Promise<void> {
     let file = openFiles.find((f) => f.path === path);
     if (!file) {
       try {
-        const content = await invoke<string>("ws_read_file", { path });
-        file = { path, name, language: "python" as SupportedLanguage, content, modified: false };
+        const size = await invoke<number>("ws_file_size", { path }).catch(() => 0);
+        if (size > MAX_PREVIEW_BYTES) {
+          file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false, tooLarge: true, sizeBytes: size };
+        } else {
+          const content = await invoke<string>("ws_read_file", { path });
+          file = { path, name, language: "python" as SupportedLanguage, content, modified: false };
+        }
         openFiles.push(file);
-      } catch { return; }
+      } catch (e) {
+        // Most often a non-UTF-8 file (cp949 Korean .csv is common). Clicking
+        // it used to do NOTHING AT ALL — the student had no idea whether the
+        // click registered. Show why instead.
+        mountUnreadableViewer(name, e);
+        activeFilePath = null;
+        return;
+      }
     }
-    mountTableViewer(file);
+    if (file.tooLarge) {
+      mountTooLargeViewer(file);
+    } else {
+      mountTableViewer(file);
+    }
     renderTabs();
     refreshFileTree();
     return;
@@ -471,17 +587,27 @@ async function openFileByPath(path: string): Promise<void> {
     const name = path.split("/").pop() || path;
     let file = openFiles.find((f) => f.path === path);
     if (!file) {
-      // Convert xlsx to CSV text using pandas
+      // Convert xlsx to CSV text using pandas — run it with the EXAM VENV
+      // python (that's where pandas/openpyxl are installed; the base python
+      // the backend would otherwise fall back to has neither).
       try {
-        const csvContent = await invoke<string>("ws_xlsx_to_csv", { path });
-        file = { path, name, language: "python" as SupportedLanguage, content: csvContent, modified: false };
-        openFiles.push(file);
+        const size = await invoke<number>("ws_file_size", { path }).catch(() => 0);
+        if (size > MAX_PREVIEW_BYTES) {
+          file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false, tooLarge: true, sizeBytes: size };
+          openFiles.push(file);
+        } else {
+          const csvContent = await invoke<string>("ws_xlsx_to_csv", { path, pythonPath: selectedPythonPath });
+          file = { path, name, language: "python" as SupportedLanguage, content: csvContent, modified: false };
+          openFiles.push(file);
+        }
       } catch {
         file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false };
         openFiles.push(file);
       }
     }
-    if (file.content) {
+    if (file.tooLarge) {
+      mountTooLargeViewer(file);
+    } else if (file.content) {
       mountTableViewer(file);
     } else {
       const container = document.getElementById("editor-container")!;
@@ -508,6 +634,7 @@ async function openFileByPath(path: string): Promise<void> {
       <div class="binary-info">${ext.toUpperCase()} file — binary format, cannot preview in editor</div>
     </div>`;
     editorView = null;
+    clearNotebook();
     renderTabs();
     refreshFileTree();
     return;
@@ -519,8 +646,16 @@ async function openFileByPath(path: string): Promise<void> {
     const name = path.split("/").pop() || path;
     let file = openFiles.find((f) => f.path === path);
     if (!file) {
-      file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false };
+      const size = await invoke<number>("ws_file_size", { path }).catch(() => 0);
+      file = { path, name, language: "python" as SupportedLanguage, content: "", modified: false,
+               tooLarge: size > MAX_PREVIEW_BYTES, sizeBytes: size };
       openFiles.push(file);
+    }
+    if (file.tooLarge) {
+      mountTooLargeViewer(file);
+      renderTabs();
+      refreshFileTree();
+      return;
     }
     mountImageViewer(file);
     renderTabs();
@@ -531,13 +666,24 @@ async function openFileByPath(path: string): Promise<void> {
   let file = openFiles.find((f) => f.path === path);
   if (!file) {
     try {
-      const content = await invoke<string>("ws_read_file", { path });
       const name = path.split("/").pop() || path;
       const lang = langFromExtension(name) || "python";
-      file = { path, name, language: lang, content, modified: false };
+      const size = await invoke<number>("ws_file_size", { path }).catch(() => 0);
+      if (size > MAX_PREVIEW_BYTES) {
+        // Never mount a giant doc into CodeMirror — it froze the whole UI.
+        file = { path, name, language: lang, content: "", modified: false, tooLarge: true, sizeBytes: size };
+      } else {
+        const content = await invoke<string>("ws_read_file", { path });
+        file = { path, name, language: lang, content, modified: false };
+      }
       openFiles.push(file);
     } catch (e) {
+      // Non-UTF-8 / locked / unreadable. Silently returning left the student
+      // clicking a file with zero feedback.
       console.error("Failed to open file:", e);
+      mountUnreadableViewer(path.split("/").pop() || path, e);
+      activeFilePath = null;
+      renderTabs();
       return;
     }
   }
@@ -555,8 +701,8 @@ async function openFileByPath(path: string): Promise<void> {
   const selector = document.getElementById("lang-selector") as HTMLSelectElement;
   if (selector) selector.value = file.language;
 
-  if (path.endsWith(".ipynb")) {
-    mountNotebookView(file);
+  if (file.tooLarge) {
+    mountTooLargeViewer(file);
   } else if (path.endsWith(".ipynb")) {
     mountNotebookView(file);
   } else {
@@ -565,6 +711,29 @@ async function openFileByPath(path: string): Promise<void> {
   }
   renderTabs();
   refreshFileTree();
+}
+
+function mountUnreadableViewer(name: string, err: unknown): void {
+  const container = document.getElementById("editor-container")!;
+  editorView = null;
+  clearNotebook();
+  container.innerHTML = `<div class="binary-viewer">
+    <div class="binary-icon">&#128196;</div>
+    <div class="binary-name">${escapeHtml(name)}</div>
+    <div class="binary-info">이 파일은 편집기에서 열 수 없습니다 (UTF-8이 아니거나 읽기 실패).<br/>코드에서 인코딩을 지정해 읽어보세요 — 예: open(path, encoding='cp949')<br/><br/>${escapeHtml(String(err))}</div>
+  </div>`;
+}
+
+function mountTooLargeViewer(file: OpenFile): void {
+  const container = document.getElementById("editor-container")!;
+  editorView = null;
+  clearNotebook();
+  const mb = ((file.sizeBytes ?? 0) / (1024 * 1024)).toFixed(1);
+  container.innerHTML = `<div class="binary-viewer">
+    <div class="binary-icon">&#128196;</div>
+    <div class="binary-name">${escapeHtml(file.name)}</div>
+    <div class="binary-info">${mb} MB — 파일이 너무 커서 미리보기를 열 수 없습니다.<br/>코드에서 직접 읽어 사용하세요 (예: open() / pd.read_csv).</div>
+  </div>`;
 }
 
 async function saveCurrentFile(): Promise<void> {
@@ -666,10 +835,17 @@ function mountEditor(file: OpenFile): void {
         markNextInputSource("paste");
       }
       handleEditorInput(event);
-      file.modified = true;
+      // NOTE: modified is set in the transaction callback below, not here —
+      // onInput only fires for beforeinput events carrying data, so it MISSES
+      // backspace/delete, Enter, drops, and undo/redo. Setting it on every
+      // docChanged transaction ensures those edits are saved on close/submit.
       renderTabs();
     },
     (changes, userEvent) => {
+      // Every document change (incl. delete / Enter / undo / redo) marks the
+      // file dirty so closeFile and submitExam actually write it to disk.
+      file.modified = true;
+      renderTabs();
       recordTransaction(changes, userEvent);
     },
   );
@@ -707,12 +883,17 @@ function mountTableViewer(file: OpenFile): void {
   };
 
   const headers = parseRow(lines[0]);
-  const rows = lines.slice(1).map(parseRow);
+  // Parse ONLY the rows we render. Mapping parseRow over every line meant a
+  // 15MB CSV (well under the open-size cap) parsed ~500k rows character by
+  // character on the UI thread just to display 500 of them — a multi-second
+  // freeze on a low-spec laptop.
+  const totalRows = lines.length - 1;
+  const rows = lines.slice(1, 1 + MAX_TABLE_ROWS).map(parseRow);
 
   // Info bar
   const info = document.createElement("div");
   info.className = "table-info";
-  info.textContent = `${file.name} — ${rows.length} rows, ${headers.length} columns`;
+  info.textContent = `${file.name} — ${totalRows} rows, ${headers.length} columns`;
   wrapper.appendChild(info);
 
   // Table
@@ -738,9 +919,9 @@ function mountTableViewer(file: OpenFile): void {
   thead.appendChild(headerRow);
   table.appendChild(thead);
 
-  // Body (max 500 rows)
+  // Body (max MAX_TABLE_ROWS rows)
   const tbody = document.createElement("tbody");
-  const maxRows = Math.min(rows.length, 500);
+  const maxRows = rows.length;
   for (let i = 0; i < maxRows; i++) {
     const tr = document.createElement("tr");
     const tdNum = document.createElement("td");
@@ -762,10 +943,10 @@ function mountTableViewer(file: OpenFile): void {
   tableWrap.appendChild(table);
   wrapper.appendChild(tableWrap);
 
-  if (rows.length > 500) {
+  if (totalRows > rows.length) {
     const more = document.createElement("div");
     more.className = "table-info";
-    more.textContent = `Showing 500 of ${rows.length} rows`;
+    more.textContent = `Showing ${rows.length} of ${totalRows} rows`;
     wrapper.appendChild(more);
   }
 
@@ -1010,7 +1191,18 @@ function startRenameInSidebar(path: string): void {
             f.language = langFromExtension(f.name) || f.language;
           }
         }
-        if (activeFilePath === path) activeFilePath = newPath;
+        // Re-point activeFilePath for BOTH a direct rename of the active file
+        // AND a rename of a PARENT directory containing it. Without the
+        // directory case, activeFilePath stays stale and Ctrl+S / Run / sync
+        // (which look up openFiles by activeFilePath) silently no-op and the
+        // next tab switch discards unsaved edits.
+        if (activeFilePath === path) {
+          activeFilePath = newPath;
+          setCurrentFile(newPath);
+        } else if (activeFilePath && activeFilePath.startsWith(path + "/")) {
+          activeFilePath = activeFilePath.replace(path, newPath);
+          setCurrentFile(activeFilePath);
+        }
       } catch (e) {
         alert(`Rename failed: ${e}`);
       }
@@ -1175,6 +1367,12 @@ async function setupExamPython(): Promise<void> {
   }
 }
 
+let recRetryTimer: number | null = null;
+let recRetryCount = 0;
+let recFailAlerted = false;
+const REC_RETRY_INTERVAL_MS = 15000;
+const REC_RETRY_MAX = 40; // ~10 minutes of retries
+
 async function startAutoRecording(): Promise<void> {
   const indicator = document.getElementById("rec-indicator")!;
   indicator.classList.remove("rec-disabled", "rec-error");
@@ -1184,12 +1382,61 @@ async function startAutoRecording(): Promise<void> {
     isRecording = true;
     indicator.classList.add("recording");
     appendOutput(`Screen recording started: ${path}\n`, "system");
+    if (recRetryTimer !== null) { clearInterval(recRetryTimer); recRetryTimer = null; }
+    recRetryCount = 0;
   } catch (e) {
     indicator.classList.add("rec-error");
     indicator.title = `Recording failed: ${e}`;
     appendOutput(`Recording failed: ${e}\n`, "error");
     console.warn("Auto-recording failed:", e);
+    // First failure: loud modal (typically the macOS Screen Recording
+    // permission on first launch). Then keep retrying quietly — once the
+    // student grants the permission, a later attempt succeeds without an
+    // app restart on most macOS versions.
+    if (!recFailAlerted) {
+      recFailAlerted = true;
+      alert(`[녹화 시작 실패]\n\n${e}\n\n권한을 허용하면 15초 내에 자동으로 다시 시작됩니다. 계속 실패하면 IDE를 재시작하세요.`);
+    }
+    if (recRetryTimer === null && setupConfig.recording_enabled) {
+      recRetryTimer = window.setInterval(() => {
+        if (isRecording || !setupConfig.recording_enabled) {
+          if (recRetryTimer !== null) { clearInterval(recRetryTimer); recRetryTimer = null; }
+          return;
+        }
+        if (recRetryCount >= REC_RETRY_MAX) {
+          if (recRetryTimer !== null) { clearInterval(recRetryTimer); recRetryTimer = null; }
+          // Giving up SILENTLY meant the student sat through the rest of the
+          // exam with no recording and no further notice.
+          alert(
+            "[녹화 실패] 약 10분간 재시도했지만 화면 녹화를 시작하지 못했습니다.\n\n" +
+            "이 시험은 녹화 없이 진행되고 있습니다 — 감독관에게 즉시 알리세요."
+          );
+          return;
+        }
+        recRetryCount++;
+        startAutoRecording();
+      }, REC_RETRY_INTERVAL_MS);
+    }
   }
+}
+
+/// A recording_health_fail can mean the capture process DIED (recoverable —
+/// start a fresh segment) or that a live process stopped producing frames
+/// (restarting would just fail with "already in progress"). Ask the backend
+/// which it is instead of guessing. Without this, a mid-exam ffmpeg crash left
+/// the rest of the exam unrecorded even though restarting would have worked.
+async function maybeRestartRecording(): Promise<void> {
+  if (!setupConfig.recording_enabled) return;
+  try {
+    const live = await invoke<boolean>("is_recording");
+    if (live) return; // stalled but alive — a restart attempt would be rejected
+  } catch {
+    return;
+  }
+  isRecording = false;
+  recFailAlerted = true;   // don't stack a second modal on top of the health alert
+  recRetryCount = 0;       // fresh retry budget for this new failure
+  await startAutoRecording();
 }
 
 // ===== Submit Exam =====
@@ -1204,21 +1451,34 @@ async function submitExam(): Promise<void> {
   btn.disabled = true;
   btn.textContent = "제출 중...";
 
-  // Save all open files
-  await syncCurrentEditor(); // capture live buffer (covers active notebook where editorView is null)
-  for (const file of openFiles) {
-    if (file.path === activeFilePath && editorView) {
-      file.content = editorView.state.doc.toString();
-    }
-    if (file.modified) {
-      await invoke("ws_write_file", { path: file.path, content: file.content });
-    }
-  }
-  flushTypingSummary();
-  // Save code edit history before submit
-  await invoke("save_code_history", { historyJson: getEditHistoryJSON() });
-
   try {
+    // Stop anything still running BEFORE zipping: a live python child keeps
+    // rewriting its output files while the backend zips them (torn members),
+    // and it would simply be ORPHANED by the exit below and keep running
+    // after the exam.
+    if (isRunning) stopCurrentRun();
+    if (isNotebookRunning()) { try { await stopNotebook(); } catch { /* best effort */ } }
+
+    // Save all open files. This is INSIDE the try so a write failure (a
+    // running script holding the file open, AV/indexer lock, disk error)
+    // re-enables the button and surfaces the error instead of leaving Submit
+    // permanently stuck at "제출 중..." with no message.
+    await syncCurrentEditor(); // capture live buffer (covers active notebook where editorView is null)
+    for (const file of openFiles) {
+      if (file.path === activeFilePath && editorView) {
+        file.content = editorView.state.doc.toString();
+      }
+      // Always write the ACTIVE file (its live buffer was just captured) even
+      // if `modified` was somehow not set; write others only when dirty.
+      if (file.modified || (file.path === activeFilePath && editorView)) {
+        await invoke("ws_write_file", { path: file.path, content: file.content });
+        file.modified = false;
+      }
+    }
+    flushTypingSummary();
+    // Save code edit history before submit
+    await invoke("save_code_history", { historyJson: getEditHistoryJSON() });
+
     const result = await invoke<{ folder_path: string; code_zip: string; video_zip: string }>(
       "submit_exam",
       { studentId }
@@ -1226,14 +1486,24 @@ async function submitExam(): Promise<void> {
 
     alert(`제출 완료!\n\n저장 위치:\n${result.folder_path}\n\n프로그램을 종료합니다.`);
 
-    // Exit the application
+    // Exit the application (authorize with the backend exit gate first)
+    try { await invoke("allow_exit"); } catch { /* proceed anyway */ }
     const { exit } = await import("@tauri-apps/plugin-process");
     await exit(0);
   } catch (e) {
     appendOutput(`Submit failed: ${e}\n`, "error");
+    alert(`제출에 실패했습니다:\n\n${e}\n\n원본 파일은 보존되어 있습니다. 문제를 해결한 뒤 다시 제출하세요.`);
     btn.disabled = false;
     btn.textContent = "Submit";
     isSubmitting = false;
+    // submit_exam already STOPPED the recording before it failed. The student
+    // is now continuing the exam — restart capture instead of silently
+    // recording nothing for the remainder.
+    if (setupConfig.recording_enabled) {
+      isRecording = false;
+      recFailAlerted = true; // failure alert above is enough; no extra modal
+      void startAutoRecording();
+    }
   }
 }
 
@@ -1500,6 +1770,8 @@ function setupLogPanel(): void {
   });
 }
 
+const MAX_LOG_ENTRIES = 3000;
+
 function appendLogEntry(event: ActivityEvent): void {
   const logContent = document.getElementById("log-content")!;
   const entry = document.createElement("div");
@@ -1511,6 +1783,12 @@ function appendLogEntry(event: ActivityEvent): void {
     <span class="log-detail">${escapeHtml(event.detail)}</span>
   `;
   logContent.appendChild(entry);
+  // Bound the DOM (display only — the full log lives in the backend and is
+  // exported at submit). A long run-heavy session otherwise grows this list
+  // without limit and the whole UI gets sluggish.
+  while (logContent.childElementCount > MAX_LOG_ENTRIES) {
+    logContent.removeChild(logContent.firstChild!);
+  }
   logContent.scrollTop = logContent.scrollHeight;
 
   if (event.severity === "warning" || event.severity === "alert") {
@@ -1550,7 +1828,12 @@ let pythonList: PythonInfo[] = [];
 async function loadPythonList(): Promise<void> {
   try {
     pythonList = await invoke<PythonInfo[]>("detect_pythons");
-    if (pythonList.length > 0) {
+    // Only relabel to a detected interpreter when the IDE is NOT already bound
+    // to the exam venv. detect_pythons resolves slowly (spawns --version), and
+    // it was overwriting the "Python: Exam Env" label with the first detected
+    // SYSTEM interpreter — misreporting which Python actually runs the code
+    // (runs still use the venv) and tempting students to "fix" it.
+    if (pythonList.length > 0 && !selectedPythonPath) {
       document.getElementById("status-python")!.textContent = `Python: ${pythonList[0].label}`;
     }
   } catch { /* ignore */ }
@@ -1609,9 +1892,13 @@ function showPythonSelector(): void {
     const pyExe = navigator.platform.includes("Win")
       ? `${dir}/Scripts/python.exe`
       : `${dir}/bin/python`;
+    const oldPath = selectedPythonPath || "exam-env";
     selectedPythonPath = pyExe;
     const name = dir.split(/[/\\]/).pop() || dir;
     anchor.textContent = `Python: venv (${name})`;
+    // Log the env switch like every other selector option — Browse was the
+    // one path that changed the interpreter without an audit trail.
+    invoke("log_python_change", { fromEnv: oldPath, toEnv: pyExe });
   });
   popup.appendChild(browseItem);
 
@@ -1659,18 +1946,30 @@ async function listenForBackendEvents(): Promise<void> {
         epochMs: Date.now(),
       });
     }
-    // Recording health failure: backend detected sub-1KB mp4 after 3s — most
-    // commonly Screen Recording permission denied on macOS. Alert the
-    // student loudly before they finish the exam thinking it was recording.
+    // Recording health failure: backend detected a dead capture process or a
+    // non-growing file — most commonly Screen Recording permission denied on
+    // macOS. Alert the student loudly before they finish the exam thinking it
+    // was recording.
     if (ev.event_type === "recording_health_fail") {
-      alert(`[녹화 시작 실패]\n\n${ev.detail}`);
+      alert(`[녹화 문제]\n\n${ev.detail}`);
+      void maybeRestartRecording();
+    }
+    // Monitoring permission failure (macOS Automation denied): one-time
+    // backend event — without the permission, focus/clipboard-source
+    // monitoring silently records nothing all exam.
+    if (ev.event_type === "monitor_health_fail") {
+      alert(`[모니터링 권한 문제]\n\n${ev.detail}`);
     }
   });
 
   // Real-time code output
   await listen<{ stream: string; text: string }>("run-output", (event) => {
     if (!isRunning) return; // ignore straggler chunks after Stop/from a previous run
-    if (isNotebookRunning()) return; // notebook handles its own output
+    // NOTE: no isNotebookRunning() guard — notebook runs use run_code_sync and
+    // never emit run-output/run-done, so guarding on it only served to DROP a
+    // streaming .py run's events when a notebook cell happened to run
+    // concurrently, wedging the Run button at "Stop". isRunning already scopes
+    // these handlers to streaming runs.
     const { stream, text } = event.payload;
     if (stream === "stderr") {
       streamingOutputReceived = true;
@@ -1686,7 +1985,7 @@ async function listenForBackendEvents(): Promise<void> {
 
   // Code execution finished
   await listen<{ exit_code: number | null; duration_ms: number; stdout: string; stderr: string }>("run-done", (event) => {
-    if (!isRunning || isNotebookRunning()) return; // Guard
+    if (!isRunning) return; // streaming-run scope only (notebook uses run_code_sync)
 
     const { exit_code, duration_ms, stdout, stderr } = event.payload;
 
@@ -1733,6 +2032,7 @@ function formatEventType(type: string): string {
     paste_large: "PASTE-LRG", input_burst: "BURST", typing_summary: "TYPING",
     code_run: "RUN", code_run_result: "RUN-RESULT",
     recording_start: "REC-START", recording_stop: "REC-STOP",
+    recording_health_fail: "REC-FAIL", monitor_health_fail: "MON-FAIL",
     file_import: "IMPORT",
     copy: "COPY",
     cut: "CUT",

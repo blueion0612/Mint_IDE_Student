@@ -124,10 +124,29 @@ fn save_baseline(root: &Path, state: &HashMap<String, FileState>) {
     }
 }
 
-fn count_lines(path: &Path) -> usize {
-    std::fs::read(path)
-        .map(|b| b.iter().filter(|&&c| c == b'\n').count() + 1)
-        .unwrap_or(0)
+/// One read → (hash, size, line_count). The poll loop previously read every
+/// monitored file TWICE per 2s cycle (once for the hash, once for the line
+/// count); on workspaces with a large .txt/.py this doubled steady-state disk
+/// I/O for no benefit.
+fn stat_bytes(data: &[u8]) -> (String, u64, usize) {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let hash = hex::encode(hasher.finalize());
+    let lines = data.iter().filter(|&&c| c == b'\n').count() + 1;
+    (hash, data.len() as u64, lines)
+}
+
+/// Read with brief retry — initial-scan variant of hash_file_retry. A transient
+/// AV/Defender share-deny right at launch used to leave the file OUT of the
+/// baseline entirely, so the next poll raised a false "EXTERNAL FILE ADDED".
+fn read_file_retry(path: &Path) -> Option<Vec<u8>> {
+    for _ in 0..3 {
+        if let Ok(d) = std::fs::read(path) {
+            return Some(d);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    std::fs::read(path).ok()
 }
 
 /// Shared set of "known writes" — the IDE registers a path here right before
@@ -141,6 +160,36 @@ pub type KnownWrites = Arc<Mutex<HashMap<String, (Option<String>, u64)>>>;
 
 pub fn new_known_writes() -> KnownWrites {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// A read-only snapshot of the integrity baseline (normalized rel -> content
+/// hash), republished by the monitor after every poll. Rename-recognition
+/// (`lib::pin_rename_sources`) consults it so an IDE-initiated rename/move
+/// recognizes a destination ONLY when the source's current bytes are already
+/// known-good in the baseline — never arbitrary live disk bytes. Pinning live
+/// bytes would let an external PRE-rename edit be laundered: the attacker edits
+/// a file between polls, renames its (parent) via the IDE, and the pin would
+/// bless the tampered content. Pinning against the baseline value the attacker
+/// cannot influence closes that hole while keeping honest renames event-free.
+pub type SharedBaseline = Arc<Mutex<HashMap<String, String>>>;
+
+pub fn new_shared_baseline() -> SharedBaseline {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Last-known-good content hash for `rel` (any path separator / unicode form —
+/// normalized here to match the monitor's keys).
+pub fn shared_baseline_hash(sb: &SharedBaseline, rel: &str) -> Option<String> {
+    sb.lock().ok().and_then(|m| m.get(&normalize_key(rel)).cloned())
+}
+
+fn publish_baseline(sb: &SharedBaseline, state: &HashMap<String, FileState>) {
+    if let Ok(mut m) = sb.lock() {
+        m.clear();
+        for (k, v) in state {
+            m.insert(k.clone(), v.hash.clone());
+        }
+    }
 }
 
 /// Grace period in seconds. The integrity loop polls every 2s; we leave
@@ -186,6 +235,17 @@ pub fn mark_known_write_hash(known: &KnownWrites, relative_path: &str, expected_
 /// integrity-monitored.
 fn is_unmonitored_output(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
+    // BUILD ARTIFACTS produced by our own run pipeline. These MUST be exempt:
+    // the compile step creates them BEFORE the post-run known-write pin, so a
+    // 2s poll landing mid-run flagged every C/C++ run (`a.exe`) and every Java
+    // run (`*.class`) as tamper_new_file. Likewise `__pycache__/*.pyc`, which
+    // Python writes the moment a student imports a local module (the `utils`
+    // sample package) — with numpy/pandas import time routinely exceeding one
+    // poll, that produced spurious TAMPER-NEW on ordinary runs and eroded
+    // trust in the signal. No exam answer is authored as a .pyc/.class/a.exe.
+    if name.eq_ignore_ascii_case("a.exe") || name.eq_ignore_ascii_case("a.out") {
+        return true;
+    }
     let ext = match name.rsplit_once('.') {
         Some((_, e)) => e.to_ascii_lowercase(),
         None => return false,
@@ -200,6 +260,10 @@ fn is_unmonitored_output(rel: &str) -> bool {
         | "npy" | "npz" | "pkl" | "pickle" | "joblib" | "h5" | "hdf5" | "pt" | "pth" | "onnx" | "ckpt" | "pb"
         // docs / media
         | "pdf" | "docx" | "pptx" | "mp4" | "mov" | "avi" | "mkv" | "webm" | "mp3" | "wav"
+        // program-written structured output / logs
+        | "json" | "log"
+        // build + bytecode artifacts (see note above)
+        | "pyc" | "pyo" | "class" | "o" | "obj" | "pdb" | "ilk"
     )
 }
 
@@ -226,19 +290,61 @@ pub fn hash_file(path: &Path) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
-/// hash_file with a brief retry — for KNOWN-WRITE PIN sites (post-run pin,
-/// rename/move) where a transient read failure (e.g. a Windows AV/Defender
-/// deny-share lock right after a write) would otherwise leave the file unpinned
-/// and raise a one-time false tamper under the content-aware grace. The scanner
-/// itself still uses plain hash_file (a read failure there just skips that poll).
+/// Files LARGER than this are fingerprinted by SIZE ONLY (`meta:<len>`), never
+/// content-hashed. Rationale: the 2s poll fully re-read every monitored file;
+/// a student importing a big monitored dataset (e.g. a 500MB corpus.txt —
+/// csv/xlsx/media are already exempt) turned that into a sustained
+/// hundreds-of-MB/s disk+CPU load that crippled low-spec laptops, and every
+/// post-run pin re-read it again. ACCEPTED RESIDUAL RISK: an external
+/// same-size in-place edit of a >32MB monitored file is not flagged (any
+/// size-changing edit still is). Exam ANSWERS are code — kilobytes — and get
+/// full content hashing; this affects only oversized auxiliary files.
+pub const LARGE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn meta_fingerprint(len: u64) -> String {
+    format!("meta:{}", len)
+}
+
+fn is_meta_fingerprint(fp: &str) -> bool {
+    fp.starts_with("meta:")
+}
+
+/// Content fingerprint under the SAME size rule as the scanner, for pin sites
+/// that hold the bytes in memory (ws_write_file / run_code / ws_import_file).
+/// The pin and the scan MUST use one scheme — a sha pin for a file the scanner
+/// fingerprints as `meta:` would never match and raise a false tamper.
+pub fn content_fingerprint(bytes: &[u8]) -> String {
+    if bytes.len() as u64 > LARGE_FILE_BYTES {
+        return meta_fingerprint(bytes.len() as u64);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// On-disk fingerprint: size-only for large files, full SHA-256 otherwise.
+fn file_fingerprint(path: &Path) -> Option<String> {
+    let len = path.metadata().ok()?.len();
+    if len > LARGE_FILE_BYTES {
+        return Some(meta_fingerprint(len));
+    }
+    hash_file(path)
+}
+
+/// file_fingerprint with a brief retry — for KNOWN-WRITE PIN sites (post-run
+/// pin, rename/move) where a transient read failure (e.g. a Windows
+/// AV/Defender deny-share lock right after a write) would otherwise leave the
+/// file unpinned and raise a one-time false tamper under the content-aware
+/// grace. (Name kept from the sha-only era; it now returns the same
+/// size-aware fingerprint the scanner computes.)
 pub fn hash_file_retry(path: &Path) -> Option<String> {
     for _ in 0..3 {
-        if let Some(h) = hash_file(path) {
+        if let Some(h) = file_fingerprint(path) {
             return Some(h);
         }
         thread::sleep(Duration::from_millis(25));
     }
-    hash_file(path)
+    file_fingerprint(path)
 }
 
 fn file_mtime(path: &Path) -> u64 {
@@ -342,6 +448,7 @@ pub fn start_integrity_monitor(
     log: LogHandle,
     app_handle: AppHandle,
     known_writes: KnownWrites,
+    shared_baseline: SharedBaseline,
 ) {
     thread::spawn(move || {
         let root = PathBuf::from(&workspace_root);
@@ -387,14 +494,27 @@ pub fn start_integrity_monitor(
         let initial_files = scan_all_files(&root);
         let initial_existed = !state.is_empty();
         for (rel, full) in &initial_files {
-            let Some(new_hash) = hash_file(full) else { continue; };
-            let new_size = full.metadata().map(|m| m.len()).unwrap_or(0);
-            let new_lines = count_lines(full);
             let new_mtime = file_mtime(full);
+            let (new_hash, new_size, new_lines) = match full.metadata().ok().map(|m| m.len()) {
+                Some(len) if len > LARGE_FILE_BYTES => (meta_fingerprint(len), len, 0usize),
+                _ => {
+                    let Some(data) = read_file_retry(full) else { continue; };
+                    stat_bytes(&data)
+                }
+            };
 
             if initial_existed {
                 if let Some(prev) = state.get(rel.as_str()) {
-                    if prev.hash != new_hash {
+                    // FINGERPRINT-SCHEME transition (sha ↔ meta:) with the SAME
+                    // size is not content evidence — it happens when a build
+                    // upgrade (or threshold change) switches the scheme for an
+                    // untouched file. Re-baseline silently. A scheme change
+                    // with a DIFFERENT size IS evidence (the size delta) and
+                    // still raises the event below.
+                    let scheme_transition = is_meta_fingerprint(&prev.hash)
+                        != is_meta_fingerprint(&new_hash)
+                        && prev.size == new_size;
+                    if prev.hash != new_hash && !scheme_transition {
                         let detail = format!(
                             "RESTART-WINDOW MODIFICATION: {} (hash differs from saved baseline)",
                             rel
@@ -436,12 +556,20 @@ pub fn start_integrity_monitor(
             save_baseline(&root, &state);
             state_dirty = false;
         }
+        // Publish the initial baseline so a rename in the first seconds after
+        // launch can be recognized against known-good content.
+        publish_baseline(&shared_baseline, &state);
 
         let mut save_counter: u32 = 0;
 
         loop {
             thread::sleep(Duration::from_secs(2));
 
+            // Did anything in `state` actually change this poll? Republishing
+            // the shared baseline clones every key+hash, so on a big workspace
+            // doing it unconditionally every 2s was pure allocation churn. The
+            // published map is already correct when nothing changed.
+            let mut baseline_changed = false;
             let now = epoch_secs();
             // Purge expired known_writes entries up front so the map doesn't
             // grow unbounded (one entry per IDE write across the exam).
@@ -453,11 +581,13 @@ pub fn start_integrity_monitor(
             // Check for modified or new files
             for (rel, full) in &files {
                 let new_mtime = file_mtime(full);
-                let new_hash = match hash_file(full) {
-                    Some(h) => h,
-                    None => continue,
+                let (new_hash, new_size, new_lines) = match full.metadata().ok().map(|m| m.len()) {
+                    Some(len) if len > LARGE_FILE_BYTES => (meta_fingerprint(len), len, 0usize),
+                    _ => {
+                        let Ok(data) = std::fs::read(full) else { continue; };
+                        stat_bytes(&data)
+                    }
                 };
-                let new_size = full.metadata().map(|m| m.len()).unwrap_or(0);
 
                 // Is this our own (IDE-initiated) write? We do NOT remove the
                 // entry on first hit — within one grace window the student may
@@ -485,7 +615,6 @@ pub fn start_integrity_monitor(
                     })
                     .unwrap_or(false);
 
-                let new_lines = count_lines(full);
                 if let Some(prev) = state.get(rel.as_str()) {
                     if prev.hash != new_hash && !is_known {
                         let size_delta: i64 = new_size as i64 - prev.size as i64;
@@ -511,6 +640,7 @@ pub fn start_integrity_monitor(
 
                 if state.get(rel.as_str()).map(|p| p.hash != new_hash).unwrap_or(true) {
                     state_dirty = true;
+                    baseline_changed = true;
                 }
                 state.insert(rel.clone(), FileState {
                     hash: new_hash,
@@ -542,6 +672,7 @@ pub fn start_integrity_monitor(
                 }
                 state.remove(rel);
                 state_dirty = true;
+                baseline_changed = true;
             }
 
             // Persist the baseline every ~30s (15 polling cycles) OR sooner if
@@ -552,6 +683,13 @@ pub fn start_integrity_monitor(
                 save_baseline(&root, &state);
                 state_dirty = false;
                 save_counter = 0;
+            }
+
+            // Republish the baseline snapshot whenever it changed, so
+            // rename-recognition always compares against the latest
+            // known-good content.
+            if baseline_changed {
+                publish_baseline(&shared_baseline, &state);
             }
         }
     });

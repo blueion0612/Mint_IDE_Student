@@ -1,4 +1,4 @@
-import { EditorState, Transaction, StateEffect, StateField, RangeSet } from "@codemirror/state";
+import { EditorState, Transaction, StateEffect, StateField, RangeSet, Compartment } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLineGutter, highlightActiveLine, drawSelection, rectangularSelection, crosshairCursor, highlightSpecialChars, Decoration, type DecorationSet } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { syntaxHighlighting, indentOnInput, bracketMatching, foldGutter, foldKeymap, defaultHighlightStyle, HighlightStyle, indentUnit } from "@codemirror/language";
@@ -127,6 +127,12 @@ export function clearErrors(view: EditorView): void {
   view.dispatch({ effects: clearErrorLines.of(null) });
 }
 
+// Language lives in its own compartment so a language switch reconfigures ONLY
+// the language — preserving undo history, the input/transaction listeners
+// (monitoring + modified-tracking), cursor and scroll. Rebuilding the whole
+// EditorState (the old setLanguage) silently dropped all of those.
+const languageCompartment = new Compartment();
+
 export function createEditor(
   parent: HTMLElement,
   language: SupportedLanguage = "python",
@@ -210,7 +216,7 @@ export function createEditor(
       EditorState.tabSize.of(4),
       bracketMatching(),
       closeBrackets(),
-      langExtension,
+      languageCompartment.of(langExtension),
       mintTheme,
       syntaxHighlighting(mintHighlightStyle),
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
@@ -234,42 +240,8 @@ export function createEditor(
 
 export function setLanguage(view: EditorView, language: SupportedLanguage): void {
   const langExtension = languageExtensions[language]?.() ?? python();
-
-  // Reconfigure by creating a new state with the current doc
-  const newState = EditorState.create({
-    doc: view.state.doc.toString(),
-    extensions: [
-      lineNumbers(),
-      highlightActiveLineGutter(),
-      highlightSpecialChars(),
-      history(),
-      foldGutter(),
-      drawSelection(),
-      rectangularSelection(),
-      crosshairCursor(),
-      highlightActiveLine(),
-      highlightSelectionMatches(),
-      indentOnInput(),
-      indentUnit.of("    "),
-      EditorState.tabSize.of(4),
-      bracketMatching(),
-      closeBrackets(),
-      langExtension,
-      mintTheme,
-      syntaxHighlighting(mintHighlightStyle),
-      syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-      errorLineField,
-      keymap.of([
-        ...defaultKeymap,
-        ...historyKeymap,
-        ...foldKeymap,
-        ...searchKeymap,
-        ...closeBracketsKeymap,
-        indentWithTab,
-      ]),
-      EditorView.lineWrapping,
-    ],
-  });
-
-  view.setState(newState);
+  // Reconfigure ONLY the language compartment — keeps doc, undo history,
+  // listeners, cursor and scroll intact (unlike the old full setState rebuild,
+  // which silently killed monitoring/modified-tracking and wiped undo).
+  view.dispatch({ effects: languageCompartment.reconfigure(langExtension) });
 }

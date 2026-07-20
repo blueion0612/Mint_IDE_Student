@@ -27,6 +27,10 @@ if (-not $isAdmin) {
 
 try {
 
+# Set at each warn-and-continue site so the final banner tells the truth
+# instead of unconditionally claiming "complete".
+$script:hadWarnings = $false
+
 Write-Host ""
 Write-Host "==============================" -ForegroundColor Cyan
 Write-Host "  MINT Exam IDE Installer" -ForegroundColor Cyan
@@ -65,11 +69,24 @@ Write-Host ""
 # ─── 1. Portable Python (extracted from Astral python-build-standalone) ───
 Write-Host "[1/5] Setting up portable Python $MINT_PY_VERSION..." -ForegroundColor Yellow
 
-# Already extracted from a previous run? Skip download.
+# Already extracted from a previous run? Skip download — but ONLY if it is the
+# pinned version AND tkinter loads. A prior release shipping e.g. 3.12.10 would
+# otherwise be kept forever, silently breaking the "byte-identical env across
+# all students" invariant; a half-extracted python.exe with broken tcl would
+# also pass. If either check fails, fall through to a clean re-extract (the
+# extract path deletes the stale dir first, so it is re-entrant).
+$pyReuse = $false
 if (Test-Path $MINT_PY_EXE) {
     $ver = & $MINT_PY_EXE --version 2>&1
-    Write-Host "  [OK] Already present: $ver at $MINT_PY_ROOT" -ForegroundColor Green
-} else {
+    $tkOk = (& $MINT_PY_EXE -c "import tkinter; tkinter.Tk().destroy(); print('OK')" 2>&1) -match "OK"
+    if (("$ver" -match [regex]::Escape($MINT_PY_VERSION)) -and $tkOk) {
+        Write-Host "  [OK] Already present: $ver at $MINT_PY_ROOT" -ForegroundColor Green
+        $pyReuse = $true
+    } else {
+        Write-Host "  [..] Present but not pinned $MINT_PY_VERSION (found '$ver', tkinter=$tkOk) — re-extracting." -ForegroundColor Yellow
+    }
+}
+if (-not $pyReuse) {
     # Sanity check: tar.exe ships with Windows 10 1803+. Older builds will
     # not have it. Fall back is manual download instructions.
     if (-not (Test-Cmd "tar")) {
@@ -194,6 +211,7 @@ if (-not (Test-Cmd "winget")) {
     Write-Host "    - Temurin JDK:  https://adoptium.net/" -ForegroundColor Cyan
     Write-Host "    - FFmpeg:       https://www.gyan.dev/ffmpeg/builds/" -ForegroundColor Cyan
     Write-Host "  Continuing without auto-install — Java/C++ run + recording may not work." -ForegroundColor Yellow
+    $script:hadWarnings = $true
 } else {
     $missing = @()
     if (Test-Cmd "node")  { Write-Host "  [OK] Node.js" -ForegroundColor Green } else { Write-Host "  [--] Node.js" -ForegroundColor Red; $missing += "OpenJS.NodeJS.LTS" }
@@ -204,23 +222,42 @@ if (-not (Test-Cmd "winget")) {
         Write-Host "  Installing $($missing.Count) via winget..."
         foreach ($pkg in $missing) {
             Write-Host "    Installing $pkg..."
+            # FFmpeg (Gyan.FFmpeg) is a winget PORTABLE package — its default
+            # scope is USER even in an elevated shell, so when an admin elevates
+            # a DIFFERENT account than the student's, it lands in the admin
+            # profile + admin PATH and the student's session never sees it
+            # (recording fails at exam time while this script's own re-probe
+            # passes). Force machine scope so it goes under %ProgramFiles%\WinGet
+            # with a system PATH entry. Node/JDK are perMachine MSIs already.
+            $scopeArg = @()
+            if ($pkg -eq "Gyan.FFmpeg") { $scopeArg = @("--scope", "machine") }
             try {
-                $wingetOut = winget install -e --id $pkg --accept-source-agreements --accept-package-agreements 2>&1
+                $wingetOut = winget install -e --id $pkg @scopeArg --accept-source-agreements --accept-package-agreements 2>&1
                 if ($LASTEXITCODE -ne 0) {
                     Write-Host "    [WARN] $pkg install exit code $LASTEXITCODE" -ForegroundColor Yellow
                     Write-Host "      $($wingetOut | Out-String)" -ForegroundColor DarkGray
+                    $script:hadWarnings = $true
                 }
             } catch {
                 Write-Host "    [WARN] $pkg install threw: $_" -ForegroundColor Yellow
+                $script:hadWarnings = $true
             }
         }
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-        # Post-install verification — if FFmpeg specifically didn't land,
-        # recording won't work mid-exam. Make sure the student knows.
+        # Post-install verification. Node/JDK/FFmpeg each break a feature if
+        # they didn't actually land, so re-probe all three (not just ffmpeg).
         if (-not (Test-Cmd "ffmpeg")) {
-            Write-Host "  [WARN] ffmpeg still missing after winget install." -ForegroundColor Yellow
-            Write-Host "         Screen recording will not work until this is fixed." -ForegroundColor Yellow
+            Write-Host "  [WARN] ffmpeg still missing after winget install — screen recording will not work." -ForegroundColor Yellow
+            $script:hadWarnings = $true
+        }
+        if (-not (Test-Cmd "node")) {
+            Write-Host "  [WARN] node still missing after winget install — JavaScript/TypeScript run will not work." -ForegroundColor Yellow
+            $script:hadWarnings = $true
+        }
+        if (-not (Test-Cmd "javac")) {
+            Write-Host "  [WARN] javac still missing after winget install — Java run will not work." -ForegroundColor Yellow
+            $script:hadWarnings = $true
         }
     }
 }
@@ -269,11 +306,17 @@ if ($exeAsset) {
     }
 
     Write-Host ""
-    Write-Host "[4/5] Running IDE installer..." -ForegroundColor Yellow
-    $ideProc = Start-Process -FilePath $tmpPath -Wait -PassThru
+    Write-Host "[4/5] Running IDE installer (silent)..." -ForegroundColor Yellow
+    # /S = NSIS silent install (Tauri's NSIS bundler supports it). Without it the
+    # student must click through the Next/Install/Finish wizard — an extra manual
+    # step the one-liner install is supposed to avoid — and cancelling would still
+    # fall through to the "complete!" banner below. Already elevated + perMachine
+    # means no UAC re-prompt.
+    $ideProc = Start-Process -FilePath $tmpPath -ArgumentList "/S" -Wait -PassThru
     Remove-Item $tmpPath -ErrorAction SilentlyContinue
     if ($ideProc.ExitCode -ne 0) {
         Write-Host "  [WARN] IDE installer exit code $($ideProc.ExitCode) — install may be incomplete." -ForegroundColor Yellow
+        $script:hadWarnings = $true
     }
 } else {
     Write-Host "  [FAIL] No installer found in recent releases." -ForegroundColor Red
@@ -284,7 +327,12 @@ if ($exeAsset) {
 
 Write-Host ""
 Write-Host "==============================" -ForegroundColor Cyan
-Write-Host "  Installation complete!" -ForegroundColor Cyan
+if ($script:hadWarnings) {
+    Write-Host "  설치가 완료되었지만 경고가 있었습니다 — 위 [WARN] 항목을 확인하세요." -ForegroundColor Yellow
+    Write-Host "  (WebView2 / FFmpeg 등이 빠지면 IDE 화면이 안 뜨거나 녹화가 안 될 수 있습니다.)" -ForegroundColor Yellow
+} else {
+    Write-Host "  Installation complete!" -ForegroundColor Cyan
+}
 Write-Host "  Python:    $MINT_PY_EXE" -ForegroundColor Gray
 Write-Host "  Launch the IDE from Start Menu. First run opens the setup wizard." -ForegroundColor Gray
 Write-Host "==============================" -ForegroundColor Cyan

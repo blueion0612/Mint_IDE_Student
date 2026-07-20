@@ -4,7 +4,7 @@ mod runner;
 mod setup;
 mod workspace;
 
-use monitor::{ActivityEvent, ActivityLog, KnownWrites, new_known_writes, mark_known_write, mark_known_write_hash};
+use monitor::{ActivityEvent, ActivityLog, KnownWrites, new_known_writes, mark_known_write, mark_known_write_hash, content_fingerprint};
 use recorder::{RecorderState, ScreenRecorder};
 use setup::SetupConfig;
 use workspace::{FileNode, Workspace, WorkspaceState};
@@ -68,7 +68,7 @@ fn run_code(
         if let Some(ref workspace) = *guard {
             // Pin the exact bytes we're about to write so an external overwrite
             // of this file within the grace window is still flagged as tamper.
-            mark_known_write_hash(&kw, &filename, &sha256_hex(code.as_bytes()));
+            mark_known_write_hash(&kw, &filename, &content_fingerprint(code.as_bytes()));
             let _ = workspace.write_file(&filename, &code);
         }
     }
@@ -104,6 +104,13 @@ fn run_code(
 pub static NOTEBOOK_CHILD_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Blocking code execution — for notebooks. Returns stdout+stderr directly.
+///
+/// The blocking work is pushed onto the BLOCKING thread pool, not run inline on
+/// the async runtime. A notebook cell can run for the entire exam (`while True`
+/// until the student hits Stop); occupying an async worker for that long
+/// starves every other `#[tauri::command(async)]` — and on a 1-core machine
+/// (num_cpus = 1 worker) it would make **submit_exam unable to run at all**
+/// while a runaway cell is active.
 #[tauri::command]
 async fn run_code_sync(
     ws: State<'_, WorkspaceState>,
@@ -116,6 +123,21 @@ async fn run_code_sync(
     let _ = language; // currently unused — notebook supplies python only
 
     let cwd = ws.lock().ok().and_then(|g| g.as_ref().map(|w| w.root_path()));
+    let kw = (*known_writes).clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_notebook_blocking(cwd, kw, code, filename, python_path)
+    })
+    .await
+    .map_err(|e| format!("notebook run task failed: {}", e))?
+}
+
+fn run_notebook_blocking(
+    cwd: Option<String>,
+    known_writes: KnownWrites,
+    code: String,
+    filename: String,
+    python_path: Option<String>,
+) -> Result<(String, String, Option<i32>), String> {
     let work_dir = cwd.clone().unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
     let hidden_name = format!(".{}", filename);
     let file_path = std::path::PathBuf::from(&work_dir).join(&hidden_name);
@@ -144,15 +166,70 @@ async fn run_code_sync(
         command.env("MPLBACKEND", "TkAgg");
     }
 
+    // Own process group on Unix so stop_notebook can SIGKILL the whole tree
+    // (a cell using multiprocessing/subprocess otherwise leaves grandchildren
+    // running after Stop). Mirrors the streaming runner.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     // Spawn (instead of .output()) so we can publish the child PID for the
-    // focus monitor's window-exemption, then capture output the same way.
+    // focus monitor's window-exemption.
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
-    let child = command.spawn().map_err(|e| e.to_string())?;
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
     NOTEBOOK_CHILD_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
-    let output_result = child.wait_with_output();
+
+    // Chunked, CAPPED collection + wait on the CHILD, not on pipe EOF.
+    // `wait_with_output()` had the same two flaws the streaming runner already
+    // fixed: (1) a grandchild inheriting the pipe (multiprocessing/subprocess)
+    // kept EOF from ever arriving → the notebook stayed "Running..." forever
+    // for a cell that had finished; (2) it buffered UNBOUNDED output — one
+    // `print` of a giant list OOM'd low-RAM laptops.
+    const NB_STDOUT_CAP: usize = 8 * 1024 * 1024;
+    const NB_STDERR_CAP: usize = 2 * 1024 * 1024;
+    fn spawn_capped_reader<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+        cap: usize,
+    ) -> (std::sync::Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
+        let buf = std::sync::Arc::new(Mutex::new(String::new()));
+        let Some(mut pipe) = pipe else { return (buf, None); };
+        let b2 = buf.clone();
+        let handle = std::thread::spawn(move || {
+            let mut chunk = [0u8; 65536];
+            let mut pending: Vec<u8> = Vec::new();
+            loop {
+                let n = match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                pending.extend_from_slice(&chunk[..n]);
+                runner::push_capped(&b2, cap, &runner::drain_utf8_lossy(&mut pending));
+            }
+            if !pending.is_empty() {
+                runner::push_capped(&b2, cap, &String::from_utf8_lossy(&pending));
+            }
+        });
+        (buf, Some(handle))
+    }
+    let (out_buf, t_out) = spawn_capped_reader(child.stdout.take(), NB_STDOUT_CAP);
+    let (err_buf, t_err) = spawn_capped_reader(child.stderr.take(), NB_STDERR_CAP);
+
+    let wait_result = child.wait();
     NOTEBOOK_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
-    let output = output_result.map_err(|e| e.to_string())?;
+    let status = wait_result.map_err(|e| e.to_string())?;
+    // Drain the readers briefly, then detach (grandchild-held pipe case).
+    if let Some(t) = t_out {
+        runner::join_bounded(t, std::time::Duration::from_secs(3));
+    }
+    if let Some(t) = t_err {
+        runner::join_bounded(t, std::time::Duration::from_secs(3));
+    }
+    let stdout_text = out_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    let stderr_text = err_buf.lock().map(|b| b.clone()).unwrap_or_default();
 
     // Cleanup temp file
     let _ = std::fs::remove_file(&file_path);
@@ -182,11 +259,44 @@ async fn run_code_sync(
         mark_known_write(&known_writes, rel);
     }
 
-    Ok((
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-        output.status.code(),
-    ))
+    Ok((stdout_text, stderr_text, status.code()))
+}
+
+/// Kill the currently-running notebook cell child (published in
+/// NOTEBOOK_CHILD_PID by run_code_sync). Notebook runs are blocking and were
+/// otherwise unstoppable — a `while True:` cell would wedge the notebook for
+/// the whole exam with app-restart the only recovery (which strands the
+/// student's files in the old session workspace). Returns true if a child was
+/// targeted.
+#[tauri::command]
+fn stop_notebook() -> bool {
+    use std::sync::atomic::Ordering;
+    let pid = NOTEBOOK_CHILD_PID.load(Ordering::SeqCst);
+    if pid == 0 {
+        return false;
+    }
+    // taskkill /T takes the child's tree on Windows; on Unix the child is a
+    // process-group leader (process_group(0) at spawn), so `-<pid>` kills the
+    // whole group including multiprocessing/subprocess grandchildren.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000)
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{}", pid)])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+    }
+    true
 }
 
 #[tauri::command]
@@ -204,15 +314,6 @@ fn stop_code(process: State<runner::RunningProcess>) -> bool {
     true
 }
 
-#[tauri::command]
-fn pip_install_packages(
-    app_handle: tauri::AppHandle,
-    packages: Vec<String>,
-    python_path: Option<String>,
-) {
-    runner::pip_install(&packages, python_path.as_deref(), app_handle);
-}
-
 // ===== Screen Recording =====
 
 // Monotonic recording generation. Bumped on every start AND stop so the
@@ -220,7 +321,12 @@ fn pip_install_packages(
 // stops or a new one starts (it never holds the recorder lock).
 static RECORDING_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-#[tauri::command]
+// `async`-flagged so Tauri runs it OFF the main (UI) thread: start-up does
+// multi-second blocking work (device enumeration + per-strategy 1.5s spawn
+// probes + the fresh-process TCC preflight on macOS) that would otherwise
+// beach-ball the whole window, and the frontend re-invokes it every 15s while
+// permission is pending.
+#[tauri::command(async)]
 fn start_recording(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
@@ -253,17 +359,37 @@ fn start_recording(
 
     // Health check — confirms the capture process actually wrote frames.
     // Covers two silent-failure modes:
-    //   1. macOS: Screen Recording / Automation permission denied → 0-byte file.
+    //   1. macOS: Screen Recording permission denied → dead process / 0-byte file.
     //   2. Windows: gdigrab session disconnected (RDP)、antivirus quarantine.
-    // After 3 seconds a healthy 2 fps recording is ≥ tens of KB; a sub-1KB
+    // After 3 seconds a healthy ffmpeg capture is ≥ tens of KB; a sub-1KB
     // file means nothing reached disk. The student gets a clear alert
     // instead of finding out post-exam that the video is unplayable.
+    //
+    // STRATEGY-AWARE: the macOS `screencapture` fallback may produce its .mov
+    // only at STOP time, so for that strategy file size proves nothing — the
+    // probe and watchdog key off process LIVENESS instead. ffmpeg strategies
+    // (all platforms) write progressively, so both size and liveness apply.
     {
         let path_for_check = std::path::PathBuf::from(&path);
         let ah = app_handle.clone();
         let my_epoch = recording_epoch;
+        let size_based = !strategy.contains("screencapture");
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
+            // Liveness snapshot via the managed recorder state. Reaps a dead
+            // child (setting last_error) under a briefly-held lock.
+            let probe_recorder = |ah: &tauri::AppHandle| -> (bool, Option<String>) {
+                let st = ah.state::<RecorderState>();
+                let result = match st.lock() {
+                    Ok(mut r) => {
+                        let alive = r.is_recording();
+                        (alive, r.last_error())
+                    }
+                    Err(_) => (true, None), // poisoned — don't false-alarm
+                };
+                result
+            };
+
             // 1. Fast-failure probe at 3s: permission-denied / immediate 0-byte.
             std::thread::sleep(std::time::Duration::from_secs(3));
             if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
@@ -271,13 +397,22 @@ fn start_recording(
             }
             let bytes = std::fs::metadata(&path_for_check)
                 .map(|m| m.len()).unwrap_or(0);
-            if bytes < 1024 {
+            let (alive, last_err) = probe_recorder(&ah);
+            // Re-check the epoch: stop_recording may hold the recorder lock
+            // through its (bounded) graceful stop, so the probe could have
+            // blocked above while this recording was being stopped.
+            if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
+                return;
+            }
+            let start_failed = if size_based { bytes < 1024 } else { !alive };
+            if start_failed {
                 let msg = if cfg!(target_os = "macos") {
                     format!(
-                        "녹화가 시작되지 않았습니다 ({} bytes after 3s). \
+                        "녹화가 시작되지 않았습니다 ({} bytes after 3s{}). \
                          시스템 설정 > 개인정보 보호 및 보안 > 화면 기록에서 \
                          MINT Exam IDE 권한을 허용하고 IDE를 재시작하세요.",
-                        bytes
+                        bytes,
+                        last_err.as_deref().map(|e| format!(", {}", e)).unwrap_or_default()
                     )
                 } else {
                     format!(
@@ -313,6 +448,30 @@ fn start_recording(
                 if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
                     return; // recording stopped or a new one started
                 }
+                // Dead capture process is definitive on every strategy — alert
+                // once and stop watching (is_recording() also emits nothing on
+                // its own; a dead child otherwise goes unnoticed for the rest
+                // of the exam while "● REC" keeps showing).
+                let (alive, last_err) = probe_recorder(&ah);
+                if RECORDING_EPOCH.load(Ordering::SeqCst) != my_epoch {
+                    return;
+                }
+                if !alive {
+                    let event = ActivityEvent::new(
+                        "recording_health_fail",
+                        &format!(
+                            "녹화 프로세스가 예기치 않게 종료되었습니다{}. 녹화가 더 이상 진행되지 않습니다 — 감독관에게 알리세요.",
+                            last_err.as_deref().map(|e| format!(" ({})", e)).unwrap_or_default()
+                        ),
+                        None,
+                        None,
+                    );
+                    let _ = ah.emit("activity-event", &event);
+                    return;
+                }
+                if !size_based {
+                    continue; // screencapture: size proves nothing until stop
+                }
                 let now_size = std::fs::metadata(&path_for_check).map(|m| m.len()).unwrap_or(0);
                 if now_size > last_size {
                     flat_samples = 0;
@@ -338,7 +497,9 @@ fn start_recording(
     Ok(path)
 }
 
-#[tauri::command]
+// `async`-flagged: graceful_stop_recorder blocks up to 15s waiting for ffmpeg
+// to finalize the moov atom — must not run on the main/UI thread.
+#[tauri::command(async)]
 fn stop_recording(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
@@ -461,12 +622,21 @@ struct PythonInfo {
 
 #[tauri::command]
 fn detect_pythons() -> Result<Vec<PythonInfo>, String> {
-    let mut results = Vec::new();
+    let mut results: Vec<PythonInfo> = Vec::new();
+    // `python3` and `python` frequently resolve to the SAME interpreter (and
+    // conda base can be rediscovered via the envs scan) — dedupe on the
+    // resolved sys.executable path so the selector doesn't list twins.
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push_unique = |results: &mut Vec<PythonInfo>, info: PythonInfo| {
+        if seen_paths.insert(info.path.clone()) {
+            results.push(info);
+        }
+    };
 
     // 1. System pythons
     for cmd in ["python3", "python"] {
         if let Some(info) = probe_python(cmd) {
-            results.push(info);
+            push_unique(&mut results, info);
         }
     }
 
@@ -491,7 +661,7 @@ fn detect_pythons() -> Result<Vec<PythonInfo>, String> {
             let name = base.file_name().unwrap().to_string_lossy().to_string();
             if let Some(mut info) = probe_python(&py.to_string_lossy()) {
                 info.label = format!("conda: {} (base)", name);
-                results.push(info);
+                push_unique(&mut results, info);
             }
         }
     }
@@ -527,7 +697,7 @@ fn detect_pythons() -> Result<Vec<PythonInfo>, String> {
                     let name = p.file_name().unwrap().to_string_lossy().to_string();
                     if let Some(mut info) = probe_python(&py.to_string_lossy()) {
                         info.label = format!("env: {}", name);
-                        results.push(info);
+                        push_unique(&mut results, info);
                     }
                 }
             }
@@ -550,9 +720,16 @@ fn silent_cmd(cmd: &str, args: &[&str]) -> Option<std::process::Output> {
 
 fn probe_python(cmd: &str) -> Option<PythonInfo> {
     let output = silent_cmd(cmd, &["--version"])?;
+    // The Windows Store `python.exe` alias stub exits non-zero and prints
+    // "Python was not found; run without arguments to install..." to stderr —
+    // without these checks it showed up in the interpreter selector as a
+    // garbage "System Python was not found..." entry.
+    if !output.status.success() {
+        return None;
+    }
     let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let ver = if ver.is_empty() { String::from_utf8_lossy(&output.stderr).trim().to_string() } else { ver };
-    if ver.is_empty() { return None; }
+    if !ver.starts_with("Python ") { return None; }
 
     let path_output = silent_cmd(cmd, &["-c", "import sys; print(sys.executable)"])?;
     let real_path = String::from_utf8_lossy(&path_output.stdout).trim().to_string();
@@ -682,9 +859,11 @@ pub struct EnvVerifyResult {
 
 #[tauri::command]
 fn verify_exam_environment(python_path: String) -> EnvVerifyResult {
-    // Single-line Python script (no triple-quotes — passed via -c).
-    // Probes tkinter, then matplotlib(TkAgg), reports JSON on stdout.
-    const PROBE: &str = "\
+    // Single-line Python scripts (no triple-quotes — passed via -c).
+    //
+    // Windows probe: tkinter + matplotlib FORCED to TkAgg — that is exactly
+    // what runner.rs forces at run time there, so the probe must match.
+    const PROBE_TK: &str = "\
 import json,sys\n\
 r={'tkinter_ok':False,'matplotlib_ok':False,'backend':'','errors':[]}\n\
 try:\n\
@@ -704,13 +883,41 @@ except Exception as e:\n\
  r['errors'].append('matplotlib: '+type(e).__name__+': '+str(e))\n\
 sys.stdout.write(json.dumps(r))\n";
 
+    // macOS/Linux probe: let matplotlib auto-select its backend (macOS uses
+    // the native MacOSX backend; runner.rs deliberately does NOT force TkAgg
+    // there). Probing TkAgg used to FAIL on every Mac — brew's python@3.12
+    // ships without tkinter — even though plt.show() works fine at exam time.
+    // tkinter status is still reported for information but does not gate `ok`.
+    const PROBE_DEFAULT: &str = "\
+import json,sys\n\
+r={'tkinter_ok':False,'matplotlib_ok':False,'backend':'','errors':[]}\n\
+try:\n\
+ import tkinter\n\
+ r['tkinter_ok']=True\n\
+except Exception as e:\n\
+ r['errors'].append('tkinter (optional on this OS): '+type(e).__name__+': '+str(e))\n\
+try:\n\
+ import matplotlib\n\
+ from matplotlib import pyplot as plt\n\
+ fig=plt.figure();plt.close(fig)\n\
+ r['matplotlib_ok']=True\n\
+ r['backend']=matplotlib.get_backend()\n\
+except Exception as e:\n\
+ r['errors'].append('matplotlib: '+type(e).__name__+': '+str(e))\n\
+sys.stdout.write(json.dumps(r))\n";
+
+    let windows = cfg!(target_os = "windows");
+    let probe = if windows { PROBE_TK } else { PROBE_DEFAULT };
+
     let mut command = std::process::Command::new(&python_path);
     command
-        .args(["-c", PROBE])
-        .env("MPLBACKEND", "TkAgg")
+        .args(["-c", probe])
         .env("PYTHONIOENCODING", "utf-8")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if windows {
+        command.env("MPLBACKEND", "TkAgg");
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -748,8 +955,11 @@ sys.stdout.write(json.dumps(r))\n";
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
+    // Windows requires tkinter (TkAgg is forced at run time there); macOS/Linux
+    // only need matplotlib itself to work with its auto-selected backend.
+    let ok = if windows { tkinter_ok && matplotlib_ok } else { matplotlib_ok };
     EnvVerifyResult {
-        ok: tkinter_ok && matplotlib_ok,
+        ok,
         tkinter_ok, matplotlib_ok, backend, errors,
     }
 }
@@ -820,43 +1030,6 @@ fn recreate_venv(app_handle: tauri::AppHandle, path: Option<String>) -> Result<S
     Ok(py_exe.to_string_lossy().to_string())
 }
 
-fn install_exam_packages(py_str: &str, app_handle: &tauri::AppHandle) -> Result<String, String> {
-    let _ = app_handle.emit("run-output", runner::RunOutputLine {
-        stream: "system".to_string(),
-        text: "Installing exam packages...\nThis may take a few minutes on first run.\n".to_string(),
-    });
-
-    let packages = [
-        "numpy", "pandas", "matplotlib", "seaborn",
-        "scikit-learn", "scipy", "sympy",
-        "Pillow", "opencv-python-headless",
-        "openpyxl", "requests",
-    ];
-
-    let mut args: Vec<&str> = vec!["-m", "pip", "install"];
-    for pkg in &packages {
-        args.push(pkg);
-    }
-    let _ = silent_cmd(py_str, &args);
-
-    // PyTorch CPU
-    let _ = silent_cmd(py_str, &[
-        "-m", "pip", "install",
-        "torch", "torchvision", "torchaudio",
-        "--index-url", "https://download.pytorch.org/whl/cpu",
-    ]);
-
-    // TensorFlow CPU (may fail on some platforms — that's OK)
-    let _ = silent_cmd(py_str, &["-m", "pip", "install", "tensorflow-cpu"]);
-
-    let _ = app_handle.emit("run-output", runner::RunOutputLine {
-        stream: "system".to_string(),
-        text: "Exam Python environment ready!\n".to_string(),
-    });
-
-    Ok(py_str.to_string())
-}
-
 fn find_system_python() -> Option<String> {
     // Priority 1: MINT-dedicated Python (installed by install-windows.ps1 — ASCII path + tcl/tk verified).
     #[cfg(target_os = "windows")]
@@ -864,6 +1037,38 @@ fn find_system_python() -> Option<String> {
         let mint_py = "C:\\ProgramData\\MINT_Python\\Python312\\python.exe";
         if std::path::Path::new(mint_py).exists() {
             return Some(mint_py.to_string());
+        }
+    }
+
+    // Priority 1 (macOS/Linux): KNOWN LOCATIONS, pinned python3.12 first —
+    // BEFORE probing bare `python3` on PATH. A GUI-launched app on macOS gets
+    // the minimal launchd PATH (/usr/bin:...), where `python3` is the Xcode
+    // CLT's Python 3.9 — a venv built from it can't install the 3.12-pinned
+    // package set (numpy==2.1.3 / matplotlib==3.10.0 / scipy==1.14.1 all
+    // require ≥3.10), so every profile install used to fail on Macs. Mirrors
+    // runner::discover_python's ordering.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut candidates: Vec<String> = vec![
+            "/opt/homebrew/bin/python3.12".to_string(),
+            "/opt/homebrew/opt/python@3.12/bin/python3.12".to_string(),
+            "/usr/local/bin/python3.12".to_string(),
+            "/usr/local/opt/python@3.12/bin/python3.12".to_string(),
+            "/opt/homebrew/bin/python3".to_string(),
+            "/usr/local/bin/python3".to_string(),
+            format!("{}/anaconda3/bin/python", home),
+            format!("{}/miniconda3/bin/python", home),
+            format!("{}/miniforge3/bin/python", home),
+            format!("{}/mambaforge/bin/python", home),
+        ];
+        if let Some(pyenv_root) = std::env::var("PYENV_ROOT").ok() {
+            candidates.push(format!("{}/shims/python3", pyenv_root));
+        }
+        // /usr/bin/python3 (CLT 3.9) is the LAST resort, after the PATH probe
+        // below has also failed — it exists on every Mac but is the wrong env.
+        for p in &candidates {
+            if std::path::Path::new(p).exists() { return Some(p.clone()); }
         }
     }
 
@@ -900,22 +1105,9 @@ fn find_system_python() -> Option<String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // GUI-launched apps on macOS have a stripped PATH; search known locations.
-        let home = std::env::var("HOME").unwrap_or_default();
-        let mut candidates: Vec<String> = vec![
-            "/opt/homebrew/bin/python3".to_string(),
-            "/usr/local/bin/python3".to_string(),
-            "/usr/bin/python3".to_string(),
-            format!("{}/anaconda3/bin/python", home),
-            format!("{}/miniconda3/bin/python", home),
-            format!("{}/miniforge3/bin/python", home),
-            format!("{}/mambaforge/bin/python", home),
-        ];
-        if let Some(pyenv_root) = std::env::var("PYENV_ROOT").ok() {
-            candidates.push(format!("{}/shims/python3", pyenv_root));
-        }
-        for p in &candidates {
-            if std::path::Path::new(p).exists() { return Some(p.clone()); }
+        // Absolute last resort: the always-present CLT python (3.9 on macOS).
+        if std::path::Path::new("/usr/bin/python3").exists() {
+            return Some("/usr/bin/python3".to_string());
         }
     }
 
@@ -980,7 +1172,9 @@ fn ws_import_file(
         .map_err(|e| format!("Failed to read source: {}", e))?;
     // Content-pin the imported bytes (not a blind time grace) so the file's
     // appearance isn't flagged, and only THIS content is excused at that path.
-    mark_known_write_hash(&kw, &rel_dest, &sha256_hex(&content));
+    // (content_fingerprint — a >32MB import must pin the same `meta:` scheme
+    // the scanner computes, or the pin never matches.)
+    mark_known_write_hash(&kw, &rel_dest, &content_fingerprint(&content));
     let full_dest = workspace.resolve_safe_for_write(&rel_dest)?;
     if let Some(parent) = full_dest.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1012,6 +1206,7 @@ fn init_workspace(
     state: State<AppState>,
     ws: State<WorkspaceState>,
     kw: State<KnownWrites>,
+    sb: State<monitor::SharedBaseline>,
     session_name: String,
 ) -> Result<String, String> {
     let base = setup::workspaces_dir();
@@ -1026,6 +1221,7 @@ fn init_workspace(
         log_handle,
         app_handle,
         (*kw).clone(),
+        (*sb).clone(),
     );
 
     *ws.lock().map_err(|e| e.to_string())? = Some(workspace);
@@ -1044,33 +1240,67 @@ fn ws_read_file(ws: State<WorkspaceState>, path: String) -> Result<String, Strin
     guard.as_ref().ok_or("No workspace initialized".to_string())?.read_file(&path)
 }
 
+/// File size without reading content — lets the frontend refuse to mount a
+/// giant file into CodeMirror / the CSV table parser (UI freeze on low-spec
+/// machines) without first pulling the whole file over IPC to find out.
 #[tauri::command]
-fn ws_xlsx_to_csv(ws: State<WorkspaceState>, path: String) -> Result<String, String> {
+fn ws_file_size(ws: State<WorkspaceState>, path: String) -> Result<u64, String> {
+    let guard = ws.lock().map_err(|e| e.to_string())?;
+    let workspace = guard.as_ref().ok_or("No workspace initialized".to_string())?;
+    let full = workspace.resolve_safe_for_write(&path)?;
+    full.metadata().map(|m| m.len()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn ws_xlsx_to_csv(
+    ws: State<WorkspaceState>,
+    path: String,
+    python_path: Option<String>,
+) -> Result<String, String> {
     let guard = ws.lock().map_err(|e| e.to_string())?;
     let workspace = guard.as_ref().ok_or("No workspace initialized")?;
     let full_path = workspace.resolve_safe_for_write(&path)?;
     let full_str = full_path.to_string_lossy().to_string();
 
-    // Use Python pandas to convert xlsx to CSV string
-    let py = find_system_python().ok_or("Python not found")?;
-    let script = format!(
-        "import pandas as pd; df = pd.read_excel(r'{}'); print(df.to_csv(index=False))",
-        full_str
-    );
-    let output = silent_cmd(&py, &["-c", &script]);
+    // Convert xlsx to CSV via pandas. Pass the path through sys.argv, NOT string
+    // interpolation into an r'...' literal — a filename containing a single quote
+    // (legal on macOS/Linux) would otherwise break out of the literal, so a legit
+    // data file fails to open (and it would run injected code).
+    //
+    // Use the EXAM VENV python the frontend passes — pandas is installed there,
+    // not in the base MINT/system python (find_system_python), so the old
+    // base-python call made every .xlsx preview fail on a fresh install.
+    let py = python_path
+        .filter(|p| !p.is_empty())
+        .or_else(find_system_python)
+        .ok_or("Python not found")?;
+    let script = "import sys, pandas as pd; print(pd.read_excel(sys.argv[1]).to_csv(index=False))";
+    let output = silent_cmd(&py, &["-c", script, &full_str]);
     match output {
         Some(o) if o.status.success() => {
             Ok(String::from_utf8_lossy(&o.stdout).to_string())
         }
-        _ => Err("Failed to read Excel file".to_string()),
+        _ => Err("Failed to read Excel file (pandas/openpyxl 필요)".to_string()),
     }
 }
 
 #[tauri::command]
 fn ws_read_file_base64(ws: State<WorkspaceState>, path: String) -> Result<String, String> {
+    // Hard ceiling: the result is base64 (≈1.33×) embedded in a JSON IPC
+    // message and then in a data: URI. A 100MB image would materialize the
+    // bytes, the base64 String, the JSON, and the webview copy all at once —
+    // enough to OOM or freeze a low-RAM laptop.
+    const MAX_BASE64_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
     let guard = ws.lock().map_err(|e| e.to_string())?;
     let workspace = guard.as_ref().ok_or("No workspace initialized".to_string())?;
     let full_path = workspace.resolve_safe_for_write(&path)?;
+    let len = full_path.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > MAX_BASE64_SOURCE_BYTES {
+        return Err(format!(
+            "파일이 너무 큽니다 ({:.1} MB) — 미리보기를 표시할 수 없습니다.",
+            len as f64 / (1024.0 * 1024.0)
+        ));
+    }
     let data = std::fs::read(&full_path).map_err(|e| e.to_string())?;
     use base64::Engine;
     Ok(base64::engine::general_purpose::STANDARD.encode(&data))
@@ -1087,7 +1317,7 @@ fn ws_write_file(
 ) -> Result<(), String> {
     // Content-pinned: an external overwrite of this path within the grace
     // window (different bytes) is still flagged as tampering.
-    mark_known_write_hash(&kw, &path, &sha256_hex(content.as_bytes()));
+    mark_known_write_hash(&kw, &path, &content_fingerprint(content.as_bytes()));
     let guard = ws.lock().map_err(|e| e.to_string())?;
     guard.as_ref().ok_or("No workspace initialized".to_string())?.write_file(&path, &content)?;
     let event = ActivityEvent::new(
@@ -1108,25 +1338,90 @@ fn ws_create_dir(ws: State<WorkspaceState>, kw: State<KnownWrites>, path: String
     guard.as_ref().ok_or("No workspace initialized".to_string())?.create_dir(&path)
 }
 
+/// Register known-writes for an IDE-initiated rename/move of `src` (absolute
+/// path, still at its OLD location) from workspace-relative `old_rel` to
+/// `new_rel`. A directory is handled PER CHILD FILE (dirs themselves aren't
+/// tracked by the integrity scanner): each old child path gets a time-only
+/// deletion grace and each dest child is pinned via `pin_authorized_dest`.
+/// Without this, renaming a folder raises a spurious tamper_new_file +
+/// tamper_deleted for every file inside.
+fn pin_rename_sources(
+    kw: &KnownWrites,
+    shared: &monitor::SharedBaseline,
+    src: &std::path::Path,
+    old_rel: &str,
+    new_rel: &str,
+) {
+    if src.is_dir() {
+        let old_base = old_rel.trim_end_matches('/');
+        let new_base = new_rel.trim_end_matches('/');
+        for (child_rel, child_path) in runner::snapshot_workspace_paths(src) {
+            let old_child = format!("{}/{}", old_base, child_rel);
+            let new_child = format!("{}/{}", new_base, child_rel);
+            mark_known_write(kw, &old_child); // source child disappears — deletion grace
+            pin_authorized_dest(kw, shared, &child_path, &old_child, &new_child);
+        }
+    } else {
+        // Single file: the caller already set the old-path deletion grace.
+        pin_authorized_dest(kw, shared, src, old_rel, new_rel);
+    }
+}
+
+/// Content-pin `new_rel` as a known write ONLY when the source file's current
+/// bytes equal the integrity baseline's last-known-good hash for `old_rel`.
+/// Honest renames (content unchanged since the last poll) stay event-free; a
+/// file an external process modified or created since the last poll does NOT
+/// match the baseline, so its dest is left unpinned and the monitor flags it at
+/// the new path.
+///
+/// Authorization is deliberately gated on the SIGNED BASELINE ALONE — NOT on the
+/// live known_writes pins. Those pins are set for every file a run touches
+/// (runner.rs pins the whole post-run snapshot), so trusting them here would let
+/// a student externally edit a file, trigger any run to pin the tampered bytes,
+/// then rename it to launder the edit with no tamper event. The baseline can
+/// only hold content a poll already accepted (and any divergence from baseline
+/// was itself flagged as tamper_detected at that poll), so it is the one source
+/// of truth an attacker cannot poison inside the sub-poll window.
+///
+/// TRADE-OFF: a file SAVED through the IDE and renamed within the same ~2s poll
+/// gap (before the baseline absorbs the new bytes) is momentarily not baseline-
+/// known, so it raises a one-off tamper_new_file at the destination. This fails
+/// SAFE (over-reports an honest action; a grader sees the paired file_rename)
+/// and is far preferable to the laundering the known_writes branch would open.
+fn pin_authorized_dest(
+    kw: &KnownWrites,
+    shared: &monitor::SharedBaseline,
+    src_child: &std::path::Path,
+    old_rel: &str,
+    new_rel: &str,
+) {
+    let Some(live) = monitor::hash_file_retry(src_child) else { return; };
+    if monitor::shared_baseline_hash(shared, old_rel).as_deref() == Some(live.as_str()) {
+        mark_known_write_hash(kw, new_rel, &live);
+    }
+}
+
 #[tauri::command]
 fn ws_rename(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
     ws: State<WorkspaceState>,
     kw: State<KnownWrites>,
+    sb: State<monitor::SharedBaseline>,
     old_path: String,
     new_path: String,
 ) -> Result<(), String> {
     mark_known_write(&kw, &old_path); // old path disappears — deletion grace
     let guard = ws.lock().map_err(|e| e.to_string())?;
     let workspace = guard.as_ref().ok_or("No workspace initialized".to_string())?;
-    // Content-pin the dest from the SOURCE bytes BEFORE renaming (the same
-    // bytes survive the move), so the new path is already content-known the
-    // instant it appears — no unpinned window for the 2s poll. A content pin
-    // (not a blind time grace) means a delete-then-recreate of a DIFFERENT file
-    // can't be laundered.
+    // Pin the destination from the SOURCE bytes BEFORE renaming, but ONLY if
+    // those bytes match the signed baseline (see pin_authorized_dest) — so the
+    // new path is content-known the instant it appears (no unpinned window for
+    // the 2s poll) while an externally-tampered source is still flagged at the
+    // destination. For a DIRECTORY, do the same per child file (renaming a
+    // folder otherwise raises tamper_new_file + tamper_deleted for every child).
     if let Ok(src) = workspace.resolve_safe_for_write(&old_path) {
-        if let Some(h) = monitor::hash_file_retry(&src) { mark_known_write_hash(&kw, &new_path, &h); }
+        pin_rename_sources(&kw, &sb, &src, &old_path, &new_path);
     }
     workspace.rename(&old_path, &new_path)?;
     let event = ActivityEvent::new(
@@ -1177,6 +1472,7 @@ fn ws_move(
     state: State<AppState>,
     ws: State<WorkspaceState>,
     kw: State<KnownWrites>,
+    sb: State<monitor::SharedBaseline>,
     src_path: String,
     dest_dir: String,
 ) -> Result<String, String> {
@@ -1195,10 +1491,12 @@ fn ws_move(
     }
 
     mark_known_write(&kw, &src_path); // source disappears — deletion grace
-    // Content-pin the dest from the SOURCE bytes BEFORE moving (no unpinned
-    // window; content pin so an unrelated recreate isn't laundered).
+    // Pin the dest from the SOURCE bytes BEFORE moving, gated on the baseline
+    // (see pin_authorized_dest): no unpinned window, but an externally-tampered
+    // source is still flagged at the destination. Directory moves pin every
+    // child file the same way.
     if let Ok(src) = workspace.resolve_safe_for_write(&src_path) {
-        if let Some(h) = monitor::hash_file_retry(&src) { mark_known_write_hash(&kw, &new_path, &h); }
+        pin_rename_sources(&kw, &sb, &src, &src_path, &new_path);
     }
     workspace.rename(&src_path, &new_path)?;
 
@@ -1221,15 +1519,6 @@ struct SubmitResult {
     folder_path: String,
     code_zip: String,
     video_zip: String,
-}
-
-/// SHA-256 hex of arbitrary bytes. Used to pin the exact content the IDE
-/// writes into the integrity monitor's known-writes (content-aware grace).
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 /// Hash the student ID with SHA-256 to produce the zip encryption password.
@@ -1289,7 +1578,10 @@ impl Drop for SubmitGuard {
     }
 }
 
-#[tauri::command]
+// `async`-flagged: submit stops recording (up to 15s graceful finalize), then
+// zips + obfuscates video — seconds of blocking work that must stay off the
+// main/UI thread so the window doesn't freeze during submission.
+#[tauri::command(async)]
 fn submit_exam(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
@@ -1310,15 +1602,20 @@ fn submit_exam(
     }
     let student_id = id_trim.to_string();
 
-    // 1. Stop recording
+    // 1. Stop recording. Bump RECORDING_EPOCH WHILE STILL HOLDING the recorder
+    //    lock (before the guard drops) — the health watchdog re-checks the epoch
+    //    immediately after it acquires the same lock, so bumping under the lock
+    //    guarantees it observes the invalidation and never fires a false
+    //    "recording process died" alert during a legitimate submit. (Bumping
+    //    after releasing the lock left a window where the watchdog could acquire
+    //    the freed lock, see the just-stopped process as not-alive, and alarm.)
     {
         let mut rec = recorder.lock().map_err(|e| e.to_string())?;
         if rec.is_recording() {
             let _ = rec.stop();
         }
+        RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    // Invalidate any recording health watchdog so it doesn't fire during submit.
-    RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     // 2. Workspace root
     let ws_root = {
@@ -1355,9 +1652,12 @@ fn submit_exam(
     //    silently swallowing a failure would ship a submission with missing or
     //    stale evidence while reporting success. Returning Err lets the student
     //    retry while the in-memory log is still intact.
+    //
+    //    ONE snapshot of the event log is taken here and reused for the video
+    //    scoping + manifest below (it was cloned three separate times, each a
+    //    full deep copy of every event in the session).
+    let events = state.activity_log.lock().unwrap().get_events();
     {
-        let events = state.activity_log.lock().unwrap().get_events();
-
         let focus_log: Vec<_> = events.iter()
             .filter(|e| matches!(e.event_type.as_str(),
                 "focus_lost" | "focus_returned" | "session_start" | "exam_submitted"))
@@ -1366,7 +1666,11 @@ fn submit_exam(
         let background_log: Vec<_> = events.iter()
             .filter(|e| matches!(e.event_type.as_str(),
                 "clipboard_internal" | "clipboard_external" | "recording_start" | "recording_stop" | "file_import" |
-                "tamper_detected" | "tamper_new_file" | "tamper_deleted"))
+                "tamper_detected" | "tamper_new_file" | "tamper_deleted" |
+                // Monitoring/recording health failures are anti-cheat-relevant
+                // evidence (they say WHY a signal may be missing) — they were
+                // only in the complete log, not the focused background one.
+                "recording_health_fail" | "monitor_health_fail"))
             .cloned().collect();
 
         let editor_log: Vec<_> = events.iter()
@@ -1408,7 +1712,7 @@ fn submit_exam(
     // recordings belong to this student and (in the manifest below) to compute
     // video offsets. If recording never started this session, there are no
     // recordings of ours to collect.
-    let rec_start_ms: Option<i64> = state.activity_log.lock().unwrap().get_events().iter()
+    let rec_start_ms: Option<i64> = events.iter()
         .find(|e| e.event_type == "recording_start")
         .map(|e| e.epoch_ms);
     // mtime floor (secs), 60s margin for clock/mtime skew. Recordings older
@@ -1511,7 +1815,7 @@ fn submit_exam(
     ];
     let mut suspect_events: Vec<serde_json::Value> = Vec::new();
     if let Some(start) = rec_start_ms {
-        for e in state.activity_log.lock().unwrap().get_events().iter() {
+        for e in events.iter() {
             if !suspect_types.contains(&e.event_type.as_str()) { continue; }
             let offset_s = ((e.epoch_ms - start) as f64) / 1000.0;
             if offset_s < 0.0 { continue; }
@@ -1542,6 +1846,11 @@ fn submit_exam(
         },
         "recording_start_epoch_ms": rec_start_ms,
         "suspect_events": suspect_events,
+        // Partial video loss (some copied, some failed) previously vanished —
+        // only TOTAL loss aborted the submit. Record per-file failures so the
+        // grader can see a submission shipped with fewer recordings than the
+        // session produced.
+        "video_errors": video_errors,
     });
     // Atomic + error-propagating: a missing/empty manifest makes the whole
     // submission invisible to the grader (scan_submissions skips manifest-less
@@ -1570,10 +1879,6 @@ fn submit_exam(
 }
 
 fn create_encrypted_zip(workspace_root: &str, zip_path: &std::path::Path, password: &str) -> Result<(), String> {
-    use std::io::{Read, Write};
-    use zip::write::SimpleFileOptions;
-    use zip::AesMode;
-
     let file = std::fs::File::create(zip_path)
         .map_err(|e| format!("Failed to create zip: {}", e))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -1585,13 +1890,35 @@ fn create_encrypted_zip(workspace_root: &str, zip_path: &std::path::Path, passwo
     Ok(())
 }
 
+/// True if a directory entry is a symlink (any OS) or a Windows reparse point
+/// (junction / mount point). Mirrors the guards in integrity.rs / runner.rs so
+/// the submit zip walker doesn't follow a workspace junction out of bounds or
+/// into an infinite loop.
+fn entry_is_link(entry: &std::fs::DirEntry) -> bool {
+    if let Ok(ft) = entry.file_type() {
+        if ft.is_symlink() {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if let Ok(md) = entry.metadata() {
+            if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn add_dir_to_zip_encrypted<W: std::io::Write + std::io::Seek>(
     zip: &mut zip::ZipWriter<W>,
     dir: &std::path::Path,
     root: &std::path::Path,
     password: &str,
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
     use zip::write::SimpleFileOptions;
     use zip::AesMode;
 
@@ -1601,6 +1928,16 @@ fn add_dir_to_zip_encrypted<W: std::io::Write + std::io::Seek>(
 
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
+        // Never follow symlinks / junctions. A workspace-local junction loop
+        // (`mklink /J`, no admin needed) would otherwise make this recursion
+        // spin until the stack overflows and ABORTS the whole submit — no code
+        // zip, no manifest, submission destroyed — and a junction pointing OUT
+        // of the workspace would bundle external files under a workspace path.
+        // The integrity scanner and workspace snapshot already skip reparse
+        // points; this walker must match them.
+        if entry_is_link(&entry) {
+            continue;
+        }
         let path = entry.path();
         let relative = path.strip_prefix(root)
             .unwrap_or(&path)
@@ -1624,85 +1961,40 @@ fn add_dir_to_zip_encrypted<W: std::io::Write + std::io::Seek>(
                 .compression_method(zip::CompressionMethod::Deflated)
                 .with_aes_encryption(AesMode::Aes256, password);
             zip.start_file(&relative, file_options).map_err(|e| e.to_string())?;
+            // STREAM the file into the zip. read_to_end buffered each member
+            // whole: a student who imported a large dataset spiked RAM by that
+            // file's full size at submit time — the worst possible moment to
+            // OOM on an 8GB exam laptop.
             let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            zip.write_all(&buf).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
 }
-
-fn create_encrypted_video_zip(rec_dir: &std::path::Path, zip_path: &std::path::Path, password: &str) -> Result<(), String> {
-    use std::io::{Read, Write};
-    use zip::write::SimpleFileOptions;
-    use zip::AesMode;
-
-    let file = std::fs::File::create(zip_path)
-        .map_err(|e| format!("Failed to create video zip: {}", e))?;
-    let mut zip = zip::ZipWriter::new(file);
-
-    if rec_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(rec_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map(|e| e == "mp4" || e == "mov").unwrap_or(false) {
-                    let options = SimpleFileOptions::default()
-                        .compression_method(zip::CompressionMethod::Stored)
-                        .with_aes_encryption(AesMode::Aes256, password);
-                    let name = path.file_name().unwrap().to_string_lossy().to_string();
-                    zip.start_file(&name, options).map_err(|e| e.to_string())?;
-                    let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-                    let mut buf = Vec::new();
-                    f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-                    zip.write_all(&buf).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
-
-    zip.finish().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
-    zip: &mut zip::ZipWriter<W>,
-    dir: &std::path::Path,
-    root: &std::path::Path,
-    options: &zip::write::SimpleFileOptions,
-) -> Result<(), String> {
-    use std::io::{Read, Write};
-
-    if !dir.is_dir() { return Ok(()); }
-
-    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if path.is_dir() {
-            zip.add_directory(&format!("{}/", relative), *options).map_err(|e| e.to_string())?;
-            add_dir_to_zip(zip, &path, root, options)?;
-        } else {
-            zip.start_file(&relative, *options).map_err(|e| e.to_string())?;
-            let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            zip.write_all(&buf).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-
 
 // ===== App Entry =====
 
+/// Gate for process exit. The frontend's close guard / submit flow set this
+/// (via allow_exit) right before calling exit(0); a window that is truly gone
+/// (Destroyed) also sets it so a dead-webview close can't leave a headless
+/// zombie. Any OTHER exit request — most importantly macOS Cmd+Q / menu Quit,
+/// which never passes through the JS onCloseRequested guard — is vetoed, so a
+/// student cannot skip the unsaved-work confirm + edit-history flush by
+/// quitting from the menu.
+static EXIT_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+fn allow_exit() {
+    EXIT_ALLOWED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // macOS: if re-launched by screen_capture_authorized_fresh() to read the
+    // current Screen Recording TCC verdict, print it and exit BEFORE any GUI is
+    // created. No-op on other platforms / normal launches.
+    recorder::run_tcc_preflight_and_exit_if_requested();
+
     let activity_log = ActivityLog::new();
     let log_handle = activity_log.get_handle();
 
@@ -1716,6 +2008,7 @@ pub fn run() {
         .manage(Mutex::new(ScreenRecorder::new()) as RecorderState)
         .manage(Mutex::new(None::<Workspace>) as WorkspaceState)
         .manage(new_known_writes())
+        .manage(monitor::new_shared_baseline())
         .manage(runner::new_running_process())
         .invoke_handler(tauri::generate_handler![
             get_activity_log,
@@ -1725,7 +2018,8 @@ pub fn run() {
             run_code,
             run_code_sync,
             stop_code,
-            pip_install_packages,
+            stop_notebook,
+            allow_exit,
             start_recording,
             stop_recording,
             is_recording,
@@ -1746,6 +2040,7 @@ pub fn run() {
             init_workspace,
             ws_list_tree,
             ws_read_file,
+            ws_file_size,
             ws_read_file_base64,
             ws_xlsx_to_csv,
             ws_write_file,
@@ -1769,6 +2064,49 @@ pub fn run() {
             monitor::start_focus_monitor(log_handle.clone(), app_handle, running);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running MINT Exam IDE");
+        .build(tauri::generate_context!())
+        .expect("error while running MINT Exam IDE")
+        .run(|app_handle, event| {
+            use std::sync::atomic::Ordering;
+            match event {
+                // The window is really gone (close guard already ran, or the
+                // webview died) — from here on, exiting is always legitimate.
+                tauri::RunEvent::WindowEvent {
+                    event: tauri::WindowEvent::Destroyed, ..
+                } => {
+                    EXIT_ALLOWED.store(true, Ordering::SeqCst);
+                }
+                // Last-chance cleanup. The exit that follows is
+                // std::process::exit — NO destructors run, so without this an
+                // active ffmpeg child was ORPHANED and kept recording the
+                // desktop indefinitely after the IDE closed (and a running
+                // python child kept executing). Stopping the recorder here also
+                // finalizes the mp4's moov atom so the last segment stays
+                // playable even on a quit-without-submit.
+                tauri::RunEvent::Exit => {
+                    RECORDING_EPOCH.fetch_add(1, Ordering::SeqCst);
+                    if let Some(rec) = app_handle.try_state::<RecorderState>() {
+                        if let Ok(mut r) = rec.lock() {
+                            let _ = r.stop();
+                        }
+                    }
+                    if let Some(proc) = app_handle.try_state::<runner::RunningProcess>() {
+                        if let Some(child) =
+                            proc.lock().ok().and_then(|mut g| g.take().map(|(_, c)| c))
+                        {
+                            runner::stop_taken_child(child);
+                        }
+                    }
+                    let _ = stop_notebook();
+                }
+                // Cmd+Q / menu Quit / stray app.exit: veto unless the frontend
+                // explicitly authorized it (allow_exit before exit(0)).
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    if !EXIT_ALLOWED.load(Ordering::SeqCst) {
+                        api.prevent_exit();
+                    }
+                }
+                _ => {}
+            }
+        });
 }

@@ -19,6 +19,12 @@ export interface EditEntry {
 const history: EditEntry[] = [];
 let currentFile = "";
 let lastInputSource: string = "type";
+// When the paste/type mark was set. A paste that inserts nothing (image-only
+// clipboard → CodeMirror fires no transaction) would otherwise leave the
+// "paste" mark latched and mislabel the NEXT typed keystroke as a paste — a
+// false integrity flag. Honor a "paste" mark only if it is fresh.
+let lastInputSourceAt = 0;
+const PASTE_MARK_TTL_MS = 1000;
 
 // CJK ranges that signal IME composition output — if any of these appear,
 // treat a multi-char insertion as a typed keystroke (one IME commit = one
@@ -39,6 +45,7 @@ export function setCurrentFile(path: string): void {
 
 export function markNextInputSource(source: "type" | "paste"): void {
   lastInputSource = source;
+  lastInputSourceAt = Date.now();
 }
 
 export function recordTransaction(
@@ -47,7 +54,12 @@ export function recordTransaction(
 ): void {
   const now = Date.now();
 
+  // Expire a stale "paste" mark: if the paste produced no transaction (e.g.
+  // image-only clipboard) the mark must not carry over to a later keystroke.
   let src = lastInputSource;
+  if (src === "paste" && now - lastInputSourceAt > PASTE_MARK_TTL_MS) {
+    src = "type";
+  }
   if (userEvent) {
     if (userEvent.startsWith("undo")) src = "undo";
     else if (userEvent.startsWith("redo")) src = "redo";

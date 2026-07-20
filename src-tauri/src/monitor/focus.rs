@@ -13,9 +13,38 @@ pub fn start_focus_monitor(
     thread::spawn(move || {
         let mut was_focused = true;
         let mut lost_focus_at: Option<i64> = None;
+        #[cfg(target_os = "macos")]
+        let mut automation_denial_reported = false;
+
+        // Windows uses cheap in-process Win32 calls, so poll fast. macOS spawns
+        // an osascript process per sample (fork+exec + AppleEvent round-trip),
+        // which is far heavier — poll less often to cut process churn / battery.
+        #[cfg(target_os = "macos")]
+        const POLL_MS: u64 = 1000;
+        #[cfg(not(target_os = "macos"))]
+        const POLL_MS: u64 = 250;
 
         loop {
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(POLL_MS));
+
+            // macOS: osascript needs the Automation (Apple Events → System
+            // Events) permission. If it has been denied, every query fails —
+            // surface that ONCE, loudly, instead of silently monitoring
+            // nothing for the whole exam.
+            #[cfg(target_os = "macos")]
+            if !automation_denial_reported
+                && AUTOMATION_DENIED.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                automation_denial_reported = true;
+                let event = ActivityEvent::new(
+                    "monitor_health_fail",
+                    "포커스/클립보드 모니터링 권한이 없습니다. 시스템 설정 > 개인정보 보호 및 보안 > 자동화에서 'MINT Exam IDE' → 'System Events'를 허용한 뒤 IDE를 재시작하세요.",
+                    None,
+                    None,
+                );
+                log.add_event(event.clone());
+                let _ = app_handle.emit("activity-event", &event);
+            }
 
             // The student's own program window (matplotlib/tkinter, same python
             // process) lives in the run-child PID — exempt that exact PID so
@@ -31,15 +60,15 @@ pub fn start_focus_monitor(
                     let nb = crate::NOTEBOOK_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
                     if nb != 0 { Some(nb) } else { None }
                 });
-            let (is_our_app, foreground_app) = check_foreground_window(run_child_pid);
+            // None = indeterminate (query failed) — keep the previous state
+            // rather than fabricating a focus_lost with an empty app name.
+            let Some((is_our_app, foreground_app)) = check_foreground_window(run_child_pid) else {
+                continue;
+            };
 
             if was_focused && !is_our_app {
                 lost_focus_at = Some(chrono::Local::now().timestamp_millis());
-                let detail = if foreground_app.contains(" — \"") || foreground_app.contains(" (\"") {
-                    format!("Switched to: {}", foreground_app)
-                } else {
-                    format!("Switched to: {}", foreground_app)
-                };
+                let detail = format!("Switched to: {}", foreground_app);
                 let event = ActivityEvent::new("focus_lost", &detail, None, None);
                 log.add_event(event.clone());
                 let _ = app_handle.emit("activity-event", &event);
@@ -60,7 +89,7 @@ pub fn start_focus_monitor(
 }
 
 #[cfg(target_os = "windows")]
-fn check_foreground_window(run_child_pid: Option<u32>) -> (bool, String) {
+fn check_foreground_window(run_child_pid: Option<u32>) -> Option<(bool, String)> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -89,7 +118,8 @@ fn check_foreground_window(run_child_pid: Option<u32>) -> (bool, String) {
     unsafe {
         let fg_hwnd = GetForegroundWindow();
         if fg_hwnd == 0 {
-            return (false, "unknown".to_string());
+            // No foreground window (session transition) — indeterminate.
+            return None;
         }
 
         let mut fg_pid: u32 = 0;
@@ -124,10 +154,14 @@ fn check_foreground_window(run_child_pid: Option<u32>) -> (bool, String) {
         // our process (our own Tauri WebView2 child). Matching the bare
         // basename treated ANY WebView2-hosted app (Office, chat apps, …) as
         // self, silently suppressing focus_lost when a student switched to one.
+        // MEMOIZED: while the student works IN the IDE, our own WebView2 child
+        // is the foreground window on every 250ms poll — an unmemoized
+        // descendant check snapshotted the ENTIRE process table 4×/second for
+        // the whole exam (visible CPU cost on low-spec machines).
         let is_ours = fg_pid == our_pid
             || Some(fg_pid) == run_child_pid
             || (raw_exe.eq_ignore_ascii_case("msedgewebview2.exe")
-                && pid_is_descendant_of(fg_pid, our_pid));
+                && descendant_of_us_cached(fg_pid, our_pid));
 
         let exe_name = if is_ours {
             "MINT Exam IDE".to_string()
@@ -154,31 +188,104 @@ fn check_foreground_window(run_child_pid: Option<u32>) -> (bool, String) {
         } else {
             format!("{} — \"{}\"", exe_name, title)
         };
-        (is_ours, label)
+        Some((is_ours, label))
+    }
+}
+
+/// Set once when osascript reports the Automation permission denial (-1743);
+/// the monitor loop turns it into a one-time monitor_health_fail alert.
+#[cfg(target_os = "macos")]
+pub(crate) static AUTOMATION_DENIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Query the frontmost app's {name, unix id} in ONE osascript round-trip.
+/// Returns None when the query fails (Automation permission denied, System
+/// Events busy) so the caller keeps its previous focus state instead of
+/// logging a bogus focus_lost with an empty name.
+#[cfg(target_os = "macos")]
+pub(crate) fn frontmost_app_macos() -> Option<(String, Option<u32>)> {
+    use std::process::Command;
+
+    // `with timeout` bounds a wedged System Events: without it, osascript
+    // inherits AppleScript's default 2-minute Apple-Event timeout, which would
+    // stall this monitor thread for two minutes on a single bad sample.
+    let output = Command::new("osascript")
+        .args(["-e", "with timeout of 2 seconds\ntell application \"System Events\" to get {name, unix id} of (first application process whose frontmost is true)\nend timeout"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        // errAEEventNotPermitted — the app was denied Automation access (or
+        // NSAppleEventsUsageDescription is missing). Every future call will
+        // fail the same way, so latch it for the one-time alert.
+        if err.contains("-1743") || err.contains("1743") {
+            AUTOMATION_DENIED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    // Output form: "AppName, 1234". App names may themselves contain ", " so
+    // split at the LAST separator.
+    match text.rsplit_once(", ") {
+        Some((name, id)) => {
+            let pid = id.trim().parse::<u32>().ok();
+            Some((name.trim().to_string(), pid))
+        }
+        None => Some((text, None)),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn check_foreground_window(_run_child_pid: Option<u32>) -> (bool, String) {
-    use std::process::Command;
-
-    let output = Command::new("osascript")
-        .args(["-e", "tell application \"System Events\" to get name of first application process whose frontmost is true"])
-        .output();
-
-    match output {
-        Ok(out) => {
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let is_ours = name.contains("MINT") || name.contains("mint-exam-ide");
-            (is_ours, name)
-        }
-        Err(_) => (false, "unknown".to_string()),
-    }
+fn check_foreground_window(run_child_pid: Option<u32>) -> Option<(bool, String)> {
+    let (name, fg_pid) = frontmost_app_macos()?;
+    let our_pid = std::process::id();
+    // PID equality is the authoritative self-test; when a PID is available it
+    // ALONE decides. The name comparison is only a fallback for the rare case
+    // System Events returned no unix id — and it is EXACT, not contains():
+    // a substring match let a student rename any app to "MINT <something>" and
+    // have every switch to it silently exempted from focus_lost.
+    // The run-child exemption mirrors Windows: the student's own
+    // matplotlib/tkinter window lives in the run/notebook python process.
+    let is_ours = match fg_pid {
+        Some(p) => p == our_pid || Some(p) == run_child_pid,
+        None => name == "MINT Exam IDE" || name == "mint-exam-ide",
+    };
+    Some((is_ours, name))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn check_foreground_window(_run_child_pid: Option<u32>) -> (bool, String) {
-    (true, "unknown".to_string())
+fn check_foreground_window(_run_child_pid: Option<u32>) -> Option<(bool, String)> {
+    Some((true, "unknown".to_string()))
+}
+
+/// Memoized `pid_is_descendant_of` for the focus poll's hot path. Caches the
+/// verdict for the LAST queried pid only — the foreground window does not
+/// change 4×/second, so this collapses the steady-state case (our own WebView2
+/// child in front) to a single process-table snapshot per focus change instead
+/// of one every 250ms. A pid reused by a different process would need to ALSO
+/// be named msedgewebview2.exe to reach this path, so a stale verdict is not a
+/// realistic bypass.
+#[cfg(target_os = "windows")]
+fn descendant_of_us_cached(pid: u32, ancestor: u32) -> bool {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(u32, u32, bool)>> = Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((cached_pid, cached_anc, verdict)) = *guard {
+            if cached_pid == pid && cached_anc == ancestor {
+                return verdict;
+            }
+        }
+    }
+    let verdict = pid_is_descendant_of(pid, ancestor);
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((pid, ancestor, verdict));
+    }
+    verdict
 }
 
 /// Walk the parent-PID chain from `pid` upward; true if `ancestor` is reached.

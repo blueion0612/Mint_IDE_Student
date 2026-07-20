@@ -159,8 +159,41 @@ pub(crate) fn hide_directory(path: &Path) {
     }
 }
 
+/// True if a directory entry is a symlink (any OS) or a Windows reparse point
+/// (junction / mount point). Mirrors the guards in integrity.rs / runner.rs /
+/// lib.rs — the file-tree walker must never follow links: a workspace-local
+/// junction loop (`mklink /J loop .`, no admin needed) would otherwise recurse
+/// until stack overflow and ABORT the whole IDE process mid-exam.
+fn entry_is_link(entry: &std::fs::DirEntry) -> bool {
+    if let Ok(ft) = entry.file_type() {
+        if ft.is_symlink() {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if let Ok(md) = entry.metadata() {
+            if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn scan_dir(dir: &Path, root: &Path) -> Result<Vec<FileNode>, String> {
+    scan_dir_depth(dir, root, 0)
+}
+
+fn scan_dir_depth(dir: &Path, root: &Path, depth: u32) -> Result<Vec<FileNode>, String> {
     let mut entries = Vec::new();
+    // Depth backstop: even if a reparse point slips past entry_is_link, a loop
+    // cannot crash the app via unbounded recursion.
+    if depth > 64 {
+        return Ok(entries);
+    }
 
     let read_dir = std::fs::read_dir(dir)
         .map_err(|e| format!("Failed to read directory: {}", e))?;
@@ -178,9 +211,13 @@ fn scan_dir(dir: &Path, root: &Path) -> Result<Vec<FileNode>, String> {
     });
 
     for entry in items {
+        if entry_is_link(&entry) { continue; }
         let name = entry.file_name().to_string_lossy().to_string();
-        // Hide dot-prefix files (temp notebook files) and log files
-        if name.starts_with('.') || name.starts_with('_') { continue; }
+        // Hide dotfiles (notebook temps, .mint_baseline*) and the IDE's own
+        // log artifacts. Do NOT hide every `_`-prefixed name — that made the
+        // student's own files like `utils/__init__.py` invisible in the tree
+        // while they still existed (and mattered for imports).
+        if name.starts_with('.') || name.starts_with("_log_") { continue; }
         let full_path = entry.path();
         let relative = full_path.strip_prefix(root)
             .unwrap_or(&full_path)
@@ -189,7 +226,7 @@ fn scan_dir(dir: &Path, root: &Path) -> Result<Vec<FileNode>, String> {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
         let children = if is_dir {
-            scan_dir(&full_path, root)?
+            scan_dir_depth(&full_path, root, depth + 1)?
         } else {
             Vec::new()
         };

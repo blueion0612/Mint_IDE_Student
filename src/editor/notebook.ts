@@ -18,9 +18,41 @@ let onModified: (() => void) | null = null;
 const CELL_MARKER = "__MINT_CELL_";
 
 let nbRunning = false;
+let nbStopRequested = false;
+
+// Per-cell output cap. The backend now returns up to 8MB of captured stdout;
+// pushing that through esc() into innerHTML froze the webview, and storing it
+// in every cell bloated the saved .ipynb (and the submission zip). Jupyter
+// itself truncates long stream output the same way.
+const MAX_CELL_OUTPUT_CHARS = 200_000;
+
+function capOutput(text: string): string {
+  if (text.length <= MAX_CELL_OUTPUT_CHARS) return text;
+  const kept = text.slice(0, MAX_CELL_OUTPUT_CHARS);
+  return `${kept}\n\n[출력이 너무 길어 잘렸습니다 — 전체 ${text.length.toLocaleString()}자 중 ${MAX_CELL_OUTPUT_CHARS.toLocaleString()}자만 표시]`;
+}
 export function isNotebookRunning(): boolean { return nbRunning; }
 export function isNotebookActive(): boolean { return cells.length > 0; }
 export function clearNotebook(): void { cells = []; notebookPath = ""; onModified = null; }
+
+/// Kill the running notebook cell (backend kills NOTEBOOK_CHILD_PID). Without
+/// this, a `while True:` cell wedges the notebook for the whole exam with app
+/// restart — which strands the student's files in the old session — the only
+/// escape. run_code_sync returns once the child dies, clearing nbRunning.
+export async function stopNotebook(): Promise<void> {
+  if (!nbRunning) return;
+  nbStopRequested = true;
+  try { await invoke("stop_notebook"); } catch { /* best effort */ }
+  updateNbToolbarRunning();
+}
+
+function updateNbToolbarRunning(): void {
+  const stopBtn = document.getElementById("nb-stop") as HTMLButtonElement | null;
+  const runAllBtn = document.getElementById("nb-run-all") as HTMLButtonElement | null;
+  if (stopBtn) stopBtn.style.display = nbRunning ? "" : "none";
+  if (runAllBtn) runAllBtn.disabled = nbRunning;
+  document.querySelectorAll<HTMLButtonElement>(".nb-run-cell").forEach((b) => { b.disabled = nbRunning; });
+}
 
 export function getNotebookJSON(): string {
   const nbCells = cells.map((c) => {
@@ -53,6 +85,7 @@ export function mountNotebook(container: HTMLElement, content: string, filePath:
   toolbar.className = "nb-toolbar";
   toolbar.innerHTML = `
     <button class="btn btn-run nb-btn" id="nb-run-all">&#9654; Run All</button>
+    <button class="btn nb-btn" id="nb-stop" style="display:none">&#9632; Stop</button>
     <button class="btn nb-btn" id="nb-add-code">+ Code</button>
     <button class="btn nb-btn" id="nb-add-md">+ Markdown</button>
   `;
@@ -77,6 +110,7 @@ export function mountNotebook(container: HTMLElement, content: string, filePath:
   container.appendChild(wrapper);
 
   document.getElementById("nb-run-all")!.addEventListener("click", runAllCells);
+  document.getElementById("nb-stop")!.addEventListener("click", stopNotebook);
   document.getElementById("nb-add-code")!.addEventListener("click", () => { addCellToDOM(document.getElementById("nb-cells")!, "code", "", ""); onModified?.(); });
   document.getElementById("nb-add-md")!.addEventListener("click", () => { addCellToDOM(document.getElementById("nb-cells")!, "markdown", "", ""); onModified?.(); });
 }
@@ -145,6 +179,8 @@ async function runAllCells(): Promise<void> {
   const codeCells: CellState[] = cells.filter(c => c.type === "code");
   if (codeCells.length === 0 || nbRunning) return;
   nbRunning = true;
+  nbStopRequested = false;
+  updateNbToolbarRunning();
 
   for (const cell of codeCells) {
     const out = cell.element.querySelector(".nb-cell-output") as HTMLElement;
@@ -170,7 +206,7 @@ async function runAllCells(): Promise<void> {
     for (let i = 1; i < parts.length; i += 2) {
       if (parts[i] === "END") break;
       const ci = parseInt(parts[i]);
-      const text = (parts[i + 1] || "").trim();
+      const text = capOutput((parts[i + 1] || "").trim());
       if (ci >= 0 && ci < codeCells.length) {
         const outEl = codeCells[ci].element.querySelector(".nb-cell-output") as HTMLElement;
         codeCells[ci].output = text;
@@ -194,21 +230,31 @@ async function runAllCells(): Promise<void> {
         }
       }
       const errCell = codeCells[errorCellIdx].element.querySelector(".nb-cell-output") as HTMLElement;
-      errCell.innerHTML += `<div class="nb-stderr">${esc(stderr)}</div>`;
+      errCell.innerHTML += `<div class="nb-stderr">${esc(capOutput(stderr))}</div>`;
       // Keep stdout part as success, only add stderr indicator
     }
   } catch (e) {
     const last = codeCells[codeCells.length - 1].element.querySelector(".nb-cell-output") as HTMLElement;
-    last.textContent = String(e);
+    last.textContent = nbStopRequested ? "중지됨 (Stopped)" : String(e);
     last.className = "nb-cell-output error";
   }
 
+  if (nbStopRequested) {
+    for (const cell of codeCells) {
+      const out = cell.element.querySelector(".nb-cell-output") as HTMLElement;
+      if (out.classList.contains("running")) { out.textContent = "중지됨 (Stopped)"; out.className = "nb-cell-output error"; }
+    }
+  }
   nbRunning = false;
+  nbStopRequested = false;
+  updateNbToolbarRunning();
 }
 
 async function runSingleCell(targetIdx: number): Promise<void> {
   if (nbRunning || cells[targetIdx]?.type !== "code") return;
   nbRunning = true;
+  nbStopRequested = false;
+  updateNbToolbarRunning();
 
   const outEl = cells[targetIdx].element.querySelector(".nb-cell-output") as HTMLElement;
   outEl.textContent = "Running...";
@@ -229,25 +275,31 @@ async function runSingleCell(targetIdx: number): Promise<void> {
     const stderr = result[1];
 
     const pos = stdout.indexOf(`${CELL_MARKER}TARGET__`);
-    const text = pos >= 0 ? stdout.substring(pos + `${CELL_MARKER}TARGET__`.length).trim() : stdout.trim();
+    const raw = pos >= 0 ? stdout.substring(pos + `${CELL_MARKER}TARGET__`.length).trim() : stdout.trim();
+    const text = capOutput(raw);
 
     cells[targetIdx].output = text;
     outEl.innerHTML = esc(text || "(no output)") + detectImages(text);
     outEl.className = "nb-cell-output success";
-    if (stderr.trim()) outEl.innerHTML += `<div class="nb-stderr">${esc(stderr)}</div>`;
+    if (stderr.trim()) outEl.innerHTML += `<div class="nb-stderr">${esc(capOutput(stderr))}</div>`;
   } catch (e) {
-    outEl.textContent = String(e);
+    outEl.textContent = nbStopRequested ? "중지됨 (Stopped)" : String(e);
     outEl.className = "nb-cell-output error";
   }
 
   nbRunning = false;
+  nbStopRequested = false;
+  updateNbToolbarRunning();
 }
 
 function detectImages(text: string): string {
   const matches = text.match(/[\w/\\.-]+\.png/gi);
   if (!matches) return "";
   let html = "";
-  for (const img of matches) {
+  // Bound it: a cell that prints many ".png"-looking strings would otherwise
+  // create one <img> + one base64 IPC read per match.
+  const unique = [...new Set(matches)].slice(0, 8);
+  for (const img of unique) {
     const name = img.split(/[/\\]/).pop() || img;
     html += `<div class="nb-cell-image"><img data-path="${name}" class="nb-img-pending" /><div class="nb-img-label">${name}</div></div>`;
   }

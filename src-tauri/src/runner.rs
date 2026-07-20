@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,13 @@ use tauri::{AppHandle, Emitter};
 const EMIT_BATCH_INTERVAL_MS: u64 = 50;
 const EMIT_BATCH_MAX_BYTES: usize = 8192;
 const MAX_OUTPUT_LINES_BEFORE_AUTO_STOP: u64 = 200_000;
+/// Byte-based auto-stop companion to the line cap. A program that prints one
+/// enormous line (`print(list(range(10**8)))` — a real student mistake) or
+/// spams without newlines never trips the LINE cap; before the chunked reader
+/// this OOM'd the IDE on low-RAM laptops.
+const MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP: u64 = 64 * 1024 * 1024;
+/// Retained-in-RAM cap for the collected stdout (run-done payload).
+const STDOUT_BUF_CAP_BYTES: usize = 8 * 1024 * 1024;
 
 // Cached Python path — found once, reused forever
 static CACHED_PYTHON: Mutex<Option<String>> = Mutex::new(None);
@@ -241,82 +248,139 @@ pub fn execute_code_streaming(
         let sc1 = stdout_collected.clone();
         let sc2 = stderr_collected.clone();
 
-        // stdout: batch lines into ~50ms chunks to avoid frontend event flood.
-        // Auto-stop if output line count exceeds the safety cap.
+        // stdout: CHUNKED reader (64KB), batched into ~50ms emits. Chunking —
+        // not `lines()` — is what bounds memory: BufRead::lines() buffers an
+        // entire line before returning it, so a single newline-less giant line
+        // was held in RAM in full (and shipped to the webview in one event).
+        // Chunking also streams partial lines, so `print(x, end="")` prompts
+        // and `\r` progress bars now appear live instead of only at exit.
+        // Auto-stop on EITHER the line cap or the total-bytes cap.
         let line_counter = Arc::new(AtomicU64::new(0));
+        let byte_counter = Arc::new(AtomicU64::new(0));
         let lc1 = line_counter.clone();
+        let bc1 = byte_counter.clone();
         let proc_handle1 = process_handle.clone();
         let t1 = thread::spawn(move || -> bool {
             let mut auto_stopped = false;
-            if let Some(out) = stdout {
-                let reader = BufReader::new(out);
+            if let Some(mut out) = stdout {
+                use std::io::Read;
+                let mut chunk = [0u8; 65536];
+                let mut pending: Vec<u8> = Vec::new();
                 let mut buffer = String::new();
                 let mut last_flush = Instant::now();
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        let count = lc1.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count > MAX_OUTPUT_LINES_BEFORE_AUTO_STOP {
-                            if !buffer.is_empty() {
-                                sc1.lock().unwrap().push_str(&buffer);
-                                emit_line(&ah1, "stdout", &buffer);
-                                buffer.clear();
-                            }
-                            emit_line(&ah1, "system",
-                                &format!("\n[OUTPUT LIMIT EXCEEDED — {} lines. Auto-stopping process.]\n", MAX_OUTPUT_LINES_BEFORE_AUTO_STOP));
-                            stop_process(&proc_handle1);
-                            auto_stopped = true;
-                            break;
-                        }
-                        buffer.push_str(&l);
-                        buffer.push('\n');
-                        if buffer.len() >= EMIT_BATCH_MAX_BYTES
-                            || last_flush.elapsed() >= Duration::from_millis(EMIT_BATCH_INTERVAL_MS)
-                        {
-                            sc1.lock().unwrap().push_str(&buffer);
+                loop {
+                    let n = match out.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    let nl = chunk[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+                    let lines_so_far = lc1.fetch_add(nl, Ordering::Relaxed) + nl;
+                    let bytes_so_far = bc1.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                    pending.extend_from_slice(&chunk[..n]);
+                    buffer.push_str(&drain_utf8_lossy(&mut pending));
+
+                    let over_lines = lines_so_far > MAX_OUTPUT_LINES_BEFORE_AUTO_STOP;
+                    let over_bytes = bytes_so_far > MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP;
+                    if over_lines || over_bytes {
+                        if !buffer.is_empty() {
+                            push_capped(&sc1, STDOUT_BUF_CAP_BYTES, &buffer);
                             emit_line(&ah1, "stdout", &buffer);
                             buffer.clear();
-                            last_flush = Instant::now();
                         }
+                        let what = if over_lines {
+                            format!("{} lines", MAX_OUTPUT_LINES_BEFORE_AUTO_STOP)
+                        } else {
+                            format!("{} MB", MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP / (1024 * 1024))
+                        };
+                        emit_line(&ah1, "system",
+                            &format!("\n[OUTPUT LIMIT EXCEEDED — {}. Auto-stopping process.]\n", what));
+                        stop_process_generation(&proc_handle1, my_id);
+                        auto_stopped = true;
+                        break;
+                    }
+                    if buffer.len() >= EMIT_BATCH_MAX_BYTES
+                        || last_flush.elapsed() >= Duration::from_millis(EMIT_BATCH_INTERVAL_MS)
+                    {
+                        push_capped(&sc1, STDOUT_BUF_CAP_BYTES, &buffer);
+                        emit_line(&ah1, "stdout", &buffer);
+                        buffer.clear();
+                        last_flush = Instant::now();
                     }
                 }
-                if !auto_stopped && !buffer.is_empty() {
-                    sc1.lock().unwrap().push_str(&buffer);
-                    emit_line(&ah1, "stdout", &buffer);
+                if !auto_stopped {
+                    // Flush any decodable remainder + a lossy tail (incomplete
+                    // final multi-byte char at EOF).
+                    buffer.push_str(&drain_utf8_lossy(&mut pending));
+                    if !pending.is_empty() {
+                        buffer.push_str(&String::from_utf8_lossy(&pending));
+                    }
+                    if !buffer.is_empty() {
+                        push_capped(&sc1, STDOUT_BUF_CAP_BYTES, &buffer);
+                        emit_line(&ah1, "stdout", &buffer);
+                    }
                 }
             }
             auto_stopped
         });
 
-        // stderr: collect silently, display AFTER stdout finishes
+        // stderr: collect silently (chunked, capped), display AFTER stdout
+        // finishes. Counts toward the SAME line/byte auto-stop caps as stdout —
+        // a program that spams only stderr (`logging`/`warnings` default there)
+        // must not evade them.
+        const STDERR_BUF_CAP_BYTES: usize = 4 * 1024 * 1024; // 4 MB retained
+        let lc2 = line_counter.clone();
+        let bc2 = byte_counter.clone();
+        let proc_handle2 = process_handle.clone();
+        let ah2 = app_handle.clone();
         let t2 = thread::spawn(move || {
-            if let Some(err) = stderr {
-                let reader = BufReader::new(err);
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        sc2.lock().unwrap().push_str(&format!("{}\n", l));
+            if let Some(mut err) = stderr {
+                use std::io::Read;
+                let mut chunk = [0u8; 65536];
+                let mut pending: Vec<u8> = Vec::new();
+                loop {
+                    let n = match err.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    let nl = chunk[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+                    let lines_so_far = lc2.fetch_add(nl, Ordering::Relaxed) + nl;
+                    let bytes_so_far = bc2.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                    pending.extend_from_slice(&chunk[..n]);
+                    push_capped(&sc2, STDERR_BUF_CAP_BYTES, &drain_utf8_lossy(&mut pending));
+                    let over_lines = lines_so_far > MAX_OUTPUT_LINES_BEFORE_AUTO_STOP;
+                    if over_lines || bytes_so_far > MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP {
+                        let what = if over_lines {
+                            format!("{} lines", MAX_OUTPUT_LINES_BEFORE_AUTO_STOP)
+                        } else {
+                            format!("{} MB", MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP / (1024 * 1024))
+                        };
+                        emit_line(&ah2, "system",
+                            &format!("\n[OUTPUT LIMIT EXCEEDED — {}. Auto-stopping process.]\n", what));
+                        stop_process_generation(&proc_handle2, my_id);
+                        break;
                     }
+                }
+                if !pending.is_empty() {
+                    push_capped(&sc2, STDERR_BUF_CAP_BYTES, &String::from_utf8_lossy(&pending));
                 }
             }
         });
 
-        // Wait for stdout to finish first
-        let auto_stopped = t1.join().unwrap_or(false);
-        t2.join().ok();
-
-        // Now emit stderr all at once (after stdout)
-        {
-            let err_str = stderr_collected.lock().unwrap().clone();
-            if !err_str.is_empty() {
-                emit_line(&app_handle, "stderr", &err_str);
-            }
-        }
-
-        // Reap OUR child only if it is still the active one. If the user pressed
-        // Stop (child taken by stop_code) and a newer run has since published
-        // its own child, the slot holds a DIFFERENT generation — we must not
-        // take/wait/emit for it, or we'd steal the new run's child and fire a
-        // misattributed run-done. Taking under the lock keeps a concurrent Stop
-        // unblocked.
+        // Reap OUR child FIRST — gate completion on the child EXITING, not on
+        // the reader threads reaching pipe EOF. If the student's program spawns
+        // a grandchild that inherits the stdout/stderr pipe (multiprocessing,
+        // subprocess.Popen, sklearn/joblib n_jobs=-1), the pipe write-end stays
+        // open after the direct child exits, so `reader.lines()` never sees EOF
+        // and t1.join() would block FOREVER — run-done never fires and the UI is
+        // stuck "running" for a program that already finished. Waiting on the
+        // child process is independent of the pipe, so it returns correctly.
+        //
+        // Only reap if the child is still the active one: a concurrent Stop
+        // (child taken by stop_code) or a newer run means the slot holds a
+        // DIFFERENT generation — we must not steal it or fire a misattributed
+        // run-done. Taking under the lock keeps a concurrent Stop unblocked.
         let my_child = {
             let mut guard = process_handle.lock().unwrap();
             match guard.as_ref() {
@@ -326,6 +390,22 @@ pub fn execute_code_streaming(
         };
         let owned = my_child.is_some();
         let exit_code = my_child.and_then(|mut c| c.wait().ok().and_then(|s| s.code()));
+
+        // The direct child has exited. Drain the reader threads, but BOUNDED:
+        // in the normal case the pipe hit EOF the instant the child exited, so
+        // they finish in microseconds; in the grandchild-inherited-pipe case
+        // they never will, so detach after a short grace (they keep draining
+        // harmlessly to their buffers) rather than hang the run forever.
+        let auto_stopped = join_bounded(t1, Duration::from_secs(3)).unwrap_or(false);
+        join_bounded(t2, Duration::from_secs(3));
+
+        // Now emit stderr all at once (after stdout)
+        {
+            let err_str = stderr_collected.lock().unwrap().clone();
+            if !err_str.is_empty() {
+                emit_line(&app_handle, "stderr", &err_str);
+            }
+        }
 
         // Register the files this run touched as known writes, each PINNED to
         // its post-run content hash: a legitimate program output (plt.savefig,
@@ -360,21 +440,45 @@ pub fn execute_code_streaming(
         // auto-stopped this run ourselves. Staying silent when the user's Stop
         // already reset the UI (and a new run may be active) prevents the
         // straggler/misattributed run-done class of bugs.
+        //
+        // The collected strings ride along ONLY as the frontend's fallback for
+        // runs so fast their streamed chunks were missed — always tiny output.
+        // Ship a bounded prefix, not the full retained buffers: serializing up
+        // to 12MB of JSON per run-done was a pointless post-run hiccup on
+        // low-spec machines (the streaming path already displayed everything).
         if owned || auto_stopped {
+            const DONE_STDOUT_CAP: usize = 256 * 1024;
+            const DONE_STDERR_CAP: usize = 128 * 1024;
             let elapsed = start.elapsed().as_millis() as u64;
-            let stdout_str = stdout_collected.lock().unwrap().clone();
-            let stderr_str = stderr_collected.lock().unwrap().clone();
+            let stdout_str = cap_prefix(&stdout_collected.lock().unwrap(), DONE_STDOUT_CAP);
+            let stderr_str = cap_prefix(&stderr_collected.lock().unwrap(), DONE_STDERR_CAP);
             emit_done_with_output(&app_handle, exit_code, elapsed, &stdout_str, &stderr_str);
         }
     });
 }
 
-/// Take the child out of the shared handle and kill its descendant tree.
-/// IMPORTANT: callers must take() the child themselves before invoking this
-/// so that a concurrent Run cannot have its fresh child killed by a stale
-/// stop. See `stop_taken_child` for the no-shared-handle variant.
-pub fn stop_process(process_handle: &RunningProcess) -> bool {
-    let child_opt = process_handle.lock().ok().and_then(|mut g| g.take().map(|(_, c)| c));
+/// Char-boundary-safe bounded prefix of `s` (with a truncation marker).
+fn cap_prefix(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut cut = cap;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n[truncated]\n", &s[..cut])
+}
+
+/// Auto-stop helper for the output-reader threads: take and kill the child in
+/// the shared slot ONLY if it still belongs to run generation `my_id`. The
+/// readers can outlive their run (detached by join_bounded when a grandchild
+/// holds the pipe open), so an unconditional take here could SIGKILL a NEWER
+/// run's freshly-published child while draining the old run's backlog.
+fn stop_process_generation(process_handle: &RunningProcess, my_id: u64) -> bool {
+    let child_opt = process_handle.lock().ok().and_then(|mut g| match g.as_ref() {
+        Some((id, _)) if *id == my_id => g.take().map(|(_, c)| c),
+        _ => None,
+    });
     match child_opt {
         Some(child) => { stop_taken_child(child); true }
         None => false,
@@ -411,54 +515,6 @@ pub fn stop_taken_child(mut child: Child) {
 
     let _ = child.kill();
     let _ = child.wait();
-}
-
-/// pip install packages
-pub fn pip_install(
-    packages: &[String],
-    python_path: Option<&str>,
-    app_handle: AppHandle,
-) {
-    let py = find_python(python_path);
-    let pkgs = packages.to_vec();
-
-    thread::spawn(move || {
-        let py_cmd = match py {
-            Some(p) => p,
-            None => {
-                emit_line(&app_handle, "stderr", "Python not found\n");
-                return;
-            }
-        };
-
-        emit_line(&app_handle, "system", &format!("$ {} -m pip install {}\n", py_cmd, pkgs.join(" ")));
-
-        let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string(), "--user".to_string()];
-        args.extend(pkgs);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let child = Command::new(&py_cmd)
-            .args(&arg_refs)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-
-        match child {
-            Ok(mut c) => {
-                if let Some(out) = c.stdout.take() {
-                    let reader = BufReader::new(out);
-                    for line in reader.lines().flatten() {
-                        emit_line(&app_handle, "stdout", &format!("{}\n", line));
-                    }
-                }
-                let status = c.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-                emit_line(&app_handle, "system", &format!("[pip exit {}]\n", status));
-            }
-            Err(e) => {
-                emit_line(&app_handle, "stderr", &format!("pip failed: {}\n", e));
-            }
-        }
-    });
 }
 
 /// Run a pip command with streaming output. Returns final exit code.
@@ -634,6 +690,81 @@ pub fn pip_list(python_path: Option<&str>) -> Vec<String> {
 
 // ===== Helpers =====
 
+/// Number of trailing bytes in `buf` that form an INCOMPLETE (not invalid)
+/// UTF-8 sequence — i.e. a multi-byte char split by the chunk boundary. 0..=3.
+fn incomplete_utf8_suffix_len(buf: &[u8]) -> usize {
+    let len = buf.len();
+    let start = len.saturating_sub(3);
+    for i in (start..len).rev() {
+        let b = buf[i];
+        if b < 0x80 {
+            return 0; // ASCII — nothing dangling
+        }
+        if b >= 0xC0 {
+            // Leading byte of a 2-4 byte sequence.
+            let need = if b >= 0xF0 { 4 } else if b >= 0xE0 { 3 } else { 2 };
+            return if i + need > len { len - i } else { 0 };
+        }
+        // 0x80..=0xBF: continuation byte — keep scanning back for the lead.
+    }
+    0 // ≥4 trailing continuation bytes can't be a valid split — let lossy eat them
+}
+
+/// Decode `pending` as UTF-8 (invalid bytes → U+FFFD), leaving at most an
+/// incomplete trailing multi-byte sequence in place for the next chunk.
+/// SINGLE-PASS: an earlier version re-validated the remainder after every
+/// invalid byte, which went O(n²) — a cell doing
+/// `sys.stdout.buffer.write(os.urandom(10**7))` burned CPU for minutes.
+/// from_utf8_lossy already substitutes U+FFFD for every invalid sequence in
+/// one pass; we only need to hold back a split char at the very end.
+pub(crate) fn drain_utf8_lossy(pending: &mut Vec<u8>) -> String {
+    let keep = incomplete_utf8_suffix_len(pending);
+    let cut = pending.len() - keep;
+    let out = String::from_utf8_lossy(&pending[..cut]).into_owned();
+    pending.drain(..cut);
+    out
+}
+
+/// Append `s` to a shared collected-output String, bounded at `cap` bytes
+/// (char-boundary-safe cut + one truncation marker). The RETAINED buffer is
+/// what run-done ships to the frontend; streaming display is unaffected.
+pub(crate) fn push_capped(sink: &Arc<Mutex<String>>, cap: usize, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if let Ok(mut buf) = sink.lock() {
+        if buf.len() >= cap {
+            return;
+        }
+        let room = cap - buf.len();
+        if s.len() <= room {
+            buf.push_str(s);
+        } else {
+            let mut cut = room;
+            while cut > 0 && !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            buf.push_str(&s[..cut]);
+            buf.push_str("\n[output truncated — retained buffer limit reached]\n");
+        }
+    }
+}
+
+/// Join a thread but give up after `timeout`, leaving it detached (it keeps
+/// running). Used to drain the output reader threads without hanging the run
+/// when a grandchild holds the inherited pipe open past the direct child's
+/// exit. `JoinHandle::is_finished` (stable) lets us poll without blocking.
+pub(crate) fn join_bounded<T>(handle: thread::JoinHandle<T>, timeout: Duration) -> Option<T> {
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() >= timeout {
+            return None; // detach; the thread finishes when the pipe finally closes
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    handle.join().ok()
+}
+
 fn emit_line(app: &AppHandle, stream: &str, text: &str) {
     let _ = app.emit("run-output", RunOutputLine {
         stream: stream.to_string(),
@@ -692,6 +823,9 @@ fn discover_python() -> Option<String> {
         let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
 
         let direct_paths = [
+            // MINT-dedicated portable Python first — keeps the no-python_path
+            // fallback consistent with lib::find_system_python.
+            "C:\\ProgramData\\MINT_Python\\Python312\\python.exe".to_string(),
             format!("{}\\AppData\\Local\\Programs\\Python\\Python312\\python.exe", home),
             format!("{}\\AppData\\Local\\Programs\\Python\\Python311\\python.exe", home),
             format!("{}\\AppData\\Local\\Programs\\Python\\Python310\\python.exe", home),
@@ -732,9 +866,18 @@ fn discover_python() -> Option<String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // macOS/Linux: check common paths by file existence
+        // macOS/Linux: check common paths by file existence.
+        // Probe the versioned python3.12 FIRST (both the keg-only symlink and
+        // the direct keg path) — that is exactly what install-mac.sh guarantees
+        // via `brew install python@3.12`. Bare `python3` may resolve to brew's
+        // current default (3.13/3.14) or CLT's 3.9, drifting from the pinned
+        // 3.12 the packages were installed for.
         let home = std::env::var("HOME").unwrap_or_default();
         let paths = [
+            "/opt/homebrew/bin/python3.12",
+            "/opt/homebrew/opt/python@3.12/bin/python3.12",
+            "/usr/local/bin/python3.12",
+            "/usr/local/opt/python@3.12/bin/python3.12",
             "/opt/homebrew/bin/python3",
             "/usr/local/bin/python3",
             "/usr/bin/python3",
@@ -766,7 +909,16 @@ fn compile_cmd(compiler: &str, src: &Path, out: &Path, extra_args: &[&str], app:
     args.extend(extra_args.iter().map(|s| s.to_string()));
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = Command::new(compiler).args(&arg_refs).output();
+    let mut command = Command::new(compiler);
+    command.args(&arg_refs);
+    // Hide the compiler's console window on Windows (gcc/g++ flashed a black
+    // window on every C/C++ Run).
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output();
 
     match output {
         Ok(o) => {
@@ -807,7 +959,14 @@ fn build_and_run_java(dir: &Path, filename: &str, app: &AppHandle) -> Option<(St
     let src_str = src.to_string_lossy().to_string();
     let dir_str = dir.to_string_lossy().to_string();
 
-    let output = Command::new("javac").arg(&src_str).output();
+    let mut javac = Command::new("javac");
+    javac.arg(&src_str);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        javac.creation_flags(0x08000000);
+    }
+    let output = javac.output();
     match output {
         Ok(o) if !o.status.success() => {
             emit_line(app, "stderr", "[Compilation Error]\n");

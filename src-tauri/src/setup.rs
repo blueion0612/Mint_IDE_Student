@@ -107,23 +107,37 @@ pub fn package_list_for_profile(profile: &str, custom: &[String]) -> Vec<String>
             "openpyxl==3.1.5".into(),
             "requests==2.32.3".into(),
         ],
-        "dl" => vec![
-            "numpy==2.1.3".into(),
-            "pandas==2.2.3".into(),
-            "matplotlib==3.10.0".into(),
-            "seaborn==0.13.2".into(),
-            "scikit-learn==1.5.2".into(),
-            "scipy==1.14.1".into(),
-            "sympy==1.13.3".into(),
-            "Pillow==11.0.0".into(),
-            "opencv-python-headless==4.10.0.84".into(),
-            "openpyxl==3.1.5".into(),
-            "requests==2.32.3".into(),
-            "torch==2.5.1".into(),
-            "torchvision==0.20.1".into(),
-            "torchaudio==2.5.1".into(),
-            "tensorflow-cpu==2.18.0".into(),
-        ],
+        "dl" => {
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut v: Vec<String> = vec![
+                "numpy==2.1.3".into(),
+                "pandas==2.2.3".into(),
+                "matplotlib==3.10.0".into(),
+                "seaborn==0.13.2".into(),
+                "scikit-learn==1.5.2".into(),
+                "scipy==1.14.1".into(),
+                "sympy==1.13.3".into(),
+                "Pillow==11.0.0".into(),
+                "opencv-python-headless==4.10.0.84".into(),
+                "openpyxl==3.1.5".into(),
+                "requests==2.32.3".into(),
+                "torch==2.5.1".into(),
+                "torchvision==0.20.1".into(),
+                "torchaudio==2.5.1".into(),
+                "tensorflow-cpu==2.18.0".into(),
+            ];
+            // macOS ships no `tensorflow-cpu` wheels at all — the package is
+            // simply `tensorflow` there (Apple-Silicon wheel exists for 2.18).
+            // Without this swap the dl profile ALWAYS ended in
+            // [INSTALL_DONE:partial] on Macs.
+            #[cfg(target_os = "macos")]
+            for p in v.iter_mut() {
+                if p == "tensorflow-cpu==2.18.0" {
+                    *p = "tensorflow==2.18.0".into();
+                }
+            }
+            v
+        }
         "custom" => custom.to_vec(),
         _ => Vec::new(),
     }

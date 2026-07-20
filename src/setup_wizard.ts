@@ -269,7 +269,11 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
       });
       overlay.querySelector("#wiz-rerun-wizard")!.addEventListener("click", async () => {
         closeModal();
-        const cfg = await showSetupWizard();
+        // Pass the CURRENT exam interpreter through — otherwise the rerun's
+        // pip install targets the system Python (find_python(None)) while the
+        // IDE keeps running code against the venv, so packages install into the
+        // wrong interpreter and the student still hits ModuleNotFoundError.
+        const cfg = await showSetupWizard(opts.pythonPath ?? null);
         resolve(cfg);
       });
 
@@ -370,14 +374,16 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
         return;
       }
 
-      // In wizard mode (first launch), require success before flipping
-      // setup_done. In settings mode, we don't gate — user is just tweaking.
-      if (opts.mode === "wizard" && (!installOk || !verifyOk)) {
+      // Surface an incomplete install/verify in BOTH modes. Previously settings
+      // mode closed silently on failure — a student who changed profiles with
+      // the network down saw the modal close as if it succeeded, with the
+      // failure log destroyed unread and packages still missing at exam time.
+      if (wantsInstall && (!installOk || !verifyOk)) {
         const proceed = confirm(
           `설치 또는 검증이 완전하지 않습니다.\n\n` +
           `${!installOk ? "- 일부 패키지 설치 실패\n" : ""}` +
           `${!verifyOk ? "- 환경 검증 실패 (plt.show 등 그래프 출력 불가능)\n" : ""}` +
-          `\n[취소] = 위자드 다시 시도, [확인] = 그대로 진행 (비추천)`
+          `\n[취소] = 다시 시도, [확인] = 그대로 진행 (비추천)`
         );
         if (!proceed) {
           submitBtn.disabled = false;
@@ -499,8 +505,8 @@ async function runVerification(log: HTMLElement, pythonPath: string | null): Pro
       }
       log.textContent += `\n`;
       log.textContent += `  matplotlib GUI 출력이 화면에 표시되지 않을 수 있습니다.\n`;
-      log.textContent += `  관리자 PowerShell에서 install-windows.ps1을 재실행하거나,\n`;
-      log.textContent += `  설정에서 venv 재설치를 시도하세요.\n`;
+      log.textContent += `  설치 스크립트(Windows: install-windows.ps1 / macOS: install-mac.sh)를\n`;
+      log.textContent += `  재실행하거나, 설정에서 venv 재설치를 시도하세요.\n`;
       log.scrollTop = log.scrollHeight;
       return false;
     }

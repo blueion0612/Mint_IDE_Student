@@ -11,7 +11,22 @@ pub fn start_clipboard_monitor(log: LogHandle, app_handle: AppHandle) {
         let mut clipboard = match Clipboard::new() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to initialize clipboard monitor: {}", e);
+                // This thread is the ONLY clipboard monitoring there is — a
+                // silent return meant copy/paste-source evidence was missing
+                // for the entire exam with nothing but an invisible stderr
+                // line (GUI build has no console). Surface it like the macOS
+                // Automation-denied case so the student can report it.
+                let event = ActivityEvent::new(
+                    "monitor_health_fail",
+                    &format!(
+                        "클립보드 모니터링을 시작하지 못했습니다 ({}). 복사/붙여넣기 출처가 기록되지 않습니다 — 감독관에게 알리세요.",
+                        e
+                    ),
+                    None,
+                    None,
+                );
+                log.add_event(event.clone());
+                let _ = app_handle.emit("activity-event", &event);
                 return;
             }
         };
@@ -144,18 +159,13 @@ fn detect_clipboard_source() -> (String, String) {
         (exe, t, pid)
     };
 
-    let own_exe = std::env::current_exe().ok()
-        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
-        .unwrap_or_default();
-
-    let lc = exe_name.to_ascii_lowercase();
-    // msedgewebview2.exe counts as "self" ONLY when it descends from our
-    // process (our own WebView2 child) — not for any unrelated WebView2 app a
-    // student copied from, which must be logged as clipboard_external.
-    if (!own_exe.is_empty() && lc == own_exe.to_ascii_lowercase())
-        || (lc == "msedgewebview2.exe"
-            && super::focus::pid_is_descendant_of(owner_pid, std::process::id()))
-    {
+    // Self-test by PID LINEAGE, not by exe basename. A copy from our editor is
+    // owned by our WebView2 child (which descends from us); the main process
+    // itself is covered because pid_is_descendant_of starts its walk at the
+    // owner pid (equality counts). The old basename comparison could be
+    // defeated by renaming any app's exe to "mint-exam-ide.exe" — its copies
+    // then logged as clipboard_internal instead of clipboard_external.
+    if super::focus::pid_is_descendant_of(owner_pid, std::process::id()) {
         return ("self".to_string(), title);
     }
 
@@ -164,18 +174,19 @@ fn detect_clipboard_source() -> (String, String) {
 
 #[cfg(target_os = "macos")]
 fn detect_clipboard_source() -> (String, String) {
-    use std::process::Command;
     // macOS doesn't expose pasteboard owner directly; the best proxy is the
     // currently-frontmost app, which is the app the user just copied from.
-    let out = Command::new("osascript")
-        .args(["-e", "tell application \"System Events\" to get name of first application process whose frontmost is true"])
-        .output();
-    let app = match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Err(_) => return ("unknown".to_string(), String::new()),
+    let Some((app, fg_pid)) = super::focus::frontmost_app_macos() else {
+        return ("unknown".to_string(), String::new());
     };
-    let is_self = app.contains("MINT") || app.eq_ignore_ascii_case("mint-exam-ide");
-    let source = if is_self { "self".to_string() } else { app.clone() };
+    // PID equality decides when available; exact-name fallback only when
+    // System Events returned no unix id (contains("MINT") was spoofable by
+    // renaming an app bundle).
+    let is_self = match fg_pid {
+        Some(p) => p == std::process::id(),
+        None => app == "MINT Exam IDE" || app == "mint-exam-ide",
+    };
+    let source = if is_self { "self".to_string() } else { app };
     (source, String::new())
 }
 

@@ -392,31 +392,42 @@ fn build_recording_command(dir: &Path, base: &str) -> Result<(Child, String, Pat
     let output_str = output_path.to_string_lossy().to_string();
 
     let scale_half = SCALE_HALF_EVEN.to_string();
+    // `-flush_packets 1` on EVERY strategy: without it ffmpeg's 32KB AVIO
+    // buffer holds encoded data in memory, and at this bitrate (~1-2KB/s on a
+    // static IDE screen) the mp4 grew in ~25-second bursts — the 3s/12s start
+    // probe and the stall watchdog both read a 0-byte file from a perfectly
+    // healthy capture and false-alarmed on real machines. Flushing per packet
+    // makes on-disk size track reality (a few tiny writes/sec — negligible).
+    //
+    // 5 fps (was 2): the user found 2fps too choppy to review. On a mostly
+    // static screen x264 encodes unchanged frames as skip frames (bytes), so
+    // the size cost is far below linear; ultrafast half-res keeps low-spec CPU
+    // impact minimal.
     let strategies: Vec<(&str, Vec<String>)> = vec![
         // gdigrab default cursor capture is off — without -draw_mouse 1 the
         // student's pointer doesn't appear in the recording, which makes it
         // hard to correlate suspicious clicks with timestamps during grading.
         ("CPU/GDI (most compatible)",
-         ["-y", "-f", "gdigrab", "-framerate", "2", "-draw_mouse", "1", "-i", "desktop",
+         ["-y", "-f", "gdigrab", "-framerate", "5", "-draw_mouse", "1", "-i", "desktop",
           "-vf", scale_half.as_str(), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
-          "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_str.as_str()]
+          "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-flush_packets", "1", output_str.as_str()]
             .iter().map(|s| s.to_string()).collect()),
         ("CPU/DDA",
-         ["-y", "-filter_complex", "ddagrab=framerate=2,scale=trunc(iw/4)*2:trunc(ih/4)*2",
+         ["-y", "-filter_complex", "ddagrab=framerate=5,scale=trunc(iw/4)*2:trunc(ih/4)*2",
           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
-          "-pix_fmt", "yuv420p", output_str.as_str()]
+          "-pix_fmt", "yuv420p", "-flush_packets", "1", output_str.as_str()]
             .iter().map(|s| s.to_string()).collect()),
         ("NVIDIA NVENC",
          ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_nvenc",
-          "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", output_str.as_str()]
+          "-preset", "p1", "-qp", "32", "-pix_fmt", "yuv420p", "-flush_packets", "1", output_str.as_str()]
             .iter().map(|s| s.to_string()).collect()),
         ("Intel QuickSync",
          ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_qsv",
-          "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", output_str.as_str()]
+          "-preset", "veryfast", "-global_quality", "32", "-pix_fmt", "yuv420p", "-flush_packets", "1", output_str.as_str()]
             .iter().map(|s| s.to_string()).collect()),
         ("AMD AMF",
          ["-y", "-filter_complex", "ddagrab=framerate=5", "-c:v", "h264_amf",
-          "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", output_str.as_str()]
+          "-quality", "speed", "-qp_i", "32", "-qp_p", "32", "-pix_fmt", "yuv420p", "-flush_packets", "1", output_str.as_str()]
             .iter().map(|s| s.to_string()).collect()),
     ];
 
@@ -600,8 +611,11 @@ fn build_recording_command(dir: &Path, base: &str) -> Result<(Child, String, Pat
             };
 
             // Some ffmpeg/macOS combinations reject particular capture rates
-            // ("selected framerate is not supported") — walk a small ladder.
-            for fps in ["2", "5", "15"] {
+            // ("selected framerate is not supported") — walk a small ladder,
+            // preferring 5fps (2fps reviewed too choppy). -flush_packets 1:
+            // see the Windows strategy comment — without it the AVIO buffer
+            // makes health probes read a 0-byte file from a healthy capture.
+            for fps in ["5", "15", "2"] {
                 let label = format!("macOS avfoundation {}fps{}", fps, multi);
                 let mut cmd = Command::new(&ffmpeg);
                 cmd.args([
@@ -612,6 +626,7 @@ fn build_recording_command(dir: &Path, base: &str) -> Result<(Child, String, Pat
                     "-vf", SCALE_HALF_EVEN,
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "38",
                     "-pix_fmt", "yuv420p",
+                    "-flush_packets", "1",
                     output_str.as_str(),
                 ])
                 .stdin(Stdio::piped())
@@ -655,10 +670,10 @@ fn build_recording_command(dir: &Path, base: &str) -> Result<(Child, String, Pat
     let output_path = dir.join(format!("{}.mp4", base));
     let output_str = output_path.to_string_lossy().to_string();
     let mut cmd = Command::new(&ffmpeg);
-    cmd.args(["-y", "-f", "x11grab", "-framerate", "2", "-i", ":0.0",
+    cmd.args(["-y", "-f", "x11grab", "-framerate", "5", "-i", ":0.0",
               "-vf", SCALE_HALF_EVEN,
               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "36",
-              "-pix_fmt", "yuv420p", output_str.as_str()])
+              "-pix_fmt", "yuv420p", "-flush_packets", "1", output_str.as_str()])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

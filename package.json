@@ -1,6 +1,7 @@
 {
   "name": "mint-exam-ide",
   "version": "5.0.3",
+  "license": "MIT",
   "description": "MINT Exam IDE - Anti-cheat coding environment for exams",
   "scripts": {
     "dev": "vite",

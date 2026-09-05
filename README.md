@@ -12,15 +12,12 @@ Yuhyeon Lee · 2026
 
 [**Releases**](https://github.com/blueion0612/Mint_IDE_Student/releases) · [**Grader**](https://github.com/blueion0612/Mint_IDE_Teacher) · [**Related**](#related)
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/hero_flow-dark.png">
-  <img alt="A student writes in the editor, the session is recorded as five streams, and the result is sealed into an encrypted submission that only the grader opens" src="docs/figures/hero_flow.png">
-</picture>
+<img alt="The editor during a session: a test script open, its output in the panel below, and the activity log listing every save and run" src="docs/figures/hero_editor.png">
 
 </div>
 
-*The exam lifecycle. The recorder, in gold, runs for the length of the session and
-feeds the sealed submission, in green, which only MINT Grader opens.*
+*The IDE during a session on Windows. A library check runs in the exam environment,
+and every save and run lands in the activity log along the bottom.*
 
 **MINT Exam IDE** is the student side of a programming exam. It is an editor that
 records how the code was written, not only what was written, and seals the result
@@ -55,6 +52,14 @@ Five streams run for the length of the session:
 The work is packed into an AES-256 encrypted archive whose key is
 derived from a hashed student identifier, so a submission cannot be opened, altered
 or re-sealed after the fact without the grader.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/hero_flow-dark.png">
+  <img alt="A student writes in the editor, the session is recorded as five streams, and the result is sealed into an encrypted submission that only the grader opens" src="docs/figures/hero_flow.png">
+</picture>
+
+*The exam lifecycle. The recorder, in gold, runs for the length of the session and
+feeds the sealed submission, in green, which only MINT Grader opens.*
 
 ## Quick start
 
@@ -108,7 +113,7 @@ src-tauri/            the Rust side: monitoring, recording, packaging
 install-windows.ps1   one-pass Windows setup
 install-mac.sh        macOS setup, builds from source
 install-linux.sh      Linux setup
-docs/figures/         README figure, the script that draws it, figstyle.py
+docs/figures/         the screenshot, the lifecycle figure and the script that draws it, figstyle.py
 ```
 
 ## Requirements

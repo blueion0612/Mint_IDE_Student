@@ -1,18 +1,26 @@
+<div align="center">
+
 # MINT Exam IDE
 
 Yuhyeon Lee · 2026
 
-[![build](https://github.com/blueion0612/Mint_IDE_Student/actions/workflows/build.yml/badge.svg)](https://github.com/blueion0612/Mint_IDE_Student/actions/workflows/build.yml)
-[![Release](https://img.shields.io/github/v/release/blueion0612/Mint_IDE_Student)](https://github.com/blueion0612/Mint_IDE_Student/releases)
+[![build](https://img.shields.io/github/actions/workflow/status/blueion0612/Mint_IDE_Student/build.yml?label=build)](https://github.com/blueion0612/Mint_IDE_Student/actions/workflows/build.yml)
 [![License](https://img.shields.io/github/license/blueion0612/Mint_IDE_Student)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey)](#requirements)
+[![Status](https://img.shields.io/badge/status-maintained-orange)](#limitations)
+[![Release](https://img.shields.io/github/v/release/blueion0612/Mint_IDE_Student)](https://github.com/blueion0612/Mint_IDE_Student/releases)
 
-[**Releases**](https://github.com/blueion0612/Mint_IDE_Student/releases) · [**Grader**](https://github.com/blueion0612/Mint_IDE_Teacher) · [**Install**](#quick-start)
+[**Releases**](https://github.com/blueion0612/Mint_IDE_Student/releases) · [**Grader**](https://github.com/blueion0612/Mint_IDE_Teacher) · [**Related**](#related)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/figures/hero_flow-dark.png">
   <img alt="A student writes in the editor, the session is recorded as five streams, and the result is sealed into an encrypted submission that only the grader opens" src="docs/figures/hero_flow.png">
 </picture>
+
+</div>
+
+*The exam lifecycle. The recorder, in gold, runs for the length of the session and
+feeds the sealed submission, in green, which only MINT Grader opens.*
 
 **MINT Exam IDE** is the student side of a programming exam. It is an editor that
 records how the code was written, not only what was written, and seals the result
@@ -23,12 +31,16 @@ The user interface is Korean, because that is who sits the exams it was built fo
 
 ## Features
 
-**Editing.** Syntax highlighting for Python, JavaScript, TypeScript, Java, C and
+### Editing
+
+Syntax highlighting for Python, JavaScript, TypeScript, Java, C and
 C++. A file tree with drag and drop, folders, renaming and import. Code runs from
 the editor with its output in a panel beside it, and Python can be pointed at the
 system interpreter or a chosen virtual environment.
 
-**Recording.** Five streams run for the length of the session:
+### Recording
+
+Five streams run for the length of the session:
 
 | Stream | What it captures |
 |---|---|
@@ -38,7 +50,9 @@ system interpreter or a chosen virtual environment.
 | File integrity | files changed outside the editor, flagged as tampering |
 | Screen | a recording covering the session |
 
-**Submission.** The work is packed into an AES-256 encrypted archive whose key is
+### Submission
+
+The work is packed into an AES-256 encrypted archive whose key is
 derived from a hashed student identifier, so a submission cannot be opened, altered
 or re-sealed after the fact without the grader.
 
@@ -94,7 +108,7 @@ src-tauri/            the Rust side: monitoring, recording, packaging
 install-windows.ps1   one-pass Windows setup
 install-mac.sh        macOS setup, builds from source
 install-linux.sh      Linux setup
-docs/figures/         README figure and the script that draws it
+docs/figures/         README figure, the script that draws it, figstyle.py
 ```
 
 ## Requirements
@@ -120,6 +134,12 @@ npx tauri build
 - **The interface is Korean only.**
 - Integrity checking detects edits made outside the editor. It is not a sandbox and
   does not prevent them.
+
+## Related
+
+- [MINT Grader](https://github.com/blueion0612/Mint_IDE_Teacher): the invigilator's
+  half. It verifies and decrypts a whole batch of the submissions this editor seals,
+  and lays the edit history beside the code.
 
 ## License
 

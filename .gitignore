@@ -7,3 +7,7 @@ Thumbs.db
 
 # Local release-note drafts — actual notes go in `gh release edit`.
 .release_notes*.md
+
+# Python bytecode from the figure script
+__pycache__/
+*.py[cod]

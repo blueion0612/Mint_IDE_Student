@@ -3146,6 +3146,114 @@ mod e2e_tests {
     }
 
     #[test]
+    fn a_run_started_right_after_a_stop_is_not_killed_by_it() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP a_run_started_right_after_a_stop_is_not_killed_by_it: no C++ compiler");
+            return;
+        }
+        // Stop, then Run again immediately, is what a student does the moment
+        // they spot a mistake. The stop must not reach into the NEW run: a kill
+        // that lands on the wrong generation would look like the second run
+        // silently doing nothing.
+        let ws = Ws::new("stop-then-run");
+        let loop_code = "#include <iostream>\n#include <chrono>\n#include <thread>\n\
+                         int main(){ for(;;){ std::cout << \"loop\" << std::endl;\n\
+                         std::this_thread::sleep_for(std::chrono::milliseconds(50)); } }\n";
+
+        let first = Arc::new(Collector::default());
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+        let reaper = RunGuard(process.clone(), stdin.clone());
+
+        execute_code_streaming(
+            "cpp", loop_code, "main.cpp",
+            Some(&ws.0.to_string_lossy()),
+            None,
+            first.clone() as Events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !first.stdout.lock().unwrap().contains("loop") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            first.stdout.lock().unwrap().contains("loop"),
+            "the first run never started; system: {}",
+            first.system.lock().unwrap()
+        );
+        press_stop(&process, &stdin);
+        drop(reaper);
+
+        // Second run, with no pause at all.
+        let ws2 = Ws::new("stop-then-run-2");
+        let second = Arc::new(Collector::default());
+        let process2 = new_running_process();
+        let stdin2 = new_running_stdin();
+        let _reaper2 = RunGuard(process2.clone(), stdin2.clone());
+        let quick = "#include <iostream>\nint main(){ std::cout << \"second ok\" << std::endl; }\n";
+
+        execute_code_streaming(
+            "cpp", quick, "main.cpp",
+            Some(&ws2.0.to_string_lossy()),
+            None,
+            second.clone() as Events,
+            process2.clone(),
+            stdin2.clone(),
+            crate::monitor::new_known_writes(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while second.done.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let out = second.stdout.lock().unwrap().clone();
+        assert!(
+            second.done.lock().unwrap().is_some(),
+            "the second run never completed — the previous Stop leaked into it. stdout: {:?} system: {}",
+            out,
+            second.system.lock().unwrap()
+        );
+        assert!(out.contains("second ok"), "stdout: {:?}", out);
+        assert!(
+            !out.contains("loop"),
+            "the first run's output leaked into the second: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn two_runs_in_a_row_do_not_mix_their_output() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP two_runs_in_a_row_do_not_mix_their_output: no C++ compiler");
+            return;
+        }
+        let ws = Ws::new("twice");
+        let first = run_program(
+            &ws, "cpp", "main.cpp",
+            "#include <iostream>\nint main(){ std::cout << \"first\" << std::endl; }\n",
+            |_| {},
+        );
+        assert!(first.finished, "system: {}", first.system);
+        assert_eq!(first.stdout.trim(), "first");
+
+        let second = run_program(
+            &ws, "cpp", "main.cpp",
+            "#include <iostream>\nint main(){ std::cout << \"second\" << std::endl; }\n",
+            |_| {},
+        );
+        assert!(second.finished, "system: {}", second.system);
+        assert_eq!(
+            second.stdout.trim(),
+            "second",
+            "the edited program must be the one that runs — a stale binary would print 'first'"
+        );
+    }
+
+    #[test]
     fn python_input_now_works_too() {
         let _guard = exclusive();
         // The same pipe fixed Python: `input()` used to hit EOF instantly,

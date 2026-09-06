@@ -24,16 +24,18 @@ records how the code was written, not only what was written, and seals the resul
 so that the file a student hands in cannot be edited afterwards. The invigilator
 opens it with [MINT Grader](https://github.com/blueion0612/Mint_IDE_Teacher).
 
-The user interface is Korean, because that is who sits the exams it was built for.
+The editor chrome is English; the setup wizard, the dialogs and the alerts are
+Korean, because that is who sits the exams it was built for.
 
 ## Features
 
 ### Editing
 
 Syntax highlighting for Python, JavaScript, TypeScript, Java, C and
-C++. A file tree with drag and drop, folders, renaming and import. Code runs from
-the editor with its output in a panel beside it, and Python can be pointed at the
-system interpreter or a chosen virtual environment.
+C++, and Jupyter notebooks open as cells, each keeping its own output. A file tree
+with drag and drop, folders, renaming and import. Code runs from the editor with
+its output in a panel beside it, and Python can be pointed at the system
+interpreter or a chosen virtual environment.
 
 ### Recording
 
@@ -119,8 +121,9 @@ docs/figures/         the screenshot, the lifecycle figure and the script that d
 ## Requirements
 
 To run an installer, nothing: it brings its own toolchain. To build from source,
-Node.js 18 or newer, Rust 1.70 or newer, and FFmpeg, plus whichever language runtimes
-the exam needs available on the machine.
+Node.js 18 or newer, Rust 1.77.2 or newer, which is the minimum Tauri 2 supports,
+and FFmpeg, plus whichever language runtimes the exam needs available on the
+machine.
 
 ```bash
 npm install
@@ -136,7 +139,8 @@ npx tauri build
 - **The recording is only as good as the permissions granted.** A student who denies
   Screen Recording produces a submission with no screen stream, which the grader
   sees as absent rather than as clean.
-- **The interface is Korean only.**
+- **The wizard, the dialogs and the alerts are Korean only**, though the editor
+  chrome itself is English.
 - Integrity checking detects edits made outside the editor. It is not a sandbox and
   does not prevent them.
 

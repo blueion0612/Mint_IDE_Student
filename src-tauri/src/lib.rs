@@ -338,7 +338,11 @@ fn stop_code(process: State<runner::RunningProcess>, stdin_state: State<runner::
 /// The frontend appends the newline for a normal "Enter"; a paste of several
 /// lines arrives as one call so ordering is preserved even if the student
 /// pastes faster than the program consumes.
-#[tauri::command]
+// `async` so Tauri runs it OFF the main thread. The write itself is handed to
+// a writer thread and cannot block, but keeping UI-triggered work off the main
+// thread is the standing rule in this file for a reason: a sync command that
+// stalls beach-balls the whole window.
+#[tauri::command(async)]
 fn send_stdin(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
@@ -367,7 +371,7 @@ fn send_stdin(
 ///
 /// `while (std::cin >> x)` and `while (getline(std::cin, line))` end only at
 /// EOF, so this is what lets a student finish an input-loop program at all.
-#[tauri::command]
+#[tauri::command(async)]
 fn close_stdin(
     app_handle: tauri::AppHandle,
     state: State<AppState>,

@@ -156,25 +156,39 @@ fn take_cancelled(gen: u64) -> bool {
 /// problems overwhelmingly read their input from stdin, so C++ (and Python)
 /// answers produced confidently wrong output with no visible error.
 ///
-/// It is a small state machine rather than just a pipe because a run does not
-/// have a pipe for its whole life. A C++ Run spends its first half-second to
-/// second COMPILING, and a student who knows their program wants input starts
-/// typing immediately — exactly as they would into a terminal. Those keystrokes
-/// are held here and delivered the moment the program exists, instead of being
-/// rejected (which, in the first version, also latched the input box shut for
-/// the rest of the run).
+/// Two things make this more than a pipe.
+///
+/// A run does not have a pipe for its whole life. A C++ Run spends its first
+/// half-second to second COMPILING, and a student who knows their program wants
+/// input starts typing immediately — exactly as they would into a terminal.
+/// Those keystrokes are held here and delivered the moment the program exists.
+///
+/// And writing to a pipe BLOCKS once the OS buffer (64 KB on Windows) is full.
+/// A program that stops reading — one that crashed, or only wanted the first
+/// line — plus a student pasting a large test input is enough to block the
+/// writer forever. If that write happened on the command thread it would freeze
+/// the UI, and if it held this lock it would also hang the Stop that is the
+/// student's way out. So the pipe is owned by a dedicated writer thread and fed
+/// through a channel; nothing on a UI path ever blocks on it.
+enum StdinMsg {
+    Data(Vec<u8>),
+    Close,
+}
+
 #[derive(Default)]
 pub struct StdinState {
     /// The generation of the run in flight, from its start until it finishes.
     /// `None` means nothing is running and input has nowhere to go.
     active_gen: Option<u64>,
-    /// The pipe, once the program has been spawned.
-    pipe: Option<(u64, std::process::ChildStdin)>,
+    /// Channel to the writer thread, once the program has been spawned.
+    tx: Option<(u64, std::sync::mpsc::Sender<StdinMsg>)>,
     /// Type-ahead recorded before the program existed.
     pending: Vec<u8>,
-    /// EOF pressed before the program existed; applied right after the
-    /// type-ahead is flushed.
+    /// EOF pressed before the program existed; applied once the pipe appears.
     eof_requested: bool,
+    /// Bytes handed to the writer thread and not yet written. Bounds the queue
+    /// for a program that has stopped reading.
+    queued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub type RunningStdin = Arc<Mutex<StdinState>>;
@@ -183,22 +197,27 @@ pub fn new_running_stdin() -> RunningStdin {
     Arc::new(Mutex::new(StdinState::default()))
 }
 
+/// Ceiling on unconsumed input, whether waiting for the program to start or
+/// waiting for it to read. Far past any exam input; a student holding a key
+/// down or pasting a runaway file cannot grow this without limit.
+const MAX_UNCONSUMED_STDIN: usize = 1 << 20; // 1 MB
+
 /// Open a run's input. Called when the run is claimed, BEFORE any compile, so
 /// type-ahead has somewhere to go.
 fn begin_stdin_run(handle: &RunningStdin, gen: u64) {
     if let Ok(mut st) = handle.lock() {
         st.active_gen = Some(gen);
-        st.pipe = None;
+        st.tx = None;
         st.pending.clear();
         st.eof_requested = false;
+        st.queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     }
 }
 
-/// Hand over the program's pipe and flush whatever the student typed while it
-/// was still compiling.
+/// Hand the program's pipe to a writer thread and flush whatever the student
+/// typed while it was still compiling.
 fn publish_stdin_pipe(handle: &RunningStdin, gen: u64, pipe: Option<std::process::ChildStdin>) {
-    use std::io::Write;
-    let mut pipe = match pipe {
+    let pipe = match pipe {
         Some(p) => p,
         None => return,
     };
@@ -211,55 +230,80 @@ fn publish_stdin_pipe(handle: &RunningStdin, gen: u64, pipe: Option<std::process
     if st.active_gen != Some(gen) {
         return;
     }
+
+    let (tx, rx) = std::sync::mpsc::channel::<StdinMsg>();
+    let queued = st.queued.clone();
+    thread::spawn(move || {
+        use std::io::Write;
+        let mut pipe = pipe;
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                StdinMsg::Data(bytes) => {
+                    let n = bytes.len();
+                    let res = pipe.write_all(&bytes).and_then(|_| pipe.flush());
+                    queued.fetch_sub(n.min(queued.load(std::sync::atomic::Ordering::Relaxed)),
+                                     std::sync::atomic::Ordering::Relaxed);
+                    if res.is_err() {
+                        break; // the program closed its end
+                    }
+                }
+                StdinMsg::Close => break,
+            }
+        }
+        // Dropping `pipe` closes it, which is the EOF a reader loop waits for.
+    });
+
     if !st.pending.is_empty() {
         let pending = std::mem::take(&mut st.pending);
-        let _ = pipe.write_all(&pending);
-        let _ = pipe.flush();
+        st.queued.fetch_add(pending.len(), std::sync::atomic::Ordering::Relaxed);
+        let _ = tx.send(StdinMsg::Data(pending));
     }
     if st.eof_requested {
-        // Dropping `pipe` here closes it, which is the EOF the student asked
-        // for before the program had started.
-        return;
+        let _ = tx.send(StdinMsg::Close);
+        return; // `tx` drops here, so nothing more can be queued
     }
-    st.pipe = Some((gen, pipe));
+    st.tx = Some((gen, tx));
 }
 
 /// Feed a chunk to the running program's stdin.
 ///
-/// Returns `Ok(true)` when the bytes were delivered or queued as type-ahead,
-/// `Ok(false)` when nothing is running or the program has closed its end (a
-/// finished or non-reading program is not a failure the student should have to
-/// interpret).
+/// Returns `Ok(true)` when the bytes were queued (for the program, or as
+/// type-ahead), `Ok(false)` when nothing is running, EOF has been sent, or the
+/// program has closed its end. A finished or non-reading program is not a
+/// failure the student should have to interpret.
+///
+/// Never blocks: the actual write happens on the writer thread.
 pub fn write_stdin(handle: &RunningStdin, text: &str) -> Result<bool, String> {
-    use std::io::Write;
+    use std::sync::atomic::Ordering;
     let mut st = handle.lock().map_err(|_| "stdin state poisoned".to_string())?;
 
-    if st.eof_requested && st.pipe.is_none() {
-        // EOF was already requested for this run; further input would never be
-        // read.
+    if st.eof_requested && st.tx.is_none() {
+        // EOF was already sent for this run; further input would never be read.
         return Ok(false);
     }
 
-    if let Some((_, pipe)) = st.pipe.as_mut() {
-        return match pipe.write_all(text.as_bytes()).and_then(|_| pipe.flush()) {
+    if let Some((_, tx)) = st.tx.as_ref() {
+        if st.queued.load(Ordering::Relaxed) + text.len() > MAX_UNCONSUMED_STDIN {
+            // The program is not reading. Refusing is the honest answer, and
+            // the frontend turns it into "this program is not taking input".
+            return Ok(false);
+        }
+        st.queued.fetch_add(text.len(), Ordering::Relaxed);
+        return match tx.send(StdinMsg::Data(text.as_bytes().to_vec())) {
             Ok(()) => Ok(true),
-            // The child exited (or closed stdin) between the UI click and the
-            // write. Drop our end so later writes short-circuit instead of
-            // repeating the same OS error.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                st.pipe = None;
-                st.active_gen = None;
+            // The writer thread is gone, which means the program closed its end.
+            Err(_) => {
+                st.queued.fetch_sub(text.len(), Ordering::Relaxed);
+                st.tx = None;
                 Ok(false)
             }
-            Err(e) => Err(e.to_string()),
         };
     }
 
     // No pipe yet. If a run is in flight it is still compiling, so hold the
     // keystrokes — that is what a terminal does.
     if st.active_gen.is_some() {
-        const MAX_TYPEAHEAD: usize = 1 << 20; // 1 MB is far past any exam input
-        if st.pending.len() + text.len() <= MAX_TYPEAHEAD {
+        if st.pending.len() + text.len() <= MAX_UNCONSUMED_STDIN {
             st.pending.extend_from_slice(text.as_bytes());
             return Ok(true);
         }
@@ -278,7 +322,11 @@ pub fn write_stdin(handle: &RunningStdin, text: &str) -> Result<bool, String> {
 pub fn close_stdin(handle: &RunningStdin) -> bool {
     match handle.lock() {
         Ok(mut st) => {
-            if st.pipe.take().is_some() {
+            if let Some((_, tx)) = st.tx.take() {
+                // Queued input is written first; the writer then closes the
+                // pipe. Dropping `tx` alone would also do it, but sending Close
+                // makes the intent explicit and survives a full queue.
+                let _ = tx.send(StdinMsg::Close);
                 return true;
             }
             if st.active_gen.is_some() && !st.eof_requested {
@@ -291,6 +339,22 @@ pub fn close_stdin(handle: &RunningStdin) -> bool {
     }
 }
 
+/// Finish a run's input: close the pipe and forget any type-ahead.
+///
+/// Generation-checked for the same reason the child reaper is: a run that has
+/// already been replaced must not close the CURRENT run's stdin.
+fn clear_stdin_generation(handle: &RunningStdin, gen: u64) {
+    if let Ok(mut st) = handle.lock() {
+        if st.active_gen == Some(gen) {
+            st.active_gen = None;
+            // Dropping the sender ends the writer thread, which closes the pipe.
+            st.tx = None;
+            st.pending.clear();
+            st.eof_requested = false;
+        }
+    }
+}
+
 /// Whether the running program's stdin pipe exists yet. `false` while a
 /// compiled language is still compiling.
 ///
@@ -299,7 +363,7 @@ pub fn close_stdin(handle: &RunningStdin) -> bool {
 /// for the wrong reason.
 #[allow(dead_code)]
 pub fn stdin_pipe_ready(handle: &RunningStdin) -> bool {
-    handle.lock().map(|st| st.pipe.is_some()).unwrap_or(false)
+    handle.lock().map(|st| st.tx.is_some()).unwrap_or(false)
 }
 
 /// Wait for the program to finish, THEN release its input.
@@ -320,21 +384,6 @@ fn wait_then_release_stdin(
     let code = child.and_then(|mut c| c.wait().ok().and_then(|s| s.code()));
     clear_stdin_generation(stdin_handle, gen);
     code
-}
-
-/// Finish a run's input: close the pipe and forget any type-ahead.
-///
-/// Generation-checked for the same reason the child reaper is: a run that has
-/// already been replaced must not close the CURRENT run's stdin.
-fn clear_stdin_generation(handle: &RunningStdin, gen: u64) {
-    if let Ok(mut st) = handle.lock() {
-        if st.active_gen == Some(gen) {
-            st.active_gen = None;
-            st.pipe = None;
-            st.pending.clear();
-            st.eof_requested = false;
-        }
-    }
 }
 
 pub fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::HashSet<String> {
@@ -2025,6 +2074,76 @@ mod stdin_tests {
         assert!(
             !stdin_pipe_ready(&handle),
             "a superseded run must not install its pipe over the current run's"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_program_that_never_reads_cannot_block_the_caller() {
+        let dir = scratch("noread");
+        crate::toolchain::clear_compiler_cache();
+        let compiler = match crate::toolchain::find_compiler(None, true) {
+            Some(c) => c,
+            None => {
+                eprintln!("SKIP a_program_that_never_reads_cannot_block_the_caller: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        // A program that ignores stdin entirely: the OS pipe buffer (64 KB on
+        // Windows) fills and every further write would block forever. That must
+        // not reach the caller — `write_stdin` is invoked from a Tauri command,
+        // and a blocking write there froze the UI and, holding the lock, hung
+        // the Stop that was the student's way out.
+        std::fs::write(
+            dir.join("noread.cpp"),
+            "#include <chrono>\n#include <thread>\n\
+             int main(){ std::this_thread::sleep_for(std::chrono::seconds(30)); }\n",
+        )
+        .unwrap();
+        let exe = dir.join(if cfg!(windows) { "noread.exe" } else { "noread" });
+        let spec = crate::toolchain::plan_compile(
+            &dir, "noread.cpp", true, &compiler,
+            crate::toolchain::DEFAULT_CPP_STANDARD, &exe,
+        );
+        let (ok, diag) = spec.run();
+        assert!(ok, "fixture failed to compile: {}", diag);
+
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        let handle: RunningStdin = new_running_stdin();
+        begin_stdin_run(&handle, 60);
+        publish_stdin_pipe(&handle, 60, child.stdin.take());
+
+        // Well past any pipe buffer.
+        let chunk = "x".repeat(32 * 1024);
+        let start = Instant::now();
+        for _ in 0..16 {
+            // The answer may be false once the queue cap is reached; what
+            // matters is that it RETURNS.
+            let _ = write_stdin(&handle, &chunk);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "write_stdin blocked on a program that is not reading"
+            );
+        }
+
+        // And Stop must still work while all that is outstanding.
+        let stop_start = Instant::now();
+        close_stdin(&handle);
+        clear_stdin_generation(&handle, 60);
+        assert!(
+            stop_start.elapsed() < Duration::from_secs(2),
+            "closing stdin blocked behind a stuck write"
         );
 
         let _ = child.kill();

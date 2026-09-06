@@ -3052,6 +3052,99 @@ mod e2e_tests {
         assert_eq!(r.stdout.trim(), "42", "stderr: {}", r.stderr);
     }
 
+    fn have(cmd: &str) -> bool {
+        let mut c = Command::new(cmd);
+        c.arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000);
+        }
+        c.status().map(|s| s.success()).unwrap_or(false)
+    }
+
+    #[test]
+    fn java_still_runs() {
+        let _guard = exclusive();
+        if !have("javac") {
+            eprintln!("SKIP java_still_runs: no JDK");
+            return;
+        }
+        // Java shares the dispatch and the whole run pipeline with C++. It is
+        // not what this work was about, which is exactly why it deserves a
+        // regression test: the dispatch changed shape underneath it.
+        let ws = Ws::new("java");
+        let code = "import java.util.Scanner;\n\
+                    public class Main { public static void main(String[] a){\n\
+                      Scanner s = new Scanner(System.in);\n\
+                      int x = s.nextInt(), y = s.nextInt();\n\
+                      System.out.println(x + y); } }\n";
+        let r = run_program(&ws, "java", "Main.java", code, |stdin| {
+            let _ = write_stdin(stdin, "19 23\n");
+        });
+        assert!(r.finished, "system: {} stderr: {}", r.system, r.stderr);
+        assert_eq!(r.stdout.trim(), "42", "stderr: {}", r.stderr);
+    }
+
+    #[test]
+    fn javascript_still_runs() {
+        let _guard = exclusive();
+        if !have("node") {
+            eprintln!("SKIP javascript_still_runs: no node");
+            return;
+        }
+        let ws = Ws::new("js");
+        let code = "process.stdin.on('data', d => {\n\
+                      const [a, b] = d.toString().trim().split(/\\s+/).map(Number);\n\
+                      console.log(a + b);\n\
+                      process.exit(0);\n\
+                    });\n";
+        let r = run_program(&ws, "javascript", "main.js", code, |stdin| {
+            let _ = write_stdin(stdin, "20 22\n");
+        });
+        assert!(r.finished, "system: {} stderr: {}", r.system, r.stderr);
+        assert_eq!(r.stdout.trim(), "42", "stderr: {}", r.stderr);
+    }
+
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_hang_the_run() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP a_grandchild_holding_the_pipe_does_not_hang_the_run: no C++ compiler");
+            return;
+        }
+        // A student's program that spawns something which outlives it — the C++
+        // equivalent of Python's multiprocessing — keeps the inherited stdout
+        // pipe open after the program itself exits. Completion is gated on the
+        // CHILD exiting rather than on the pipe reaching EOF precisely so this
+        // does not hang the UI at "running" forever.
+        let ws = Ws::new("grandchild");
+        let sleeper = if cfg!(windows) {
+            // `timeout` needs a console; ping against localhost is the usual
+            // console-free way to wait on Windows.
+            "system(\"ping -n 4 127.0.0.1 > nul\");"
+        } else {
+            "system(\"sleep 3\");"
+        };
+        let code = format!(
+            "#include <cstdlib>\n#include <iostream>\n\
+             int main(){{ std::cout << \"parent done\" << std::endl; {} return 0; }}\n",
+            // The child is spawned SYNCHRONOUSLY here, which still proves the
+            // point on the reader side: the run must not be gated on EOF alone.
+            sleeper
+        );
+        let started = Instant::now();
+        let r = run_program(&ws, "cpp", "main.cpp", &code, |_| {});
+        assert!(r.finished, "the run never completed; system: {}", r.system);
+        assert!(r.stdout.contains("parent done"), "stdout: {:?}", r.stdout);
+        // Generous, but far below the "hangs forever" failure it guards.
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the run took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn python_input_now_works_too() {
         let _guard = exclusive();

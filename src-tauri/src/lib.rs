@@ -1959,7 +1959,16 @@ fn submit_exam(
 
     // 8. Manifest (IDE integrity + student setup + suspicious event timestamps)
     let ide_exe_hash = compute_self_hash().unwrap_or_else(|| "unavailable".to_string());
+
     let cfg = setup::load_config();
+    // The compiler that actually built this student's code, captured when it
+    // ran. Null is a perfectly normal answer — a Python-only exam compiles
+    // nothing. Deliberately NOT resolved here: submit is the one path where
+    // nothing may block, and probing a compiler means spawning a process.
+    let cpp_toolchain = match toolchain::compiler_used() {
+        Some((path, version)) => serde_json::json!({ "path": path, "version": version }),
+        None => serde_json::Value::Null,
+    };
 
     // (rec_start_ms was computed above, before the video loop.)
 
@@ -1998,7 +2007,16 @@ fn submit_exam(
             "recording_enabled": cfg.recording_enabled,
             "include_sample_code": cfg.include_sample_code,
             "custom_venv_path": cfg.custom_venv_path,
+            "cpp_compiler_path": cfg.cpp_compiler_path,
+            "cpp_standard": cfg.cpp_standard,
         },
+        // Which compiler actually built this student's C/C++ answers, recorded
+        // the way the Python interpreter already is. A grader re-running a
+        // submission needs to know the toolchain: "works on my machine" is a
+        // real dispute when the answer relies on a compiler extension or a
+        // standard-library difference, and after the fact there is no other way
+        // to tell which GCC or Clang produced it.
+        "cpp_toolchain": cpp_toolchain,
         "recording_start_epoch_ms": rec_start_ms,
         "suspect_events": suspect_events,
         // Partial video loss (some copied, some failed) previously vanished —

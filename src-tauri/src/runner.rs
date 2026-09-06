@@ -293,6 +293,11 @@ pub fn close_stdin(handle: &RunningStdin) -> bool {
 
 /// Whether the running program's stdin pipe exists yet. `false` while a
 /// compiled language is still compiling.
+///
+/// Introspection for the tests: the type-ahead tests have to be able to say
+/// "the program provably does not exist yet" before writing, or they would pass
+/// for the wrong reason.
+#[allow(dead_code)]
 pub fn stdin_pipe_ready(handle: &RunningStdin) -> bool {
     handle.lock().map(|st| st.pipe.is_some()).unwrap_or(false)
 }
@@ -1471,6 +1476,10 @@ fn build_native(
         emit_done_with_output(app, None, 0, "", "");
         return None;
     }
+
+    // Record the toolchain for the submission manifest, now rather than at
+    // submit time — see `toolchain::note_compiler_used`.
+    crate::toolchain::note_compiler_used(&compiler);
 
     let src_abs = dir.join(filename);
     let build_dir = crate::toolchain::build_dir_for_workspace(dir);

@@ -252,6 +252,34 @@ pub fn find_compiler(explicit: Option<&str>, cpp: bool) -> Option<String> {
     found
 }
 
+/// The compiler that actually built something this session: (path, version).
+///
+/// Recorded at compile time and read at submit time. The submission manifest
+/// wants to say which toolchain produced the student's answers, and RESOLVING
+/// that at submit time would mean spawning `g++ --version` on the one code path
+/// where nothing may block: a hung probe there costs the student their exam.
+/// Reading a value captured earlier is both safer and more truthful — it is the
+/// compiler that ran, not the one that would be picked now.
+static LAST_USED_COMPILER: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Record a successful compiler resolution.
+pub fn note_compiler_used(path: &str) {
+    if let Ok(mut g) = LAST_USED_COMPILER.lock() {
+        // Only probe the version the FIRST time a given compiler is used; a Run
+        // should not pay for a subprocess it does not need.
+        let already = matches!(g.as_ref(), Some((p, _)) if p == path);
+        if !already {
+            let version = probe_version(path).unwrap_or_default();
+            *g = Some((path.to_string(), version));
+        }
+    }
+}
+
+/// The compiler used this session, if any code was compiled.
+pub fn compiler_used() -> Option<(String, String)> {
+    LAST_USED_COMPILER.lock().ok().and_then(|g| g.clone())
+}
+
 /// Drop the discovery cache. Called after an install/settings change so a newly
 /// installed toolchain is picked up without restarting the IDE.
 pub fn clear_compiler_cache() {
@@ -261,6 +289,8 @@ pub fn clear_compiler_cache() {
     if let Ok(mut g) = CACHED_CC.lock() {
         *g = None;
     }
+    // Deliberately NOT cleared: which compiler was used is a record of what
+    // happened, not a cache of what would happen next.
 }
 
 fn discover_compiler(cpp: bool) -> Option<String> {
@@ -1723,6 +1753,28 @@ mod real_compiler_tests {
             String::from_utf8_lossy(&out.stderr).to_string(),
             out.status.code(),
         )
+    }
+
+    #[test]
+    fn the_compiler_used_is_recorded_for_the_manifest() {
+        let c = match cxx() {
+            Some(c) => c,
+            None => {
+                eprintln!("SKIP the_compiler_used_is_recorded_for_the_manifest: no C++ compiler");
+                return;
+            }
+        };
+        // Submit reads this instead of resolving a compiler, because submit is
+        // the one path where a blocked subprocess costs the student their exam.
+        note_compiler_used(&c);
+        let (path, version) = compiler_used().expect("a compiler was used");
+        assert_eq!(path, c);
+        assert!(!version.is_empty(), "the version should have been probed once");
+
+        // Recording the same compiler again must not re-probe; the value stays.
+        note_compiler_used(&c);
+        let (path2, version2) = compiler_used().unwrap();
+        assert_eq!((path2, version2), (path, version));
     }
 
     #[test]

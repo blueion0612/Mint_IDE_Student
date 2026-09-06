@@ -148,58 +148,156 @@ fn take_cancelled(gen: u64) -> bool {
     }
 }
 
-/// The write end of the running child's stdin, keyed by the same run
-/// generation as the child itself.
+/// Standard input for the run in flight.
 ///
 /// Before this existed the child inherited the IDE's stdin. A GUI process has
 /// no console, so that handle was invalid and every read hit EOF immediately:
 /// `std::cin >> n` left `n` untouched and `input()` raised EOFError. Exam
 /// problems overwhelmingly read their input from stdin, so C++ (and Python)
 /// answers produced confidently wrong output with no visible error.
-pub type RunningStdin = Arc<Mutex<Option<(u64, std::process::ChildStdin)>>>;
+///
+/// It is a small state machine rather than just a pipe because a run does not
+/// have a pipe for its whole life. A C++ Run spends its first half-second to
+/// second COMPILING, and a student who knows their program wants input starts
+/// typing immediately — exactly as they would into a terminal. Those keystrokes
+/// are held here and delivered the moment the program exists, instead of being
+/// rejected (which, in the first version, also latched the input box shut for
+/// the rest of the run).
+#[derive(Default)]
+pub struct StdinState {
+    /// The generation of the run in flight, from its start until it finishes.
+    /// `None` means nothing is running and input has nowhere to go.
+    active_gen: Option<u64>,
+    /// The pipe, once the program has been spawned.
+    pipe: Option<(u64, std::process::ChildStdin)>,
+    /// Type-ahead recorded before the program existed.
+    pending: Vec<u8>,
+    /// EOF pressed before the program existed; applied right after the
+    /// type-ahead is flushed.
+    eof_requested: bool,
+}
+
+pub type RunningStdin = Arc<Mutex<StdinState>>;
 
 pub fn new_running_stdin() -> RunningStdin {
-    Arc::new(Mutex::new(None))
+    Arc::new(Mutex::new(StdinState::default()))
+}
+
+/// Open a run's input. Called when the run is claimed, BEFORE any compile, so
+/// type-ahead has somewhere to go.
+fn begin_stdin_run(handle: &RunningStdin, gen: u64) {
+    if let Ok(mut st) = handle.lock() {
+        st.active_gen = Some(gen);
+        st.pipe = None;
+        st.pending.clear();
+        st.eof_requested = false;
+    }
+}
+
+/// Hand over the program's pipe and flush whatever the student typed while it
+/// was still compiling.
+fn publish_stdin_pipe(handle: &RunningStdin, gen: u64, pipe: Option<std::process::ChildStdin>) {
+    use std::io::Write;
+    let mut pipe = match pipe {
+        Some(p) => p,
+        None => return,
+    };
+    let mut st = match handle.lock() {
+        Ok(st) => st,
+        Err(_) => return,
+    };
+    // A newer run already owns the state: this pipe belongs to a run that was
+    // superseded, so let it drop (closing it) rather than crossing the wires.
+    if st.active_gen != Some(gen) {
+        return;
+    }
+    if !st.pending.is_empty() {
+        let pending = std::mem::take(&mut st.pending);
+        let _ = pipe.write_all(&pending);
+        let _ = pipe.flush();
+    }
+    if st.eof_requested {
+        // Dropping `pipe` here closes it, which is the EOF the student asked
+        // for before the program had started.
+        return;
+    }
+    st.pipe = Some((gen, pipe));
 }
 
 /// Feed a chunk to the running program's stdin.
 ///
-/// Returns `Ok(true)` when the bytes were handed to the pipe, `Ok(false)` when
-/// nothing is running or the program has already closed its end (a finished or
-/// non-reading program is not an error the student should see as a failure).
+/// Returns `Ok(true)` when the bytes were delivered or queued as type-ahead,
+/// `Ok(false)` when nothing is running or the program has closed its end (a
+/// finished or non-reading program is not a failure the student should have to
+/// interpret).
 pub fn write_stdin(handle: &RunningStdin, text: &str) -> Result<bool, String> {
     use std::io::Write;
-    let mut guard = handle.lock().map_err(|_| "stdin state poisoned".to_string())?;
-    let stdin = match guard.as_mut() {
-        Some((_, s)) => s,
-        None => return Ok(false),
-    };
-    match stdin.write_all(text.as_bytes()).and_then(|_| stdin.flush()) {
-        Ok(()) => Ok(true),
-        // The child exited (or closed stdin) between the UI click and the
-        // write. Drop our end so later writes short-circuit instead of
-        // repeating the same OS error.
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-            *guard = None;
-            Ok(false)
-        }
-        Err(e) => Err(e.to_string()),
+    let mut st = handle.lock().map_err(|_| "stdin state poisoned".to_string())?;
+
+    if st.eof_requested && st.pipe.is_none() {
+        // EOF was already requested for this run; further input would never be
+        // read.
+        return Ok(false);
     }
+
+    if let Some((_, pipe)) = st.pipe.as_mut() {
+        return match pipe.write_all(text.as_bytes()).and_then(|_| pipe.flush()) {
+            Ok(()) => Ok(true),
+            // The child exited (or closed stdin) between the UI click and the
+            // write. Drop our end so later writes short-circuit instead of
+            // repeating the same OS error.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                st.pipe = None;
+                st.active_gen = None;
+                Ok(false)
+            }
+            Err(e) => Err(e.to_string()),
+        };
+    }
+
+    // No pipe yet. If a run is in flight it is still compiling, so hold the
+    // keystrokes — that is what a terminal does.
+    if st.active_gen.is_some() {
+        const MAX_TYPEAHEAD: usize = 1 << 20; // 1 MB is far past any exam input
+        if st.pending.len() + text.len() <= MAX_TYPEAHEAD {
+            st.pending.extend_from_slice(text.as_bytes());
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    Ok(false)
 }
 
-/// Close stdin, signalling EOF to the program.
+/// Close stdin, signalling EOF.
 ///
 /// Essential for C++: `while (std::cin >> x)` and `while (getline(...))`
-/// terminate ONLY on EOF, so without this a student could never end an
-/// input loop and every such program would look like it hung.
+/// terminate ONLY on EOF, so this is what lets a student finish an input-loop
+/// program at all. Pressing it before the program has been spawned is recorded
+/// and applied as soon as it is.
 pub fn close_stdin(handle: &RunningStdin) -> bool {
     match handle.lock() {
-        Ok(mut guard) => guard.take().is_some(),
+        Ok(mut st) => {
+            if st.pipe.take().is_some() {
+                return true;
+            }
+            if st.active_gen.is_some() && !st.eof_requested {
+                st.eof_requested = true;
+                return true;
+            }
+            false
+        }
         Err(_) => false,
     }
 }
 
-/// Wait for the program to finish, THEN release our end of its stdin.
+/// Whether the running program's stdin pipe exists yet. `false` while a
+/// compiled language is still compiling.
+pub fn stdin_pipe_ready(handle: &RunningStdin) -> bool {
+    handle.lock().map(|st| st.pipe.is_some()).unwrap_or(false)
+}
+
+/// Wait for the program to finish, THEN release its input.
 ///
 /// The ordering is the whole point, so it lives in one function rather than as
 /// two adjacent statements someone could reorder. Closing stdin before the wait
@@ -207,7 +305,8 @@ pub fn close_stdin(handle: &RunningStdin) -> bool {
 /// raises, and an exam answer prints a confident wrong result with no error
 /// anywhere. `wait()` is what blocks for the life of the program, and that is
 /// exactly the window in which the output panel's input box must be able to
-/// feed it.
+/// feed it. Reintroducing the swap fails six of the end-to-end tests at the
+/// bottom of this file.
 fn wait_then_release_stdin(
     child: Option<Child>,
     stdin_handle: &RunningStdin,
@@ -218,15 +317,17 @@ fn wait_then_release_stdin(
     code
 }
 
-/// Drop the stdin handle if it still belongs to `gen`.
+/// Finish a run's input: close the pipe and forget any type-ahead.
 ///
 /// Generation-checked for the same reason the child reaper is: a run that has
 /// already been replaced must not close the CURRENT run's stdin.
 fn clear_stdin_generation(handle: &RunningStdin, gen: u64) {
-    if let Ok(mut guard) = handle.lock() {
-        let owned = matches!(guard.as_ref(), Some((id, _)) if *id == gen);
-        if owned {
-            *guard = None;
+    if let Ok(mut st) = handle.lock() {
+        if st.active_gen == Some(gen) {
+            st.active_gen = None;
+            st.pipe = None;
+            st.pending.clear();
+            st.eof_requested = false;
         }
     }
 }
@@ -333,6 +434,23 @@ pub fn execute_code_streaming(
     let py_path = python_path.map(|s| s.to_string());
     let dir = work_dir.clone();
 
+    // Claim the run generation and open the run's input SYNCHRONOUSLY, before
+    // the worker thread starts.
+    //
+    // Both used to happen inside the thread, which left a window between
+    // `run_code` returning to the frontend - where the input row appears - and
+    // the run existing at all. Anything typed in that window was rejected, and
+    // the frontend reads a rejection as "this program is not reading input",
+    // latching the box shut for the rest of the run. The window is short, but a
+    // student who knows their program wants input types into it immediately,
+    // and a loaded machine widens it arbitrarily.
+    //
+    // Claiming the generation here is also more honest: it belongs to the
+    // invocation, not to the thread that services it. The compiler child is
+    // published under this same id, which is what lets Stop cancel a compile.
+    let my_id = RUN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    begin_stdin_run(&stdin_handle, my_id);
+
     thread::spawn(move || {
         let start = std::time::Instant::now();
 
@@ -348,16 +466,6 @@ pub fn execute_code_streaming(
         }
 
         // Build command
-        // Claim the run generation up front, BEFORE any compile.
-        //
-        // It used to be claimed after the build, which left compiled languages
-        // with an uncancellable window: Stop during a 100 ms-to-2 minute
-        // compile found an empty process slot, did nothing, and the program
-        // started anyway once the compiler finished — the student pressed Stop
-        // and watched their program run. The compiler child is now published
-        // under this id like any other, so Stop kills it.
-        let my_id = RUN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-
         // Every builder yields (program, args, extra_PATH_dir). Only the
         // compiled languages need the third: a MinGW binary looks for its
         // runtime DLLs beside the compiler that produced it.
@@ -376,7 +484,13 @@ pub fn execute_code_streaming(
 
         let (cmd, args, extra_path_dir) = match result {
             Some(v) => v,
-            None => return, // compile error already emitted
+            None => {
+                // Compile error, or a Stop during the compile. Either way no
+                // program will run, so release the input state; leaving it
+                // "active" would silently swallow the next thing typed.
+                clear_stdin_generation(&stdin_handle, my_id);
+                return;
+            }
         };
 
         // Spawn with piped stdout/stderr
@@ -436,6 +550,7 @@ pub fn execute_code_streaming(
             Err(e) => {
                 emit_line(&app_handle, "stderr", &format!("Failed to run '{}': {}. Is it installed?\n", cmd, e));
                 emit_done_with_output(&app_handle, None, 0, "", "");
+                clear_stdin_generation(&stdin_handle, my_id);
                 return;
             }
         };
@@ -466,18 +581,14 @@ pub fn execute_code_streaming(
             if cancelled {
                 drop(guard);
                 stop_taken_child(child);
+                clear_stdin_generation(&stdin_handle, my_id);
                 return;
             }
             *guard = Some((my_id, child));
         }
-        // Publish stdin under the SAME generation. Generation-keying matters
-        // for the same reason it does for the child itself: a stale input line
-        // typed against a finished run must not be delivered into a newer run's
-        // stdin.
-        {
-            let mut guard = stdin_handle.lock().unwrap();
-            *guard = child_stdin.map(|s| (my_id, s));
-        }
+        // Hand over the pipe under the SAME generation, flushing whatever was
+        // typed while the compile was still running.
+        publish_stdin_pipe(&stdin_handle, my_id, child_stdin);
 
         let ah1 = app_handle.clone();
 
@@ -1666,7 +1777,8 @@ mod stdin_tests {
 
         let mut out = child.stdout.take().unwrap();
         let handle: RunningStdin = new_running_stdin();
-        *handle.lock().unwrap() = Some((1, child.stdin.take().unwrap()));
+        begin_stdin_run(&handle, 1);
+        publish_stdin_pipe(&handle, 1, child.stdin.take());
 
         // Deliver two lines with a pause between them. If stdin were closed at
         // start-up the program would already be at EOF and the second write
@@ -1714,7 +1826,8 @@ mod stdin_tests {
             .expect("spawn");
         let mut out = child.stdout.take().unwrap();
         let handle: RunningStdin = new_running_stdin();
-        *handle.lock().unwrap() = Some((7, child.stdin.take().unwrap()));
+        begin_stdin_run(&handle, 7);
+        publish_stdin_pipe(&handle, 7, child.stdin.take());
 
         // The UI sends a pasted block as ONE call precisely so ordering cannot
         // be interleaved by the student typing while it is being consumed.
@@ -1748,10 +1861,13 @@ mod stdin_tests {
             .spawn()
             .expect("spawn");
         let handle: RunningStdin = new_running_stdin();
-        *handle.lock().unwrap() = Some((9, child.stdin.take().unwrap()));
+        begin_stdin_run(&handle, 9);
+        publish_stdin_pipe(&handle, 9, child.stdin.take());
 
         close_stdin(&handle);
         child.wait().unwrap();
+        // The run is over as far as the UI is concerned.
+        clear_stdin_generation(&handle, 9);
 
         // Typing into a program that has finished is an ordinary thing to do by
         // accident; it must read as "not delivered", never as a failure the
@@ -1762,10 +1878,175 @@ mod stdin_tests {
     }
 
     #[test]
+    fn typing_while_the_program_is_still_compiling_is_not_lost() {
+        let dir = scratch("typeahead");
+        let exe = match build_echo_program(&dir) {
+            Some(e) => e,
+            None => {
+                eprintln!("SKIP typing_while_the_program_is_still_compiling_is_not_lost: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        let handle: RunningStdin = new_running_stdin();
+        // The run has been claimed but the compiler is still working, so there
+        // is no pipe. A student who knows their program wants input starts
+        // typing here — as they would into a terminal.
+        begin_stdin_run(&handle, 3);
+        assert!(!stdin_pipe_ready(&handle));
+        assert!(
+            write_stdin(&handle, "early\n").unwrap(),
+            "type-ahead must be accepted, not rejected"
+        );
+        assert!(write_stdin(&handle, "alsoearly\n").unwrap());
+
+        // Now the program exists.
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let mut out = child.stdout.take().unwrap();
+        publish_stdin_pipe(&handle, 3, child.stdin.take());
+
+        assert!(write_stdin(&handle, "late\n").unwrap());
+        close_stdin(&handle);
+        child.wait().unwrap();
+
+        let mut text = String::new();
+        out.read_to_string(&mut text).unwrap();
+        let got: Vec<&str> = text.lines().filter(|l| l.starts_with("got:")).collect();
+        assert_eq!(
+            got,
+            vec!["got:early", "got:alsoearly", "got:late"],
+            "type-ahead must arrive first and in order; full output: {}",
+            text
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eof_pressed_during_the_compile_is_applied_when_the_program_starts() {
+        let dir = scratch("early-eof");
+        let exe = match build_echo_program(&dir) {
+            Some(e) => e,
+            None => {
+                eprintln!("SKIP eof_pressed_during_the_compile_is_applied_when_the_program_starts: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        let handle: RunningStdin = new_running_stdin();
+        begin_stdin_run(&handle, 5);
+        assert!(write_stdin(&handle, "one\n").unwrap());
+        assert!(close_stdin(&handle), "EOF before the program starts is still an EOF");
+        // Anything typed after EOF has nowhere to go.
+        assert_eq!(write_stdin(&handle, "ignored\n").unwrap(), false);
+
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let mut out = child.stdout.take().unwrap();
+        publish_stdin_pipe(&handle, 5, child.stdin.take());
+
+        // The program must see the one buffered line and then EOF, and exit on
+        // its own without anything further.
+        let status = child.wait().expect("program must terminate on the deferred EOF");
+        assert!(status.success());
+
+        let mut text = String::new();
+        out.read_to_string(&mut text).unwrap();
+        assert!(text.contains("got:one"), "output: {}", text);
+        assert!(text.contains("eof:1"), "exactly one line should have arrived: {}", text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn type_ahead_does_not_leak_into_the_next_run() {
+        let handle: RunningStdin = new_running_stdin();
+        begin_stdin_run(&handle, 10);
+        assert!(write_stdin(&handle, "from run 10\n").unwrap());
+        clear_stdin_generation(&handle, 10);
+
+        // Nothing is running now.
+        assert_eq!(write_stdin(&handle, "orphan\n").unwrap(), false);
+
+        // A new run starts with empty input, not the previous run's leftovers.
+        begin_stdin_run(&handle, 11);
+        assert!(
+            handle.lock().unwrap().pending.is_empty(),
+            "a new run must not inherit the previous run's type-ahead"
+        );
+    }
+
+    #[test]
+    fn a_superseded_runs_pipe_is_not_installed() {
+        let dir = scratch("superseded");
+        let exe = match build_echo_program(&dir) {
+            Some(e) => e,
+            None => {
+                eprintln!("SKIP a_superseded_runs_pipe_is_not_installed: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        let handle: RunningStdin = new_running_stdin();
+        begin_stdin_run(&handle, 20);
+        // A newer run takes over while run 20 was still compiling.
+        begin_stdin_run(&handle, 21);
+
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        publish_stdin_pipe(&handle, 20, child.stdin.take());
+        assert!(
+            !stdin_pipe_ready(&handle),
+            "a superseded run must not install its pipe over the current run's"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn no_run_means_nothing_is_delivered() {
         let handle: RunningStdin = new_running_stdin();
         assert_eq!(write_stdin(&handle, "x\n").unwrap(), false);
         assert!(!close_stdin(&handle));
+    }
+
+    #[test]
+    fn type_ahead_is_bounded() {
+        // A student holding a key down, or a runaway paste, must not grow this
+        // buffer without limit while a compile is in flight.
+        let handle: RunningStdin = new_running_stdin();
+        begin_stdin_run(&handle, 30);
+        let chunk = "x".repeat(64 * 1024);
+        let mut accepted = 0usize;
+        for _ in 0..64 {
+            if write_stdin(&handle, &chunk).unwrap() {
+                accepted += chunk.len();
+            } else {
+                break;
+            }
+        }
+        assert!(accepted <= 1 << 20, "type-ahead grew past its cap: {}", accepted);
+        assert!(accepted > 0, "some type-ahead should have been accepted");
     }
 
     #[test]
@@ -1787,7 +2068,8 @@ mod stdin_tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn");
-        *handle.lock().unwrap() = Some((42, child.stdin.take().unwrap()));
+        begin_stdin_run(&handle, 42);
+        publish_stdin_pipe(&handle, 42, child.stdin.take());
 
         // A straggler thread from run 41 must not close run 42's stdin.
         clear_stdin_generation(&handle, 41);
@@ -1919,7 +2201,7 @@ mod e2e_tests {
         // racing the compile step.
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
-            let live = stdin.lock().unwrap().is_some();
+            let live = stdin_pipe_ready(&stdin);
             let finished = collector.done.lock().unwrap().is_some();
             if live || finished || Instant::now() > deadline {
                 break;
@@ -1975,6 +2257,59 @@ mod e2e_tests {
         assert_eq!(r.stdout.trim(), "42", "stderr: {} system: {}", r.stderr, r.system);
         assert_eq!(r.exit_code, Some(0));
         assert!(r.system.contains("Compiling"), "the compile step should be announced");
+    }
+
+    #[test]
+    fn input_typed_during_the_compile_still_reaches_the_program() {
+        if !have_cxx() {
+            eprintln!("SKIP input_typed_during_the_compile_still_reaches_the_program: no C++ compiler");
+            return;
+        }
+        // A C++ Run spends its first half-second to second compiling. A student
+        // who knows their program wants input starts typing straight away, and
+        // in the first version of this feature those keystrokes were rejected —
+        // which ALSO latched the input box shut for the rest of the run. This
+        // drives the whole pipeline and writes before the program can possibly
+        // exist.
+        let ws = Ws::new("cpp-typeahead");
+        let code = "#include <iostream>\n\
+                    int main(){ int a,b; std::cin>>a>>b; std::cout<<(a+b)<<std::endl; }\n";
+
+        let collector = Arc::new(Collector::default());
+        let events: Events = collector.clone();
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+
+        execute_code_streaming(
+            "cpp",
+            code,
+            "main.cpp",
+            Some(&ws.0.to_string_lossy()),
+            None,
+            events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
+        );
+
+        // Write IMMEDIATELY. The compiler cannot have finished yet.
+        assert!(
+            !stdin_pipe_ready(&stdin),
+            "the program cannot already exist; this test would prove nothing"
+        );
+        assert!(
+            write_stdin(&stdin, "17 25\n").unwrap(),
+            "input typed during the compile must be accepted"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while collector.done.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let out = collector.stdout.lock().unwrap().clone();
+        let sys_log = collector.system.lock().unwrap().clone();
+        assert_eq!(out.trim(), "42", "system log: {}", sys_log);
     }
 
     #[test]

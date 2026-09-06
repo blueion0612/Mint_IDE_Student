@@ -2925,6 +2925,72 @@ mod e2e_tests {
     }
 
     #[test]
+    fn a_segfault_ends_the_run_instead_of_hanging_it() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP a_segfault_ends_the_run_instead_of_hanging_it: no C++ compiler");
+            return;
+        }
+        // Dereferencing a null pointer is the most common way an exam program
+        // dies. On Windows a crashing process can raise an error-reporting
+        // dialog, which would leave the IDE waiting on a modal box the student
+        // may not even see — during an exam that is unrecoverable. The run has
+        // to END, and the output printed before the crash has to survive.
+        let ws = Ws::new("segv");
+        let code = "#include <iostream>\n\
+                    int main(){ std::cout << \"before crash\" << std::endl;\n\
+                    volatile int* p = nullptr; *p = 1; return 0; }\n";
+        let started = Instant::now();
+        let r = run_program(&ws, "cpp", "main.cpp", code, |_| {});
+
+        assert!(
+            r.finished,
+            "the run never ended — a crash dialog would hang an exam. system: {}",
+            r.system
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "the crash took {:?} to be reported",
+            started.elapsed()
+        );
+        assert!(
+            r.stdout.contains("before crash"),
+            "output produced before the crash must not be lost: {:?}",
+            r.stdout
+        );
+        assert_ne!(r.exit_code, Some(0), "a crash must not look like success");
+    }
+
+    #[test]
+    fn an_abort_ends_the_run_instead_of_hanging_it() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP an_abort_ends_the_run_instead_of_hanging_it: no C++ compiler");
+            return;
+        }
+        // assert() is live under -O2 (NDEBUG is not defined for a student's
+        // build), and a failed assert calls abort(). Same requirement: end,
+        // do not hang.
+        let ws = Ws::new("abort");
+        let code = "#include <cassert>\n#include <iostream>\n\
+                    int main(){ std::cout << \"checking\" << std::endl;\n\
+                    int n = 0; assert(n == 1); return 0; }\n";
+        let started = Instant::now();
+        let r = run_program(&ws, "cpp", "main.cpp", code, |_| {});
+
+        assert!(r.finished, "the run never ended after abort(). system: {}", r.system);
+        assert!(started.elapsed() < Duration::from_secs(90));
+        assert!(r.stdout.contains("checking"), "stdout: {:?}", r.stdout);
+        assert_ne!(r.exit_code, Some(0));
+        // The assertion message goes to stderr and is the student's only clue.
+        assert!(
+            r.stderr.contains("Assertion") || r.stderr.contains("assert"),
+            "the assertion message should reach the student: {:?}",
+            r.stderr
+        );
+    }
+
+    #[test]
     fn a_runtime_crash_is_reported_as_a_nonzero_exit() {
         let _guard = exclusive();
         if !have_cxx() {

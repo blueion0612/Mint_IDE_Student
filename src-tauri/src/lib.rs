@@ -91,7 +91,7 @@ fn run_code(
         &language, &code, &filename,
         cwd.as_deref(),
         python_path.as_deref(),
-        app_handle,
+        runner::events_from_handle(app_handle),
         (*process).clone(),
         (*stdin_state).clone(),
         (*kw).clone(),

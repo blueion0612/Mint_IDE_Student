@@ -6,7 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
+
+// The run pipeline is generic over the Tauri runtime rather than hard-wired to
+// the default one. Production still passes the real handle and infers `R`;
+// tests pass `MockRuntime`, which is what makes it possible to drive a whole
+// run — compile, spawn, stdin, events — and assert on what the frontend would
+// have received. Without this the pipeline could only be tested a piece at a
+// time, and the mistakes that matter here live in how the pieces are ordered.
 
 const EMIT_BATCH_INTERVAL_MS: u64 = 50;
 const EMIT_BATCH_MAX_BYTES: usize = 8192;
@@ -33,6 +40,61 @@ static RUN_GEN: AtomicU64 = AtomicU64::new(0);
 pub struct RunOutputLine {
     pub stream: String, // "stdout", "stderr", "system"
     pub text: String,
+}
+
+/// Where a run's output goes.
+///
+/// In the app this is the Tauri `AppHandle`, which turns each call into the
+/// `run-output` / `run-done` events the frontend listens for. Making it a trait
+/// costs one virtual call per emit — nothing against a process spawn — and buys
+/// the ability to drive a COMPLETE run in a test: compile a real file, spawn a
+/// real child, feed its stdin, and assert on exactly what the frontend would
+/// have been told. That is the only level at which an ordering mistake shows
+/// up, and the alternative (Tauri's mock runtime) links a windowing runtime
+/// into the test binary, which does not load on every machine.
+pub trait RunEvents: Send + Sync + 'static {
+    fn line(&self, stream: &str, text: &str);
+    fn done(&self, exit_code: Option<i32>, duration_ms: u64, stdout: &str, stderr: &str);
+}
+
+/// Shared handle to a run's event sink.
+pub type Events = Arc<dyn RunEvents>;
+
+#[derive(Clone, Serialize)]
+struct RunDone {
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    stdout: String,
+    stderr: String,
+}
+
+impl<R: Runtime> RunEvents for AppHandle<R> {
+    fn line(&self, stream: &str, text: &str) {
+        let _ = self.emit(
+            "run-output",
+            RunOutputLine {
+                stream: stream.to_string(),
+                text: text.to_string(),
+            },
+        );
+    }
+
+    fn done(&self, exit_code: Option<i32>, duration_ms: u64, stdout: &str, stderr: &str) {
+        let _ = self.emit(
+            "run-done",
+            RunDone {
+                exit_code,
+                duration_ms,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            },
+        );
+    }
+}
+
+/// Wrap a Tauri handle as a run event sink.
+pub fn events_from_handle<R: Runtime>(handle: AppHandle<R>) -> Events {
+    Arc::new(handle)
 }
 
 /// Shared handle to the running process so it can be stopped. The `u64` is the
@@ -250,7 +312,7 @@ pub fn execute_code_streaming(
     filename: &str,
     workspace_dir: Option<&str>,
     python_path: Option<&str>,
-    app_handle: AppHandle,
+    app_handle: Events,
     process_handle: RunningProcess,
     stdin_handle: RunningStdin,
     known_writes: crate::monitor::KnownWrites,
@@ -697,7 +759,7 @@ pub fn stop_taken_child(mut child: Child) {
 }
 
 /// Run a pip command with streaming output. Returns final exit code.
-fn run_pip_streaming(py_cmd: &str, args: &[&str], app: &AppHandle) -> i32 {
+fn run_pip_streaming(py_cmd: &str, args: &[&str], app: &Events) -> i32 {
     let mut command = Command::new(py_cmd);
     command.args(args)
         .stdout(Stdio::piped())
@@ -742,11 +804,14 @@ fn run_pip_streaming(py_cmd: &str, args: &[&str], app: &AppHandle) -> i32 {
 }
 
 /// Smart install: routes torch / tensorflow through their proper indexes.
-pub fn pip_install_smart(
+pub fn pip_install_smart<R: Runtime>(
     packages: &[String],
     python_path: Option<&str>,
-    app_handle: AppHandle,
+    app_handle: AppHandle<R>,
 ) {
+    // Wrapped once; everything below reports through the same sink the run
+    // pipeline uses, so install progress and program output share one path.
+    let app_handle: Events = events_from_handle(app_handle);
     let py = find_python(python_path);
     let pkgs = packages.to_vec();
 
@@ -816,11 +881,12 @@ pub fn pip_install_smart(
     });
 }
 
-pub fn pip_uninstall(
+pub fn pip_uninstall<R: Runtime>(
     packages: &[String],
     python_path: Option<&str>,
-    app_handle: AppHandle,
+    app_handle: AppHandle<R>,
 ) {
+    let app_handle: Events = events_from_handle(app_handle);
     let py = find_python(python_path);
     let pkgs = packages.to_vec();
 
@@ -944,26 +1010,12 @@ pub(crate) fn join_bounded<T>(handle: thread::JoinHandle<T>, timeout: Duration) 
     handle.join().ok()
 }
 
-fn emit_line(app: &AppHandle, stream: &str, text: &str) {
-    let _ = app.emit("run-output", RunOutputLine {
-        stream: stream.to_string(),
-        text: text.to_string(),
-    });
+fn emit_line(app: &Events, stream: &str, text: &str) {
+    app.line(stream, text);
 }
 
-fn emit_done_with_output(app: &AppHandle, exit_code: Option<i32>, duration_ms: u64, stdout: &str, stderr: &str) {
-    #[derive(Clone, Serialize)]
-    struct RunDone {
-        exit_code: Option<i32>,
-        duration_ms: u64,
-        stdout: String,
-        stderr: String,
-    }
-    let _ = app.emit("run-done", RunDone {
-        exit_code, duration_ms,
-        stdout: stdout.to_string(),
-        stderr: stderr.to_string(),
-    });
+fn emit_done_with_output(app: &Events, exit_code: Option<i32>, duration_ms: u64, stdout: &str, stderr: &str) {
+    app.done(exit_code, duration_ms, stdout, stderr);
 }
 
 pub fn find_python_cached(python_path: Option<&str>) -> Option<String> {
@@ -1257,7 +1309,7 @@ fn build_native(
     dir: &Path,
     filename: &str,
     cpp: bool,
-    app: &AppHandle,
+    app: &Events,
     process_handle: &RunningProcess,
     my_id: u64,
 ) -> Option<NativeBuild> {
@@ -1337,7 +1389,22 @@ fn build_native(
         exe = build_dir.join(alt);
     }
 
-    let spec = crate::toolchain::plan_compile(dir, filename, cpp, &compiler, &standard, &exe);
+    // Compatibility headers for whatever this platform's standard library is
+    // missing — today that is <bits/stdc++.h>, which libstdc++ has and libc++
+    // does not. Written into the build directory, added with -idirafter so a
+    // toolchain that has the real one is unaffected.
+    let compat = crate::toolchain::ensure_compat_headers(&build_dir);
+
+    let spec = crate::toolchain::plan_compile_units(
+        dir,
+        filename,
+        cpp,
+        &compiler,
+        &standard,
+        &exe,
+        usize::MAX,
+        compat.as_deref(),
+    );
 
     if spec.units.len() > 1 {
         let extra: Vec<&str> = spec.units.iter().skip(1).map(|s| s.as_str()).collect();
@@ -1365,7 +1432,7 @@ fn build_native(
                 emit_line(app, "system",
                     "\n같은 폴더의 다른 파일과 함수가 중복되어, 현재 파일만 단독 컴파일합니다.\n");
                 let solo = crate::toolchain::plan_compile_units(
-                    dir, filename, cpp, &compiler, &standard, &exe, 1,
+                    dir, filename, cpp, &compiler, &standard, &exe, 1, compat.as_deref(),
                 );
                 attempt = run_compile_attempt(&solo, process_handle, my_id);
             }
@@ -1469,7 +1536,7 @@ fn read_capped<R: std::io::Read>(pipe: &mut Option<R>, cap: usize) -> String {
 fn build_and_run_c(
     dir: &Path,
     filename: &str,
-    app: &AppHandle,
+    app: &Events,
     process_handle: &RunningProcess,
     my_id: u64,
 ) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
@@ -1480,7 +1547,7 @@ fn build_and_run_c(
 fn build_and_run_cpp(
     dir: &Path,
     filename: &str,
-    app: &AppHandle,
+    app: &Events,
     process_handle: &RunningProcess,
     my_id: u64,
 ) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
@@ -1488,7 +1555,7 @@ fn build_and_run_cpp(
     Some((b.exe.to_string_lossy().to_string(), vec![], b.bin_dir))
 }
 
-fn build_and_run_java(dir: &Path, filename: &str, app: &AppHandle) -> Option<(String, Vec<String>)> {
+fn build_and_run_java(dir: &Path, filename: &str, app: &Events) -> Option<(String, Vec<String>)> {
     let src = dir.join(filename);
     let src_str = src.to_string_lossy().to_string();
     let dir_str = dir.to_string_lossy().to_string();
@@ -1743,5 +1810,357 @@ mod stdin_tests {
         note_stop_request();
         assert!(take_cancelled(gen), "the stop must be visible to the run it targets");
         assert!(!take_cancelled(gen), "a cancellation must only fire once");
+    }
+}
+
+/// End-to-end tests of the actual run pipeline.
+///
+/// Everything else in this file tests a piece. These drive
+/// `execute_code_streaming` itself: a real source file is compiled by a real
+/// compiler, a real child process runs, real bytes go down its stdin, and the
+/// assertions are made on exactly what the frontend would have been told.
+///
+/// That level matters because the mistakes that actually happen here are
+/// ordering mistakes. Releasing stdin before `child.wait()` rather than after
+/// it type-checks, passes every unit test in this file, and silently hands the
+/// program EOF the instant it starts — an exam answer then reads nothing and
+/// prints a confident wrong result. Only a whole run catches that.
+///
+/// The sink is a plain collector rather than Tauri's mock runtime, which links
+/// a windowing runtime into the test binary and does not load on every machine.
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+
+    /// Collects what the frontend would have received.
+    #[derive(Default)]
+    struct Collector {
+        stdout: Mutex<String>,
+        stderr: Mutex<String>,
+        system: Mutex<String>,
+        done: Mutex<Option<(Option<i32>, u64)>>,
+    }
+
+    impl RunEvents for Collector {
+        fn line(&self, stream: &str, text: &str) {
+            let sink = match stream {
+                "stdout" => &self.stdout,
+                "stderr" => &self.stderr,
+                _ => &self.system,
+            };
+            sink.lock().unwrap().push_str(text);
+        }
+        fn done(&self, exit_code: Option<i32>, duration_ms: u64, _stdout: &str, _stderr: &str) {
+            *self.done.lock().unwrap() = Some((exit_code, duration_ms));
+        }
+    }
+
+    struct Ws(std::path::PathBuf);
+    impl Ws {
+        fn new(tag: &str) -> Ws {
+            let d = std::env::temp_dir().join(format!(
+                "mint-e2e-{}-{}-{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|x| x.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            Ws(d)
+        }
+        fn write(&self, rel: &str, body: &str) {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, body).unwrap();
+        }
+    }
+    impl Drop for Ws {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RunResult {
+        stdout: String,
+        stderr: String,
+        system: String,
+        exit_code: Option<i32>,
+        finished: bool,
+    }
+
+    /// Drive one complete run. `feed` is called once the program is live, with
+    /// the stdin handle, so a test sends input exactly the way the UI does.
+    fn run_program<F>(ws: &Ws, language: &str, filename: &str, code: &str, feed: F) -> RunResult
+    where
+        F: FnOnce(&RunningStdin),
+    {
+        let collector = Arc::new(Collector::default());
+        let events: Events = collector.clone();
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+
+        execute_code_streaming(
+            language,
+            code,
+            filename,
+            Some(&ws.0.to_string_lossy()),
+            None,
+            events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
+        );
+
+        // Wait for the child to exist before feeding it, so the test is not
+        // racing the compile step.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let live = stdin.lock().unwrap().is_some();
+            let finished = collector.done.lock().unwrap().is_some();
+            if live || finished || Instant::now() > deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        feed(&stdin);
+
+        // Then wait for completion.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while collector.done.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Copied into locals first: a MutexGuard temporary that lives to the end
+        // of the block would outlive the Arc it borrows from.
+        let done = *collector.done.lock().unwrap();
+        let stdout = collector.stdout.lock().unwrap().clone();
+        let stderr = collector.stderr.lock().unwrap().clone();
+        let system = collector.system.lock().unwrap().clone();
+        RunResult {
+            stdout,
+            stderr,
+            system,
+            exit_code: done.and_then(|(c, _)| c),
+            finished: done.is_some(),
+        }
+    }
+
+    fn have_cxx() -> bool {
+        crate::toolchain::clear_compiler_cache();
+        crate::toolchain::find_compiler(None, true).is_some()
+    }
+
+    #[test]
+    fn cpp_run_reads_stdin_and_reports_its_output() {
+        if !have_cxx() {
+            eprintln!("SKIP cpp_run_reads_stdin_and_reports_its_output: no C++ compiler");
+            return;
+        }
+        let ws = Ws::new("cpp-stdin");
+        let code = "#include <iostream>\n\
+                    int main(){ int a,b; std::cin>>a>>b; std::cout<<(a*b)<<std::endl; return 0; }\n";
+        let r = run_program(&ws, "cpp", "main.cpp", code, |stdin| {
+            // Exactly what the UI does when the student presses Enter.
+            assert!(
+                write_stdin(stdin, "6 7\n").unwrap(),
+                "stdin must be open while the program is running"
+            );
+        });
+
+        assert!(r.finished, "run-done never arrived (system log: {})", r.system);
+        assert_eq!(r.stdout.trim(), "42", "stderr: {} system: {}", r.stderr, r.system);
+        assert_eq!(r.exit_code, Some(0));
+        assert!(r.system.contains("Compiling"), "the compile step should be announced");
+    }
+
+    #[test]
+    fn cpp_run_ends_on_eof() {
+        if !have_cxx() {
+            eprintln!("SKIP cpp_run_ends_on_eof: no C++ compiler");
+            return;
+        }
+        let ws = Ws::new("cpp-eof");
+        let code = "#include <iostream>\n\
+                    int main(){ long long x,s=0; while(std::cin>>x) s+=x; std::cout<<s<<std::endl; }\n";
+        let r = run_program(&ws, "cpp", "main.cpp", code, |stdin| {
+            assert!(write_stdin(stdin, "1 2 3 4\n").unwrap());
+            // Without this the program waits forever — which is the whole reason
+            // the EOF button exists.
+            assert!(close_stdin(stdin));
+        });
+
+        assert!(r.finished, "an input loop must terminate on EOF");
+        assert_eq!(r.stdout.trim(), "10");
+    }
+
+    #[test]
+    fn cpp_multi_file_run_links_and_runs() {
+        if !have_cxx() {
+            eprintln!("SKIP cpp_multi_file_run_links_and_runs: no C++ compiler");
+            return;
+        }
+        let ws = Ws::new("cpp-multi");
+        ws.write("helper.h", "#pragma once\nint twice(int);\n");
+        ws.write("helper.cpp", "#include \"helper.h\"\nint twice(int x){return x*2;}\n");
+        let code = "#include <iostream>\n#include \"helper.h\"\n\
+                    int main(){ int n; std::cin>>n; std::cout<<twice(n)<<std::endl; }\n";
+        let r = run_program(&ws, "cpp", "main.cpp", code, |stdin| {
+            assert!(write_stdin(stdin, "21\n").unwrap());
+        });
+
+        assert!(r.finished, "system log: {}", r.system);
+        assert_eq!(r.stdout.trim(), "42", "stderr: {}", r.stderr);
+        assert!(
+            r.system.contains("helper.cpp"),
+            "the linked sibling should be named in the compile line: {}",
+            r.system
+        );
+    }
+
+    #[test]
+    fn a_compile_error_is_reported_and_nothing_runs() {
+        if !have_cxx() {
+            eprintln!("SKIP a_compile_error_is_reported_and_nothing_runs: no C++ compiler");
+            return;
+        }
+        let ws = Ws::new("cpp-broken");
+        let code = "#include <iostream>\nint main(){ this is not valid }\n";
+        let r = run_program(&ws, "cpp", "main.cpp", code, |_| {});
+
+        assert!(r.finished, "the UI must be released even when the compile fails");
+        assert!(r.stderr.contains("[Compilation Error]"), "stderr was: {}", r.stderr);
+        assert!(r.stderr.contains("main.cpp:2"), "diagnostic should name the line: {}", r.stderr);
+        assert!(r.stdout.is_empty(), "a program that did not compile must not produce output");
+    }
+
+    #[test]
+    fn a_header_cannot_be_run_on_its_own() {
+        if !have_cxx() {
+            eprintln!("SKIP a_header_cannot_be_run_on_its_own: no C++ compiler");
+            return;
+        }
+        let ws = Ws::new("cpp-header");
+        let r = run_program(&ws, "cpp", "util.h", "#pragma once\nint f();\n", |_| {});
+        assert!(r.finished);
+        assert!(
+            r.stderr.contains("헤더 파일"),
+            "the student needs to be told what to run instead: {}",
+            r.stderr
+        );
+    }
+
+    #[test]
+    fn a_runtime_crash_is_reported_as_a_nonzero_exit() {
+        if !have_cxx() {
+            eprintln!("SKIP a_runtime_crash_is_reported_as_a_nonzero_exit: no C++ compiler");
+            return;
+        }
+        let ws = Ws::new("cpp-crash");
+        let code = "#include <vector>\n#include <iostream>\n\
+                    int main(){ std::vector<int> v; std::cout << v.at(3) << std::endl; }\n";
+        let r = run_program(&ws, "cpp", "main.cpp", code, |_| {});
+        assert!(r.finished);
+        assert_ne!(r.exit_code, Some(0), "an uncaught exception must not look like success");
+    }
+
+    #[test]
+    fn program_output_is_streamed_not_only_delivered_at_exit() {
+        if !have_cxx() {
+            eprintln!("SKIP program_output_is_streamed_not_only_delivered_at_exit: no C++ compiler");
+            return;
+        }
+        // A program that prompts, then reads, is the normal interactive shape.
+        // The prompt has to REACH the student before they are expected to
+        // answer it, which means partial lines must stream rather than being
+        // held until exit.
+        let ws = Ws::new("cpp-stream");
+        let code = "#include <iostream>\n\
+                    int main(){ std::cout << \"이름을 입력하세요: \" << std::flush;\n\
+                    std::string s; std::getline(std::cin, s);\n\
+                    std::cout << \"안녕하세요, \" << s << std::endl; }\n";
+        let ws_ref = &ws;
+        let r = run_program(ws_ref, "cpp", "main.cpp", code, |stdin| {
+            // Give the prompt time to arrive before answering.
+            thread::sleep(Duration::from_millis(300));
+            assert!(write_stdin(stdin, "민트\n").unwrap());
+        });
+
+        assert!(r.finished, "system: {}", r.system);
+        assert!(
+            r.stdout.contains("이름을 입력하세요:"),
+            "an unterminated prompt must stream: {:?}",
+            r.stdout
+        );
+        assert!(r.stdout.contains("안녕하세요, 민트"), "stdout: {:?}", r.stdout);
+    }
+
+    #[test]
+    fn the_binary_is_not_written_into_the_workspace() {
+        if !have_cxx() {
+            eprintln!("SKIP the_binary_is_not_written_into_the_workspace: no C++ compiler");
+            return;
+        }
+        // Build output inside the workspace would ride along in the submission
+        // zip and be seen by the integrity monitor as a new file on every Run.
+        let ws = Ws::new("cpp-clean");
+        let code = "#include <iostream>\nint main(){ std::cout << \"ok\" << std::endl; }\n";
+        let r = run_program(&ws, "cpp", "main.cpp", code, |_| {});
+        assert!(r.finished);
+        assert_eq!(r.stdout.trim(), "ok");
+
+        let mut left: Vec<String> = std::fs::read_dir(&ws.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["main.cpp".to_string()],
+            "the workspace must contain only the student's source"
+        );
+    }
+
+    #[test]
+    fn c_language_runs_through_the_same_pipeline() {
+        crate::toolchain::clear_compiler_cache();
+        if crate::toolchain::find_compiler(None, false).is_none() {
+            eprintln!("SKIP c_language_runs_through_the_same_pipeline: no C compiler");
+            return;
+        }
+        let ws = Ws::new("c-run");
+        let code = "#include <stdio.h>\n\
+                    int main(void){ int a,b; if(scanf(\"%d %d\", &a, &b)!=2) return 1;\n\
+                    printf(\"%d\\n\", a+b); return 0; }\n";
+        let r = run_program(&ws, "c", "main.c", code, |stdin| {
+            assert!(write_stdin(stdin, "20 22\n").unwrap());
+        });
+        assert!(r.finished, "system: {}", r.system);
+        assert_eq!(r.stdout.trim(), "42", "stderr: {}", r.stderr);
+    }
+
+    #[test]
+    fn python_input_now_works_too() {
+        // The same pipe fixed Python: `input()` used to hit EOF instantly,
+        // because a GUI process has no console to inherit stdin from.
+        let ws = Ws::new("py-stdin");
+        let code = "name = input()\nprint('hello', name)\n";
+        let r = run_program(&ws, "python", "main.py", code, |stdin| {
+            let _ = write_stdin(stdin, "mint\n");
+        });
+        if !r.finished || r.stderr.contains("Failed to run") {
+            eprintln!("SKIP python_input_now_works_too: no usable python on this machine");
+            return;
+        }
+        assert!(
+            r.stdout.contains("hello mint"),
+            "stdout: {:?} stderr: {:?}",
+            r.stdout,
+            r.stderr
+        );
     }
 }

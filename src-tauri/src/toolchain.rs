@@ -719,6 +719,8 @@ mod tests {
         // Anything here must be understood by BOTH GCC and Apple Clang. A flag
         // only one of them accepts fails every compile on the other platform.
         const PORTABLE_PREFIXES: [&str; 4] = ["-std=", "-O", "-W", "-static"];
+        // -idirafter and -I are added by plan_compile, not by this function, but
+        // both are understood by GCC and Clang alike.
         for a in base_compile_args("c++17") {
             assert!(
                 PORTABLE_PREFIXES.iter().any(|p| a.starts_with(p)),
@@ -1164,6 +1166,10 @@ pub struct CompileSpec {
 }
 
 /// Build the compiler invocation for `rel_file` inside `workspace`.
+///
+/// The convenience form: every translation unit, no compatibility headers.
+/// Production goes through `plan_compile_units`, which needs both knobs.
+#[allow(dead_code)]
 pub fn plan_compile(
     workspace: &Path,
     rel_file: &str,
@@ -1172,7 +1178,7 @@ pub fn plan_compile(
     standard: &str,
     exe: &Path,
 ) -> CompileSpec {
-    plan_compile_units(workspace, rel_file, cpp, compiler, standard, exe, usize::MAX)
+    plan_compile_units(workspace, rel_file, cpp, compiler, standard, exe, usize::MAX, None)
 }
 
 /// As `plan_compile`, but linking at most `max_units` translation units.
@@ -1188,6 +1194,7 @@ pub fn plan_compile_units(
     standard: &str,
     exe: &Path,
     max_units: usize,
+    compat_include: Option<&Path>,
 ) -> CompileSpec {
     let src_abs = workspace.join(rel_file);
     let project_dir = src_abs.parent().unwrap_or(workspace).to_path_buf();
@@ -1220,6 +1227,17 @@ pub fn plan_compile_units(
             .unwrap_or_else(|_| u.to_string_lossy().to_string());
         units.push(rel);
     }
+    // `-idirafter`, not `-I`: the directory goes AFTER the system headers, so a
+    // toolchain that already has the real <bits/stdc++.h> (every GCC) keeps
+    // using it and only a toolchain without one (Apple Clang) falls through to
+    // the shim. Both compilers accept the flag. The path is absolute, which is
+    // safe here for the same reason the output path is: the build directory is
+    // forced to ASCII.
+    if let Some(compat) = compat_include {
+        args.push("-idirafter".to_string());
+        args.push(compat.to_string_lossy().to_string());
+    }
+
     args.extend(units.iter().cloned());
     args.push("-o".to_string());
     args.push(exe.to_string_lossy().to_string());
@@ -1231,6 +1249,239 @@ pub fn plan_compile_units(
         exe: exe.to_path_buf(),
         units,
     }
+}
+
+/// Contents of the `bits/stdc++.h` compatibility header.
+///
+/// Every include is guarded by `__has_include`, so the same file works against
+/// libstdc++, libc++ and any standard level from C++11 up. Headers that only
+/// exist in newer standards simply do not appear.
+const BITS_STDCXX_SHIM: &str = r#"// MINT Exam IDE — compatibility header.
+//
+// <bits/stdc++.h> is a libstdc++ extension. It does not exist on macOS, whose
+// clang uses libc++, so a student who writes the include that every
+// competitive-programming habit teaches would have working code on Windows and
+// a compile error on a Mac. This file exists only for the platforms that lack
+// the real one: it is added with -idirafter, so wherever the genuine
+// <bits/stdc++.h> exists, that one is still used.
+#pragma once
+
+#if defined(__has_include)
+#  define MINT_HAS(x) __has_include(x)
+#else
+#  define MINT_HAS(x) 1
+#endif
+
+// C library
+#if MINT_HAS(<cassert>)
+#  include <cassert>
+#endif
+#if MINT_HAS(<cctype>)
+#  include <cctype>
+#endif
+#if MINT_HAS(<cerrno>)
+#  include <cerrno>
+#endif
+#if MINT_HAS(<cfloat>)
+#  include <cfloat>
+#endif
+#if MINT_HAS(<climits>)
+#  include <climits>
+#endif
+#if MINT_HAS(<cmath>)
+#  include <cmath>
+#endif
+#if MINT_HAS(<cstdarg>)
+#  include <cstdarg>
+#endif
+#if MINT_HAS(<cstddef>)
+#  include <cstddef>
+#endif
+#if MINT_HAS(<cstdint>)
+#  include <cstdint>
+#endif
+#if MINT_HAS(<cstdio>)
+#  include <cstdio>
+#endif
+#if MINT_HAS(<cstdlib>)
+#  include <cstdlib>
+#endif
+#if MINT_HAS(<cstring>)
+#  include <cstring>
+#endif
+#if MINT_HAS(<ctime>)
+#  include <ctime>
+#endif
+#if MINT_HAS(<cwchar>)
+#  include <cwchar>
+#endif
+
+// Containers
+#if MINT_HAS(<array>)
+#  include <array>
+#endif
+#if MINT_HAS(<bitset>)
+#  include <bitset>
+#endif
+#if MINT_HAS(<deque>)
+#  include <deque>
+#endif
+#if MINT_HAS(<forward_list>)
+#  include <forward_list>
+#endif
+#if MINT_HAS(<list>)
+#  include <list>
+#endif
+#if MINT_HAS(<map>)
+#  include <map>
+#endif
+#if MINT_HAS(<queue>)
+#  include <queue>
+#endif
+#if MINT_HAS(<set>)
+#  include <set>
+#endif
+#if MINT_HAS(<stack>)
+#  include <stack>
+#endif
+#if MINT_HAS(<unordered_map>)
+#  include <unordered_map>
+#endif
+#if MINT_HAS(<unordered_set>)
+#  include <unordered_set>
+#endif
+#if MINT_HAS(<vector>)
+#  include <vector>
+#endif
+
+// Algorithms, numerics, utilities
+#if MINT_HAS(<algorithm>)
+#  include <algorithm>
+#endif
+#if MINT_HAS(<bit>)
+#  include <bit>
+#endif
+#if MINT_HAS(<chrono>)
+#  include <chrono>
+#endif
+#if MINT_HAS(<complex>)
+#  include <complex>
+#endif
+#if MINT_HAS(<functional>)
+#  include <functional>
+#endif
+#if MINT_HAS(<initializer_list>)
+#  include <initializer_list>
+#endif
+#if MINT_HAS(<iterator>)
+#  include <iterator>
+#endif
+#if MINT_HAS(<limits>)
+#  include <limits>
+#endif
+#if MINT_HAS(<memory>)
+#  include <memory>
+#endif
+#if MINT_HAS(<numeric>)
+#  include <numeric>
+#endif
+#if MINT_HAS(<optional>)
+#  include <optional>
+#endif
+#if MINT_HAS(<random>)
+#  include <random>
+#endif
+#if MINT_HAS(<ratio>)
+#  include <ratio>
+#endif
+#if MINT_HAS(<string>)
+#  include <string>
+#endif
+#if MINT_HAS(<string_view>)
+#  include <string_view>
+#endif
+#if MINT_HAS(<tuple>)
+#  include <tuple>
+#endif
+#if MINT_HAS(<type_traits>)
+#  include <type_traits>
+#endif
+#if MINT_HAS(<utility>)
+#  include <utility>
+#endif
+#if MINT_HAS(<variant>)
+#  include <variant>
+#endif
+
+// I/O
+#if MINT_HAS(<fstream>)
+#  include <fstream>
+#endif
+#if MINT_HAS(<iomanip>)
+#  include <iomanip>
+#endif
+#if MINT_HAS(<ios>)
+#  include <ios>
+#endif
+#if MINT_HAS(<iostream>)
+#  include <iostream>
+#endif
+#if MINT_HAS(<istream>)
+#  include <istream>
+#endif
+#if MINT_HAS(<ostream>)
+#  include <ostream>
+#endif
+#if MINT_HAS(<sstream>)
+#  include <sstream>
+#endif
+#if MINT_HAS(<streambuf>)
+#  include <streambuf>
+#endif
+
+// Concurrency and exceptions
+#if MINT_HAS(<atomic>)
+#  include <atomic>
+#endif
+#if MINT_HAS(<condition_variable>)
+#  include <condition_variable>
+#endif
+#if MINT_HAS(<exception>)
+#  include <exception>
+#endif
+#if MINT_HAS(<mutex>)
+#  include <mutex>
+#endif
+#if MINT_HAS(<new>)
+#  include <new>
+#endif
+#if MINT_HAS(<stdexcept>)
+#  include <stdexcept>
+#endif
+#if MINT_HAS(<thread>)
+#  include <thread>
+#endif
+
+#undef MINT_HAS
+"#;
+
+/// Write the compatibility headers into `build_dir` and return the directory to
+/// hand the compiler, or None if it could not be written (in which case the
+/// compile simply proceeds without them).
+///
+/// Rewritten only when the contents differ, so a Run does not touch the disk
+/// for nothing.
+pub fn ensure_compat_headers(build_dir: &Path) -> Option<PathBuf> {
+    let root = build_dir.join("mint_compat");
+    let bits = root.join("bits");
+    let header = bits.join("stdc++.h");
+
+    let current = std::fs::read_to_string(&header).unwrap_or_default();
+    if current != BITS_STDCXX_SHIM {
+        std::fs::create_dir_all(&bits).ok()?;
+        std::fs::write(&header, BITS_STDCXX_SHIM).ok()?;
+    }
+    Some(root)
 }
 
 /// `..`-style path from the directory holding `rel_file` back to the workspace
@@ -1368,7 +1619,9 @@ mod build_tests {
         );
         let out = exe.to_string_lossy().to_string();
         for a in &spec.args {
-            if *a == out {
+            // The output path and the compat-header directory are both ours and
+            // both live under an ASCII build directory.
+            if *a == out || a.contains("mint_compat") {
                 continue;
             }
             assert!(
@@ -1679,7 +1932,7 @@ mod real_compiler_tests {
         );
 
         // 2. The single-unit retry must succeed and produce the ACTIVE file's answer.
-        let solo = plan_compile_units(ws.path(), "main.cpp", true, &c, DEFAULT_CPP_STANDARD, &exe, 1);
+        let solo = plan_compile_units(ws.path(), "main.cpp", true, &c, DEFAULT_CPP_STANDARD, &exe, 1, None);
         assert_eq!(solo.units.len(), 1);
         let (ok2, diag2) = solo.run();
         assert!(ok2, "single-file retry must compile: {}", diag2);
@@ -2011,6 +2264,93 @@ mod real_compiler_tests {
             "a non-UTF-8 sibling must still be offered to the compiler: {:?}",
             spec.units
         );
+    }
+
+    #[test]
+    fn the_bits_stdcxx_shim_is_valid_cpp() {
+        let c = match cxx() {
+            Some(c) => c,
+            None => {
+                eprintln!("SKIP the_bits_stdcxx_shim_is_valid_cpp: no C++ compiler");
+                return;
+            }
+        };
+        // This machine's GCC has the real <bits/stdc++.h>, so a normal compile
+        // would never touch the shim and could not tell us whether it is even
+        // valid. Force it with -I (before the system headers) so the shim IS
+        // what gets included — the situation a macOS student is in.
+        let ws = Ws::new("shim");
+        let compat = ensure_compat_headers(ws.path()).expect("write compat headers");
+        assert!(compat.join("bits").join("stdc++.h").is_file());
+
+        ws.write(
+            "main.cpp",
+            "#include <bits/stdc++.h>\nusing namespace std;\n\
+             int main(){ vector<int> v{3,1,2}; sort(v.begin(), v.end());\n\
+             map<string,int> m; m[\"a\"]=1; string s=\"x\";\n\
+             cout << v[0] << v[1] << v[2] << m[\"a\"] << s << endl; }\n",
+        );
+        let exe = ws.path().join(if cfg!(windows) { "shim.exe" } else { "shim" });
+        let mut args = base_compile_args(DEFAULT_CPP_STANDARD);
+        args.push("-I".to_string());
+        args.push(compat.to_string_lossy().to_string());
+        args.push("main.cpp".to_string());
+        args.push("-o".to_string());
+        args.push(exe.to_string_lossy().to_string());
+
+        let mut cmd = Command::new(&c);
+        cmd.args(&args).current_dir(ws.path()).stdin(Stdio::null());
+        compile_env(&mut cmd);
+        let out = quiet(&mut cmd).output().expect("compile with the shim");
+        assert!(
+            out.status.success(),
+            "the shim header does not compile:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let run = Command::new(&exe).current_dir(ws.path()).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "1231x");
+    }
+
+    #[test]
+    fn bits_stdcxx_compiles_through_the_normal_run_path() {
+        let c = match cxx() {
+            Some(c) => c,
+            None => {
+                eprintln!("SKIP bits_stdcxx_compiles_through_the_normal_run_path: no C++ compiler");
+                return;
+            }
+        };
+        // The include every competitive-programming habit teaches must work on
+        // whatever this machine has, through exactly the arguments a Run uses.
+        let ws = Ws::new("bits");
+        let compat = ensure_compat_headers(ws.path()).expect("compat headers");
+        ws.write(
+            "main.cpp",
+            "#include <bits/stdc++.h>\nusing namespace std;\n\
+             int main(){ int n; cin >> n; vector<int> v(n); for(auto&x:v) cin>>x;\n\
+             sort(v.rbegin(), v.rend()); for(int x:v) cout<<x<<' '; cout<<endl; }\n",
+        );
+        let exe = ws.path().join(if cfg!(windows) { "b.exe" } else { "b" });
+        let spec = plan_compile_units(
+            ws.path(), "main.cpp", true, &c, DEFAULT_CPP_STANDARD, &exe, usize::MAX, Some(&compat),
+        );
+        assert!(spec.args.iter().any(|a| a == "-idirafter"), "compat include missing");
+        let (ok, diag) = spec.run();
+        assert!(ok, "bits/stdc++.h failed to compile: {}", diag);
+
+        let mut cmd = Command::new(&exe);
+        cmd.current_dir(ws.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = quiet(&mut cmd).spawn().unwrap();
+        {
+            let mut sin = child.stdin.take().unwrap();
+            sin.write_all(b"3\n5 1 9\n").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "9 5 1");
     }
 
     #[test]

@@ -1356,6 +1356,9 @@ function stopCurrentRun(): void {
 
 /// True once EOF has been sent for the current run; further sends are pointless.
 let stdinClosed = false;
+/// True once "this program is not taking input" has been said for this run, so
+/// it is said once rather than after every keystroke.
+let stdinWarned = false;
 
 function stdinRow(): HTMLElement | null {
   return document.getElementById("stdin-row");
@@ -1365,6 +1368,7 @@ function showStdinRow(): void {
   const row = stdinRow();
   if (!row) return;
   stdinClosed = false;
+  stdinWarned = false;
   row.hidden = false;
   const input = document.getElementById("stdin-input") as HTMLInputElement | null;
   const send = document.getElementById("stdin-send") as HTMLButtonElement | null;
@@ -1394,10 +1398,14 @@ async function sendStdin(text: string): Promise<void> {
     const delivered = await invoke<boolean>("send_stdin", { text });
     if (delivered) {
       appendOutput(text, "stdin");
-    } else {
-      // The program already stopped reading (finished, or never read at all).
-      appendOutput("[프로그램이 입력을 더 받지 않습니다]\n", "system");
-      stdinClosed = true;
+    } else if (!stdinWarned) {
+      // Not delivered means the program finished, closed its end, or has
+      // stopped consuming what it was already sent. Say so ONCE — and leave the
+      // box usable, because a program that is merely behind on reading may
+      // still catch up, and latching it shut would strand the student with no
+      // way to feed a program that is genuinely waiting.
+      appendOutput("[프로그램이 입력을 받지 않습니다 — 이미 끝났거나 입력을 읽지 않는 코드입니다]\n", "system");
+      stdinWarned = true;
     }
   } catch (e) {
     appendOutput(`[stdin 전송 실패: ${e}]\n`, "error");

@@ -194,8 +194,12 @@ if (Test-Path $MINT_GXX_EXE) {
 }
 
 if (-not $gccReuse) {
-    if (-not (Test-Cmd "tar")) {
-        Write-Host "  [WARN] tar.exe not found (needs Windows 10 1803+). Skipping C/C++ toolchain." -ForegroundColor Yellow
+    # Check the exact binary this step invokes, not whatever `tar` PATH resolves
+    # to: a Git-for-Windows GNU tar can satisfy a PATH probe while the bundled
+    # bsdtar - the one that reads 7-Zip - is what we actually need.
+    $bsdtar = Join-Path $env:SystemRoot "System32\tar.exe"
+    if (-not (Test-Path $bsdtar)) {
+        Write-Host "  [WARN] $bsdtar not found (needs Windows 10 1803+). Skipping C/C++ toolchain." -ForegroundColor Yellow
         Write-Host "         Python/Java will still work; C and C++ Run will not." -ForegroundColor Yellow
         $script:hadWarnings = $true
     } else {
@@ -228,7 +232,7 @@ if (-not $gccReuse) {
             New-Item -ItemType Directory -Force -Path $MINT_GCC_ROOT | Out-Null
             Write-Host "  Extracting to $MINT_GCC_ROOT (takes ~10 s) ..."
             # Windows' bundled tar is bsdtar/libarchive, which reads 7-Zip.
-            & "$env:SystemRoot\System32\tar.exe" -xf $gccArchive -C $MINT_GCC_ROOT
+            & $bsdtar -xf $gccArchive -C $MINT_GCC_ROOT
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path $MINT_GXX_EXE)) {
                 Write-Host "  [WARN] Extraction did not produce $MINT_GXX_EXE (tar exit $LASTEXITCODE)." -ForegroundColor Yellow
                 $gccOk = $false

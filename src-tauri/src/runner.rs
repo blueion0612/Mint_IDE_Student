@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +25,9 @@ const MAX_OUTPUT_LINES_BEFORE_AUTO_STOP: u64 = 200_000;
 const MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP: u64 = 64 * 1024 * 1024;
 /// Retained-in-RAM cap for the collected stdout (run-done payload).
 const STDOUT_BUF_CAP_BYTES: usize = 8 * 1024 * 1024;
+/// Largest single `run-output` event. Matches what one 64 KB read used to
+/// produce, so a flooding program cannot hand the webview one huge payload.
+const MAX_EMIT_CHUNK_BYTES: usize = 64 * 1024;
 
 // Cached Python path — found once, reused forever
 static CACHED_PYTHON: Mutex<Option<String>> = Mutex::new(None);
@@ -355,6 +358,16 @@ fn clear_stdin_generation(handle: &RunningStdin, gen: u64) {
     }
 }
 
+/// The generation currently occupying the process slot, if any.
+///
+/// Introspection for the tests: the Stop-during-compile test has to wait until
+/// the compiler is genuinely published before pressing Stop, or it would be
+/// testing a race rather than the behaviour.
+#[allow(dead_code)]
+pub fn current_slot_generation(process_handle: &RunningProcess) -> Option<u64> {
+    process_handle.lock().ok().and_then(|g| g.as_ref().map(|(id, _)| *id))
+}
+
 /// Whether the running program's stdin pipe exists yet. `false` while a
 /// compiled language is still compiling.
 ///
@@ -376,14 +389,23 @@ pub fn stdin_pipe_ready(handle: &RunningStdin) -> bool {
 /// exactly the window in which the output panel's input box must be able to
 /// feed it. Reintroducing the swap fails six of the end-to-end tests at the
 /// bottom of this file.
-fn wait_then_release_stdin(
-    child: Option<Child>,
+fn wait_program_then_release_stdin(
+    process_handle: &RunningProcess,
     stdin_handle: &RunningStdin,
     gen: u64,
-) -> Option<i32> {
-    let code = child.and_then(|mut c| c.wait().ok().and_then(|s| s.code()));
+) -> (bool, Option<i32>) {
+    // Waits IN the slot, so the child remains findable — and therefore
+    // killable — by Stop, by the runaway-output auto-stop and by the
+    // kill-on-exit hook for as long as it runs.
+    let outcome = wait_child_in_slot(process_handle, gen, None, Duration::from_millis(25));
+    release_slot(process_handle, gen);
+    let result = match outcome {
+        SlotWait::Exited(status) => (true, status.code()),
+        // Stopped, superseded, or (with no limit) unreachable.
+        _ => (false, None),
+    };
     clear_stdin_generation(stdin_handle, gen);
-    code
+    result
 }
 
 pub fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::HashSet<String> {
@@ -648,7 +670,8 @@ pub fn execute_code_streaming(
 
         let stdout_collected = Arc::new(Mutex::new(String::new()));
         let stderr_collected = Arc::new(Mutex::new(String::new()));
-        let sc1 = stdout_collected.clone();
+        // stdout's copy is taken by the flusher, which is the only thing that
+        // emits it; the reader no longer touches it.
         let sc2 = stderr_collected.clone();
 
         // stdout: CHUNKED reader (64KB), batched into ~50ms emits. Chunking —
@@ -663,14 +686,74 @@ pub fn execute_code_streaming(
         let lc1 = line_counter.clone();
         let bc1 = byte_counter.clone();
         let proc_handle1 = process_handle.clone();
+        // stdout is read by one thread and EMITTED by another.
+        //
+        // The reader alone used to do both, flushing its batch buffer only on
+        // the way round the loop — that is, only when the NEXT read returned.
+        // A program that prints a prompt and then blocks on input therefore
+        // showed the student nothing: the prompt sat in the buffer until more
+        // output arrived or the program exited. That is precisely the shape of
+        // an interactive exam program ("이름을 입력하세요: " then getline), and
+        // it was invisible until stdin existed to make such programs possible.
+        // (The old code had a 50 ms escape hatch that usually hid this, because
+        // process start-up took longer than the interval — on a fast machine it
+        // did not, and the prompt vanished.)
+        //
+        // A dedicated flusher on a ~50 ms tick keeps the batching that stops an
+        // event flood while bounding how long any byte can wait. Only the
+        // flusher emits, so ordering is preserved.
+        let emit_state: Arc<(Mutex<(String, bool)>, Condvar)> =
+            Arc::new((Mutex::new((String::new(), false)), Condvar::new()));
+
+        let flush_state = emit_state.clone();
+        let ah_flush = app_handle.clone();
+        let sc_flush = stdout_collected.clone();
+        let t_flush = thread::spawn(move || {
+            let (lock, cv) = &*flush_state;
+            loop {
+                let (text, done) = {
+                    let guard = lock.lock().unwrap();
+                    // Wake on the tick, or early when the reader signals a full
+                    // batch or the end of the stream.
+                    let (mut guard, _) = cv
+                        .wait_timeout(guard, Duration::from_millis(EMIT_BATCH_INTERVAL_MS))
+                        .unwrap();
+                    (std::mem::take(&mut guard.0), guard.1)
+                };
+                if !text.is_empty() {
+                    push_capped(&sc_flush, STDOUT_BUF_CAP_BYTES, &text);
+                    // One emit per event stays bounded. The reader can hand
+                    // over megabytes between ticks when a program floods, and
+                    // the webview should not be given a multi-megabyte payload
+                    // in one go — the old synchronous flush was naturally
+                    // capped at one 64 KB read, so keep that shape.
+                    let mut rest: &str = &text;
+                    while !rest.is_empty() {
+                        let mut cut = MAX_EMIT_CHUNK_BYTES.min(rest.len());
+                        while cut > 0 && !rest.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        if cut == 0 {
+                            cut = rest.len(); // a single char longer than the cap
+                        }
+                        emit_line(&ah_flush, "stdout", &rest[..cut]);
+                        rest = &rest[cut..];
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+        });
+
         let t1 = thread::spawn(move || -> bool {
             let mut auto_stopped = false;
+            let mut limit_message: Option<String> = None;
             if let Some(mut out) = stdout {
                 use std::io::Read;
                 let mut chunk = [0u8; 65536];
                 let mut pending: Vec<u8> = Vec::new();
-                let mut buffer = String::new();
-                let mut last_flush = Instant::now();
+                let (lock, cv) = &*emit_state;
                 loop {
                     let n = match out.read(&mut chunk) {
                         Ok(0) => break,
@@ -681,48 +764,54 @@ pub fn execute_code_streaming(
                     let lines_so_far = lc1.fetch_add(nl, Ordering::Relaxed) + nl;
                     let bytes_so_far = bc1.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
                     pending.extend_from_slice(&chunk[..n]);
-                    buffer.push_str(&drain_utf8_lossy(&mut pending));
+                    let decoded = drain_utf8_lossy(&mut pending);
+                    if !decoded.is_empty() {
+                        let mut guard = lock.lock().unwrap();
+                        guard.0.push_str(&decoded);
+                        if guard.0.len() >= EMIT_BATCH_MAX_BYTES {
+                            cv.notify_one();
+                        }
+                    }
 
                     let over_lines = lines_so_far > MAX_OUTPUT_LINES_BEFORE_AUTO_STOP;
                     let over_bytes = bytes_so_far > MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP;
                     if over_lines || over_bytes {
-                        if !buffer.is_empty() {
-                            push_capped(&sc1, STDOUT_BUF_CAP_BYTES, &buffer);
-                            emit_line(&ah1, "stdout", &buffer);
-                            buffer.clear();
-                        }
-                        let what = if over_lines {
+                        limit_message = Some(if over_lines {
                             format!("{} lines", MAX_OUTPUT_LINES_BEFORE_AUTO_STOP)
                         } else {
                             format!("{} MB", MAX_OUTPUT_BYTES_BEFORE_AUTO_STOP / (1024 * 1024))
-                        };
-                        emit_line(&ah1, "system",
-                            &format!("\n[OUTPUT LIMIT EXCEEDED — {}. Auto-stopping process.]\n", what));
+                        });
+                        // Kill first: the student is waiting, and the message
+                        // below is only worth reading once the flood stops.
                         stop_process_generation(&proc_handle1, my_id);
                         auto_stopped = true;
                         break;
                     }
-                    if buffer.len() >= EMIT_BATCH_MAX_BYTES
-                        || last_flush.elapsed() >= Duration::from_millis(EMIT_BATCH_INTERVAL_MS)
-                    {
-                        push_capped(&sc1, STDOUT_BUF_CAP_BYTES, &buffer);
-                        emit_line(&ah1, "stdout", &buffer);
-                        buffer.clear();
-                        last_flush = Instant::now();
-                    }
                 }
-                if !auto_stopped {
-                    // Flush any decodable remainder + a lossy tail (incomplete
-                    // final multi-byte char at EOF).
-                    buffer.push_str(&drain_utf8_lossy(&mut pending));
-                    if !pending.is_empty() {
-                        buffer.push_str(&String::from_utf8_lossy(&pending));
-                    }
-                    if !buffer.is_empty() {
-                        push_capped(&sc1, STDOUT_BUF_CAP_BYTES, &buffer);
-                        emit_line(&ah1, "stdout", &buffer);
-                    }
+                // Whatever is left, including an incomplete final multi-byte
+                // character, then close the stream.
+                let mut tail = drain_utf8_lossy(&mut pending);
+                if !pending.is_empty() {
+                    tail.push_str(&String::from_utf8_lossy(&pending));
                 }
+                {
+                    let mut guard = lock.lock().unwrap();
+                    guard.0.push_str(&tail);
+                    guard.1 = true;
+                    cv.notify_one();
+                }
+            } else {
+                let (lock, cv) = &*emit_state;
+                let mut guard = lock.lock().unwrap();
+                guard.1 = true;
+                cv.notify_one();
+            }
+            // The auto-stop notice must come AFTER the output it interrupts, so
+            // wait for the flusher to drain before saying anything.
+            let _ = t_flush.join();
+            if let Some(what) = limit_message {
+                emit_line(&ah1, "system",
+                    &format!("\n[OUTPUT LIMIT EXCEEDED — {}. Auto-stopping process.]\n", what));
             }
             auto_stopped
         });
@@ -780,22 +869,19 @@ pub fn execute_code_streaming(
         // stuck "running" for a program that already finished. Waiting on the
         // child process is independent of the pipe, so it returns correctly.
         //
-        // Only reap if the child is still the active one: a concurrent Stop
-        // (child taken by stop_code) or a newer run means the slot holds a
-        // DIFFERENT generation — we must not steal it or fire a misattributed
-        // run-done. Taking under the lock keeps a concurrent Stop unblocked.
-        let my_child = {
-            let mut guard = process_handle.lock().unwrap();
-            match guard.as_ref() {
-                Some((id, _)) if *id == my_id => guard.take().map(|(_, c)| c),
-                _ => None,
-            }
-        };
-        let owned = my_child.is_some();
-        // Blocks for the life of the program, keeping stdin open across it, then
-        // releases the handle. A student who presses Stop is released instead by
-        // `stop_code`, which closes stdin explicitly before killing the child.
-        let exit_code = wait_then_release_stdin(my_child, &stdin_handle, my_id);
+        // Only OUR child counts: a concurrent Stop (child taken by stop_code)
+        // or a newer run means the slot holds a DIFFERENT generation, and we
+        // must neither steal it nor fire a misattributed run-done.
+        //
+        // The child is left IN the slot while it runs. Taking it out first —
+        // which is what this did — emptied the slot for the whole life of every
+        // program, so Stop, the runaway auto-stop and the kill-on-exit hook all
+        // looked in an empty slot and killed nothing.
+        //
+        // stdin stays open across the wait and is released after it, which is
+        // the ordering the whole input feature depends on.
+        let (owned, exit_code) =
+            wait_program_then_release_stdin(&process_handle, &stdin_handle, my_id);
 
         // The direct child has exited. Drain the reader threads, but BOUNDED:
         // in the normal case the pipe hit EOF the instant the child exited, so
@@ -1309,53 +1395,71 @@ struct NativeBuild {
     bin_dir: Option<std::path::PathBuf>,
 }
 
-/// Outcome of waiting for a compile.
-enum CompileWait {
-    Done(std::process::ExitStatus),
-    /// Ran past `COMPILE_TIMEOUT` and was killed.
+/// Outcome of waiting for a child that lives in the shared process slot.
+enum SlotWait {
+    Exited(std::process::ExitStatus),
+    /// Ran past the limit and was killed.
     TimedOut,
     /// The student pressed Stop (or a newer run took the slot).
     Cancelled,
 }
 
-/// Wait for a compile that lives in the SHARED process slot.
+/// Wait for a child that lives in the SHARED process slot.
 ///
-/// The compiler child is published under the run generation exactly like the
-/// program is, which is what makes Stop work during a compile: `stop_code`
-/// takes it out of the slot and kills it, and the next poll here sees the slot
-/// no longer holds this generation.
+/// The child STAYS in the slot for as long as it runs, and that is the whole
+/// point: `stop_code` stops a program by taking it out of the slot and killing
+/// it, so a child held anywhere else cannot be stopped at all.
 ///
-/// `std::process::Child` has no timed wait, so this polls; 20 ms is short
-/// enough that a normal sub-second compile is not measurably delayed.
-fn wait_compile_in_slot(
+/// This function previously existed only for the compiler while the program was
+/// waited on with a plain `child.wait()` — which required taking the child OUT
+/// of the slot first. The slot was therefore empty for the entire life of every
+/// program, so Stop found nothing, killed nothing, and merely reset the UI while
+/// the program kept running. The auto-stop on runaway output and the
+/// kill-on-exit hook looked in the same empty slot and were equally inert.
+///
+/// `std::process::Child` has no timed wait, so this polls. The lock is held only
+/// for the `try_wait` itself, leaving Stop free to take the child between polls.
+fn wait_child_in_slot(
     process_handle: &RunningProcess,
     my_id: u64,
-    limit: Duration,
-) -> CompileWait {
+    limit: Option<Duration>,
+    poll: Duration,
+) -> SlotWait {
     let start = Instant::now();
     loop {
         {
             let mut guard = match process_handle.lock() {
                 Ok(g) => g,
-                Err(_) => return CompileWait::Cancelled,
+                Err(_) => return SlotWait::Cancelled,
             };
             match guard.as_mut() {
                 Some((id, child)) if *id == my_id => match child.try_wait() {
-                    Ok(Some(status)) => return CompileWait::Done(status),
+                    Ok(Some(status)) => return SlotWait::Exited(status),
                     Ok(None) => {
-                        if start.elapsed() >= limit {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return CompileWait::TimedOut;
+                        if let Some(limit) = limit {
+                            if start.elapsed() >= limit {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return SlotWait::TimedOut;
+                            }
                         }
                     }
-                    Err(_) => return CompileWait::Cancelled,
+                    Err(_) => return SlotWait::Cancelled,
                 },
                 // Someone took our child: Stop, or a newer run.
-                _ => return CompileWait::Cancelled,
+                _ => return SlotWait::Cancelled,
             }
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(poll);
+    }
+}
+
+/// Remove this run's child from the slot, if it is still ours.
+fn release_slot(process_handle: &RunningProcess, my_id: u64) {
+    if let Ok(mut guard) = process_handle.lock() {
+        if matches!(guard.as_ref(), Some((id, _)) if *id == my_id) {
+            *guard = None;
+        }
     }
 }
 
@@ -1425,29 +1529,29 @@ fn run_compile_attempt(
         *guard = Some((my_id, child));
     }
 
-    let wait = wait_compile_in_slot(process_handle, my_id, COMPILE_TIMEOUT);
+    let wait = wait_child_in_slot(
+        process_handle,
+        my_id,
+        Some(COMPILE_TIMEOUT),
+        Duration::from_millis(20),
+    );
 
     // Take the compiler back out of the slot so the program can take its place.
     // If Stop already took it, this is a no-op.
-    if let Ok(mut guard) = process_handle.lock() {
-        let ours = matches!(guard.as_ref(), Some((id, _)) if *id == my_id);
-        if ours {
-            *guard = None;
-        }
-    }
+    release_slot(process_handle, my_id);
 
     let compile_out = join_bounded(t_out, Duration::from_secs(5)).unwrap_or_default();
     let compile_err = join_bounded(t_err, Duration::from_secs(5)).unwrap_or_default();
     let combined = format!("{}{}", compile_err, compile_out);
 
     match wait {
-        CompileWait::Done(status) if status.success() => CompileAttempt::Success { warnings: combined },
-        CompileWait::Done(status) => CompileAttempt::Failed {
+        SlotWait::Exited(status) if status.success() => CompileAttempt::Success { warnings: combined },
+        SlotWait::Exited(status) => CompileAttempt::Failed {
             diagnostics: combined,
             code: status.code(),
         },
-        CompileWait::TimedOut => CompileAttempt::TimedOut,
-        CompileWait::Cancelled => CompileAttempt::Cancelled,
+        SlotWait::TimedOut => CompileAttempt::TimedOut,
+        SlotWait::Cancelled => CompileAttempt::Cancelled,
     }
 }
 
@@ -2242,6 +2346,37 @@ mod stdin_tests {
 mod e2e_tests {
     use super::*;
 
+    /// These tests share process-global state — `RUN_GEN` and the cancellation
+    /// set — because a real session only ever has one run in flight. Cargo runs
+    /// tests in parallel, so without this one test's Stop would cancel
+    /// another's run and the failure would look like a product bug. Production
+    /// needs no such lock: the Run button becomes Stop, which is what serialises
+    /// runs there.
+    static E2E_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the lock, ignoring poisoning — a panicking test should not cascade
+    /// into every later one.
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Kills whatever is still in the process slot when a test ends.
+    ///
+    /// A test that leaves a child running is not merely untidy here: the child
+    /// inherited the test harness's stdout pipe, so it holds that pipe open
+    /// after cargo exits and anything reading the harness's output waits
+    /// forever. Dropping this guard reaps the child on every exit path,
+    /// including a panic.
+    struct RunGuard(RunningProcess, RunningStdin);
+    impl Drop for RunGuard {
+        fn drop(&mut self) {
+            close_stdin(&self.1);
+            if let Some(child) = self.0.lock().ok().and_then(|mut g| g.take().map(|(_, c)| c)) {
+                stop_taken_child(child);
+            }
+        }
+    }
+
     /// Collects what the frontend would have received.
     #[derive(Default)]
     struct Collector {
@@ -2312,6 +2447,7 @@ mod e2e_tests {
         let events: Events = collector.clone();
         let process = new_running_process();
         let stdin = new_running_stdin();
+        let _reaper = RunGuard(process.clone(), stdin.clone());
 
         execute_code_streaming(
             language,
@@ -2366,6 +2502,7 @@ mod e2e_tests {
 
     #[test]
     fn cpp_run_reads_stdin_and_reports_its_output() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP cpp_run_reads_stdin_and_reports_its_output: no C++ compiler");
             return;
@@ -2389,6 +2526,7 @@ mod e2e_tests {
 
     #[test]
     fn input_typed_during_the_compile_still_reaches_the_program() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP input_typed_during_the_compile_still_reaches_the_program: no C++ compiler");
             return;
@@ -2407,6 +2545,7 @@ mod e2e_tests {
         let events: Events = collector.clone();
         let process = new_running_process();
         let stdin = new_running_stdin();
+        let _reaper = RunGuard(process.clone(), stdin.clone());
 
         execute_code_streaming(
             "cpp",
@@ -2440,8 +2579,274 @@ mod e2e_tests {
         assert_eq!(out.trim(), "42", "system log: {}", sys_log);
     }
 
+    /// What `lib::stop_code` does, without the Tauri State plumbing: record the
+    /// stop against the current generation, close input, take the child out of
+    /// the slot and kill it.
+    fn press_stop(process: &RunningProcess, stdin: &RunningStdin) {
+        close_stdin(stdin);
+        note_stop_request();
+        if let Some(child) = process.lock().ok().and_then(|mut g| g.take().map(|(_, c)| c)) {
+            stop_taken_child(child);
+        }
+    }
+
+    #[test]
+    fn stop_during_the_compile_prevents_the_program_from_running() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP stop_during_the_compile_prevents_the_program_from_running: no C++ compiler");
+            return;
+        }
+        // Stop used to be a no-op while a compile was in flight: it found an
+        // empty process slot, did nothing, and the program started anyway once
+        // the compiler finished. The student pressed Stop and watched their
+        // program run. <bits/stdc++.h> gives a compile long enough (~1s) to land
+        // a Stop inside reliably.
+        let ws = Ws::new("stop-compile");
+        let code = "#include <bits/stdc++.h>\n\
+                    int main(){ std::cout << \"SHOULD NOT RUN\" << std::endl; \
+                    std::ofstream f(\"ran.txt\"); f << \"ran\"; return 0; }\n";
+
+        let collector = Arc::new(Collector::default());
+        let events: Events = collector.clone();
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+        let _reaper = RunGuard(process.clone(), stdin.clone());
+
+        execute_code_streaming(
+            "cpp", code, "main.cpp",
+            Some(&ws.0.to_string_lossy()),
+            None,
+            events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
+        );
+
+        // Wait until the compiler is actually in the slot, then stop it.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while current_slot_generation(&process).is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            current_slot_generation(&process).is_some(),
+            "the compiler should have been published to the process slot"
+        );
+        press_stop(&process, &stdin);
+
+        // Give the run every chance to (wrongly) proceed.
+        thread::sleep(Duration::from_secs(3));
+
+        let out = collector.stdout.lock().unwrap().clone();
+        assert!(
+            !out.contains("SHOULD NOT RUN"),
+            "the program ran after Stop: {:?}",
+            out
+        );
+        assert!(
+            !ws.0.join("ran.txt").exists(),
+            "the program ran after Stop and left its output behind"
+        );
+        assert!(
+            collector.done.lock().unwrap().is_none(),
+            "a cancelled run must not fire run-done; the UI already reset itself"
+        );
+    }
+
+    #[test]
+    fn runaway_output_is_auto_stopped_and_the_program_really_dies() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP runaway_output_is_auto_stopped_and_the_program_really_dies: no C++ compiler");
+            return;
+        }
+        // `while(1) printf(...)` is a normal exam mistake. The auto-stop looks
+        // for the child in the same shared slot Stop does, so it was inert for
+        // exactly the same reason: the run thread had already taken the child
+        // out. The line cap would be announced and the program would keep
+        // flooding.
+        let ws = Ws::new("runaway");
+        let code = "#include <cstdio>\n\
+                    int main(){ for(long long i=0;;++i) printf(\"%lld\\n\", i); }\n";
+
+        let collector = Arc::new(Collector::default());
+        let events: Events = collector.clone();
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+        let _reaper = RunGuard(process.clone(), stdin.clone());
+
+        execute_code_streaming(
+            "cpp", code, "main.cpp",
+            Some(&ws.0.to_string_lossy()),
+            None,
+            events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
+        );
+
+        // The cap is 200k lines / 64 MB, which this program reaches in seconds.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while collector.done.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            collector.done.lock().unwrap().is_some(),
+            "the run never finished; a runaway program must be auto-stopped"
+        );
+        assert!(
+            collector.system.lock().unwrap().contains("OUTPUT LIMIT EXCEEDED"),
+            "the student should be told why it stopped: {}",
+            collector.system.lock().unwrap()
+        );
+
+        // And the announcement has to be true.
+        let settled = collector.stdout.lock().unwrap().len();
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(
+            collector.stdout.lock().unwrap().len(),
+            settled,
+            "the program was still printing after the auto-stop announced it had been stopped"
+        );
+    }
+
+    #[test]
+    fn stop_actually_stops_the_program_not_just_the_ui() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP stop_actually_stops_the_program_not_just_the_ui: no C++ compiler");
+            return;
+        }
+        // Asserting that the process slot is empty after Stop proves nothing:
+        // it is empty either way. This watches the program's OUTPUT instead. A
+        // program that keeps printing after Stop is a program that was never
+        // stopped — and in an exam that is a runaway the student cannot escape.
+        let ws = Ws::new("stop-proof");
+        let code = "#include <iostream>\n#include <chrono>\n#include <thread>\n\
+                    int main(){ for(long long i=0;;++i){ std::cout << i << std::endl;\n\
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50)); } }\n";
+
+        let collector = Arc::new(Collector::default());
+        let events: Events = collector.clone();
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+        let _reaper = RunGuard(process.clone(), stdin.clone());
+
+        execute_code_streaming(
+            "cpp", code, "main.cpp",
+            Some(&ws.0.to_string_lossy()),
+            None,
+            events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
+        );
+
+        // Wait until it is unmistakably running.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while collector.stdout.lock().unwrap().len() < 4 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            collector.stdout.lock().unwrap().len() >= 4,
+            "the program never started printing; system log: {}",
+            collector.system.lock().unwrap()
+        );
+
+        press_stop(&process, &stdin);
+
+        // Give any in-flight output time to land, then take a reading.
+        thread::sleep(Duration::from_millis(600));
+        let after_stop = collector.stdout.lock().unwrap().len();
+
+        // A stopped program prints nothing more. Two seconds is forty more
+        // lines at the program's rate — no ambiguity either way.
+        thread::sleep(Duration::from_secs(2));
+        let later = collector.stdout.lock().unwrap().len();
+
+        assert_eq!(
+            later, after_stop,
+            "the program kept printing after Stop — it was never killed \
+             (grew from {} to {} bytes)",
+            after_stop, later
+        );
+    }
+
+    #[test]
+    fn stop_while_running_kills_the_program() {
+        let _guard = exclusive();
+        if !have_cxx() {
+            eprintln!("SKIP stop_while_running_kills_the_program: no C++ compiler");
+            return;
+        }
+        // The runaway an exam actually produces: a loop that never ends.
+        let ws = Ws::new("stop-running");
+        let code = "#include <iostream>\n#include <chrono>\n#include <thread>\n\
+                    int main(){ std::cout << \"started\" << std::endl;\n\
+                    for(;;) std::this_thread::sleep_for(std::chrono::milliseconds(50)); }\n";
+
+        let collector = Arc::new(Collector::default());
+        let events: Events = collector.clone();
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+        let _reaper = RunGuard(process.clone(), stdin.clone());
+
+        execute_code_streaming(
+            "cpp", code, "main.cpp",
+            Some(&ws.0.to_string_lossy()),
+            None,
+            events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
+        );
+
+        // Wait for the program itself to be live and talking. Whatever happens,
+        // the child must not outlive this test: an orphan holding the inherited
+        // stdout pipe keeps the whole test harness from exiting.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut started = false;
+        while Instant::now() < deadline {
+            if collector.stdout.lock().unwrap().contains("started") {
+                started = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !started {
+            let out = collector.stdout.lock().unwrap().clone();
+            let err = collector.stderr.lock().unwrap().clone();
+            let sys_log = collector.system.lock().unwrap().clone();
+            press_stop(&process, &stdin);
+            panic!(
+                "the program never reported starting.\nstdout: {:?}\nstderr: {:?}\nsystem: {:?}",
+                out, err, sys_log
+            );
+        }
+
+        let stop_at = Instant::now();
+        press_stop(&process, &stdin);
+
+        // run-done is not emitted for a stopped run (the UI already reset
+        // itself), so completion is observed through the input being released.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while stdin_pipe_ready(&stdin) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !stdin_pipe_ready(&stdin),
+            "input was still open {:?} after Stop — the program was not reaped",
+            stop_at.elapsed()
+        );
+        assert!(
+            process.lock().unwrap().is_none(),
+            "the process slot should be empty after Stop"
+        );
+    }
+
     #[test]
     fn cpp_run_ends_on_eof() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP cpp_run_ends_on_eof: no C++ compiler");
             return;
@@ -2462,6 +2867,7 @@ mod e2e_tests {
 
     #[test]
     fn cpp_multi_file_run_links_and_runs() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP cpp_multi_file_run_links_and_runs: no C++ compiler");
             return;
@@ -2486,6 +2892,7 @@ mod e2e_tests {
 
     #[test]
     fn a_compile_error_is_reported_and_nothing_runs() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP a_compile_error_is_reported_and_nothing_runs: no C++ compiler");
             return;
@@ -2502,6 +2909,7 @@ mod e2e_tests {
 
     #[test]
     fn a_header_cannot_be_run_on_its_own() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP a_header_cannot_be_run_on_its_own: no C++ compiler");
             return;
@@ -2518,6 +2926,7 @@ mod e2e_tests {
 
     #[test]
     fn a_runtime_crash_is_reported_as_a_nonzero_exit() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP a_runtime_crash_is_reported_as_a_nonzero_exit: no C++ compiler");
             return;
@@ -2532,37 +2941,73 @@ mod e2e_tests {
 
     #[test]
     fn program_output_is_streamed_not_only_delivered_at_exit() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP program_output_is_streamed_not_only_delivered_at_exit: no C++ compiler");
             return;
         }
-        // A program that prompts, then reads, is the normal interactive shape.
-        // The prompt has to REACH the student before they are expected to
-        // answer it, which means partial lines must stream rather than being
-        // held until exit.
+        // A program that prompts and then reads is the normal interactive
+        // shape. The prompt must reach the student BEFORE they are expected to
+        // answer it, so this asserts on the output WHILE the program is still
+        // blocked — asserting after the run would pass even if nothing was
+        // emitted until exit, which is exactly the bug this guards.
         let ws = Ws::new("cpp-stream");
-        let code = "#include <iostream>\n\
+        let code = "#include <iostream>\n#include <string>\n\
                     int main(){ std::cout << \"이름을 입력하세요: \" << std::flush;\n\
                     std::string s; std::getline(std::cin, s);\n\
                     std::cout << \"안녕하세요, \" << s << std::endl; }\n";
-        let ws_ref = &ws;
-        let r = run_program(ws_ref, "cpp", "main.cpp", code, |stdin| {
-            // Give the prompt time to arrive before answering.
-            thread::sleep(Duration::from_millis(300));
-            assert!(write_stdin(stdin, "민트\n").unwrap());
-        });
 
-        assert!(r.finished, "system: {}", r.system);
-        assert!(
-            r.stdout.contains("이름을 입력하세요:"),
-            "an unterminated prompt must stream: {:?}",
-            r.stdout
+        let collector = Arc::new(Collector::default());
+        let events: Events = collector.clone();
+        let process = new_running_process();
+        let stdin = new_running_stdin();
+        let _reaper = RunGuard(process.clone(), stdin.clone());
+
+        execute_code_streaming(
+            "cpp", code, "main.cpp",
+            Some(&ws.0.to_string_lossy()),
+            None,
+            events,
+            process.clone(),
+            stdin.clone(),
+            crate::monitor::new_known_writes(),
         );
-        assert!(r.stdout.contains("안녕하세요, 민트"), "stdout: {:?}", r.stdout);
+
+        // Wait for the PROMPT, with the program still parked in getline.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if collector.stdout.lock().unwrap().contains("이름을 입력하세요:") {
+                break;
+            }
+            if Instant::now() > deadline {
+                let out = collector.stdout.lock().unwrap().clone();
+                let err = collector.stderr.lock().unwrap().clone();
+                let sys_log = collector.system.lock().unwrap().clone();
+                panic!(
+                    "an unterminated prompt never streamed.\nstdout: {:?}\nstderr: {:?}\nsystem: {:?}",
+                    out, err, sys_log
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            collector.done.lock().unwrap().is_none(),
+            "the program should still be waiting for input at this point"
+        );
+
+        write_stdin(&stdin, "민트\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while collector.done.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let out = collector.stdout.lock().unwrap().clone();
+        assert!(out.contains("안녕하세요, 민트"), "stdout: {:?}", out);
     }
 
     #[test]
     fn the_binary_is_not_written_into_the_workspace() {
+        let _guard = exclusive();
         if !have_cxx() {
             eprintln!("SKIP the_binary_is_not_written_into_the_workspace: no C++ compiler");
             return;
@@ -2590,6 +3035,7 @@ mod e2e_tests {
 
     #[test]
     fn c_language_runs_through_the_same_pipeline() {
+        let _guard = exclusive();
         crate::toolchain::clear_compiler_cache();
         if crate::toolchain::find_compiler(None, false).is_none() {
             eprintln!("SKIP c_language_runs_through_the_same_pipeline: no C compiler");
@@ -2608,6 +3054,7 @@ mod e2e_tests {
 
     #[test]
     fn python_input_now_works_too() {
+        let _guard = exclusive();
         // The same pipe fixed Python: `input()` used to hit EOF instantly,
         // because a GUI process has no console to inherit stdin from.
         let ws = Ws::new("py-stdin");

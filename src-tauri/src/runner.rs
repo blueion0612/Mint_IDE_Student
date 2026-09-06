@@ -43,6 +43,132 @@ pub fn new_running_process() -> RunningProcess {
     Arc::new(Mutex::new(None))
 }
 
+/// Run generations that were stopped while no child was in the slot.
+///
+/// There is a real gap between "the compiler exited" and "the program is
+/// published": `build_native` takes the compiler child out, then the program is
+/// spawned. A Stop landing in that window finds nothing to kill and would
+/// otherwise be lost, letting the program start after the student stopped it.
+/// Recording the id closes the gap. The set is tiny and drained as soon as it
+/// is read.
+static CANCELLED_RUNS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Record that the CURRENT run was asked to stop.
+///
+/// Called by `stop_code` in addition to killing whatever is in the slot. The
+/// frontend serialises runs (the Run button becomes Stop), so the generation
+/// most recently handed out by `RUN_GEN` is the one being stopped — including
+/// when the slot is momentarily empty between the compiler exiting and the
+/// program being published.
+pub fn note_stop_request() {
+    let gen = RUN_GEN.load(Ordering::SeqCst);
+    if let Ok(mut c) = CANCELLED_RUNS.lock() {
+        if !c.contains(&gen) {
+            c.push(gen);
+        }
+        // Bounded: an entry is normally consumed by the run it belongs to, but
+        // a run that exited before reading its own flag would otherwise leak.
+        while c.len() > 32 {
+            c.remove(0);
+        }
+    }
+}
+
+/// Consume the cancellation flag for `gen`, if one was set.
+fn take_cancelled(gen: u64) -> bool {
+    match CANCELLED_RUNS.lock() {
+        Ok(mut c) => {
+            let had = c.contains(&gen);
+            c.retain(|g| *g != gen);
+            had
+        }
+        Err(_) => false,
+    }
+}
+
+/// The write end of the running child's stdin, keyed by the same run
+/// generation as the child itself.
+///
+/// Before this existed the child inherited the IDE's stdin. A GUI process has
+/// no console, so that handle was invalid and every read hit EOF immediately:
+/// `std::cin >> n` left `n` untouched and `input()` raised EOFError. Exam
+/// problems overwhelmingly read their input from stdin, so C++ (and Python)
+/// answers produced confidently wrong output with no visible error.
+pub type RunningStdin = Arc<Mutex<Option<(u64, std::process::ChildStdin)>>>;
+
+pub fn new_running_stdin() -> RunningStdin {
+    Arc::new(Mutex::new(None))
+}
+
+/// Feed a chunk to the running program's stdin.
+///
+/// Returns `Ok(true)` when the bytes were handed to the pipe, `Ok(false)` when
+/// nothing is running or the program has already closed its end (a finished or
+/// non-reading program is not an error the student should see as a failure).
+pub fn write_stdin(handle: &RunningStdin, text: &str) -> Result<bool, String> {
+    use std::io::Write;
+    let mut guard = handle.lock().map_err(|_| "stdin state poisoned".to_string())?;
+    let stdin = match guard.as_mut() {
+        Some((_, s)) => s,
+        None => return Ok(false),
+    };
+    match stdin.write_all(text.as_bytes()).and_then(|_| stdin.flush()) {
+        Ok(()) => Ok(true),
+        // The child exited (or closed stdin) between the UI click and the
+        // write. Drop our end so later writes short-circuit instead of
+        // repeating the same OS error.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            *guard = None;
+            Ok(false)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Close stdin, signalling EOF to the program.
+///
+/// Essential for C++: `while (std::cin >> x)` and `while (getline(...))`
+/// terminate ONLY on EOF, so without this a student could never end an
+/// input loop and every such program would look like it hung.
+pub fn close_stdin(handle: &RunningStdin) -> bool {
+    match handle.lock() {
+        Ok(mut guard) => guard.take().is_some(),
+        Err(_) => false,
+    }
+}
+
+/// Wait for the program to finish, THEN release our end of its stdin.
+///
+/// The ordering is the whole point, so it lives in one function rather than as
+/// two adjacent statements someone could reorder. Closing stdin before the wait
+/// hands the program an immediate EOF: `std::cin >> n` reads nothing, `input()`
+/// raises, and an exam answer prints a confident wrong result with no error
+/// anywhere. `wait()` is what blocks for the life of the program, and that is
+/// exactly the window in which the output panel's input box must be able to
+/// feed it.
+fn wait_then_release_stdin(
+    child: Option<Child>,
+    stdin_handle: &RunningStdin,
+    gen: u64,
+) -> Option<i32> {
+    let code = child.and_then(|mut c| c.wait().ok().and_then(|s| s.code()));
+    clear_stdin_generation(stdin_handle, gen);
+    code
+}
+
+/// Drop the stdin handle if it still belongs to `gen`.
+///
+/// Generation-checked for the same reason the child reaper is: a run that has
+/// already been replaced must not close the CURRENT run's stdin.
+fn clear_stdin_generation(handle: &RunningStdin, gen: u64) {
+    if let Ok(mut guard) = handle.lock() {
+        let owned = matches!(guard.as_ref(), Some((id, _)) if *id == gen);
+        if owned {
+            *guard = None;
+        }
+    }
+}
+
 pub fn snapshot_workspace_files(root: &std::path::Path) -> std::collections::HashSet<String> {
     snapshot_workspace_paths(root).into_keys().collect()
 }
@@ -126,6 +252,7 @@ pub fn execute_code_streaming(
     python_path: Option<&str>,
     app_handle: AppHandle,
     process_handle: RunningProcess,
+    stdin_handle: RunningStdin,
     known_writes: crate::monitor::KnownWrites,
 ) {
     let work_dir = workspace_dir
@@ -159,12 +286,25 @@ pub fn execute_code_streaming(
         }
 
         // Build command
+        // Claim the run generation up front, BEFORE any compile.
+        //
+        // It used to be claimed after the build, which left compiled languages
+        // with an uncancellable window: Stop during a 100 ms-to-2 minute
+        // compile found an empty process slot, did nothing, and the program
+        // started anyway once the compiler finished — the student pressed Stop
+        // and watched their program run. The compiler child is now published
+        // under this id like any other, so Stop kills it.
+        let my_id = RUN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Every builder yields (program, args, extra_PATH_dir). Only the
+        // compiled languages need the third: a MinGW binary looks for its
+        // runtime DLLs beside the compiler that produced it.
         let result = match lang.as_str() {
-            "python" => build_python_cmd(&dir, &fname, py_path.as_deref()),
-            "javascript" | "typescript" => build_node_cmd(&dir, &fname),
-            "c" => build_and_run_c(&dir, &fname, &app_handle),
-            "cpp" => build_and_run_cpp(&dir, &fname, &app_handle),
-            "java" => build_and_run_java(&dir, &fname, &app_handle),
+            "python" => build_python_cmd(&dir, &fname, py_path.as_deref()).map(|(c, a)| (c, a, None)),
+            "javascript" | "typescript" => build_node_cmd(&dir, &fname).map(|(c, a)| (c, a, None)),
+            "c" => build_and_run_c(&dir, &fname, &app_handle, &process_handle, my_id),
+            "cpp" => build_and_run_cpp(&dir, &fname, &app_handle, &process_handle, my_id),
+            "java" => build_and_run_java(&dir, &fname, &app_handle).map(|(c, a)| (c, a, None)),
             _ => {
                 emit_line(&app_handle, "stderr", &format!("Unsupported language: {}\n", lang));
                 emit_done_with_output(&app_handle, None, 0, "", "");
@@ -172,7 +312,7 @@ pub fn execute_code_streaming(
             }
         };
 
-        let (cmd, args) = match result {
+        let (cmd, args, extra_path_dir) = match result {
             Some(v) => v,
             None => return, // compile error already emitted
         };
@@ -186,8 +326,19 @@ pub fn execute_code_streaming(
             .env("PYTHONUTF8", "1")
             .env("TF_CPP_MIN_LOG_LEVEL", "3")      // suppress TensorFlow warnings
             .env("TF_ENABLE_ONEDNN_OPTS", "0")     // suppress oneDNN messages
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // stdin is PIPED, not inherited. A GUI process has no console, so the
+        // inherited handle was invalid: `std::cin >> n` and Python's `input()`
+        // both saw instant EOF and the program carried on with uninitialised
+        // values — silently wrong answers on any exam problem that reads input.
+        // With a pipe the child blocks exactly as it would in a terminal, and
+        // the output panel's input box feeds it.
+        if let Some(ref bd) = extra_path_dir {
+            crate::toolchain::prepend_path(&mut command, bd);
+        }
 
         // matplotlib backend selection:
         // - Windows: force TkAgg. Our dedicated Python ships with Include_tcltk=1
@@ -233,12 +384,37 @@ pub fn execute_code_streaming(
         // proceeded — UI showed stopped while Python kept running.)
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let child_stdin = child.stdin.take();
 
-        // Claim a run generation and publish the child under it.
-        let my_id = RUN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        // Publish the child under the generation claimed before the build.
+        //
+        // If a Stop arrived while we were compiling, the slot no longer holds
+        // our id (or holds a newer run's) — in that case the program must NOT
+        // start. Kill what we just spawned and leave quietly; the frontend
+        // already reset itself when the student pressed Stop.
         {
             let mut guard = process_handle.lock().unwrap();
+            let cancelled = match guard.as_ref() {
+                Some((id, _)) => *id != my_id,
+                // An empty slot is the NORMAL state here: build_native takes
+                // the compiler child back out on success. Only an explicit
+                // stop request means this run was cancelled.
+                None => take_cancelled(my_id),
+            };
+            if cancelled {
+                drop(guard);
+                stop_taken_child(child);
+                return;
+            }
             *guard = Some((my_id, child));
+        }
+        // Publish stdin under the SAME generation. Generation-keying matters
+        // for the same reason it does for the child itself: a stale input line
+        // typed against a finished run must not be delivered into a newer run's
+        // stdin.
+        {
+            let mut guard = stdin_handle.lock().unwrap();
+            *guard = child_stdin.map(|s| (my_id, s));
         }
 
         let ah1 = app_handle.clone();
@@ -389,7 +565,10 @@ pub fn execute_code_streaming(
             }
         };
         let owned = my_child.is_some();
-        let exit_code = my_child.and_then(|mut c| c.wait().ok().and_then(|s| s.code()));
+        // Blocks for the life of the program, keeping stdin open across it, then
+        // releases the handle. A student who presses Stop is released instead by
+        // `stop_code`, which closes stdin explicitly before killing the child.
+        let exit_code = wait_then_release_stdin(my_child, &stdin_handle, my_id);
 
         // The direct child has exited. Drain the reader threads, but BOUNDED:
         // in the normal case the pipe hit EOF the instant the child exited, so
@@ -904,54 +1083,409 @@ fn build_node_cmd(dir: &Path, filename: &str) -> Option<(String, Vec<String>)> {
     Some(("node".to_string(), vec![file.to_string_lossy().to_string()]))
 }
 
-fn compile_cmd(compiler: &str, src: &Path, out: &Path, extra_args: &[&str], app: &AppHandle) -> Option<()> {
-    let mut args: Vec<String> = vec![src.to_string_lossy().to_string(), "-o".to_string(), out.to_string_lossy().to_string()];
-    args.extend(extra_args.iter().map(|s| s.to_string()));
+/// A compiler invocation that is about to run, plus everything the RUN step
+/// needs afterwards.
+struct NativeBuild {
+    exe: std::path::PathBuf,
+    /// Directory holding the compiler, put on the child's PATH so a
+    /// dynamically-linked MinGW binary can find libstdc++/libgcc/libwinpthread.
+    bin_dir: Option<std::path::PathBuf>,
+}
 
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let mut command = Command::new(compiler);
-    command.args(&arg_refs);
-    // Hide the compiler's console window on Windows (gcc/g++ flashed a black
-    // window on every C/C++ Run).
+/// Outcome of waiting for a compile.
+enum CompileWait {
+    Done(std::process::ExitStatus),
+    /// Ran past `COMPILE_TIMEOUT` and was killed.
+    TimedOut,
+    /// The student pressed Stop (or a newer run took the slot).
+    Cancelled,
+}
+
+/// Wait for a compile that lives in the SHARED process slot.
+///
+/// The compiler child is published under the run generation exactly like the
+/// program is, which is what makes Stop work during a compile: `stop_code`
+/// takes it out of the slot and kills it, and the next poll here sees the slot
+/// no longer holds this generation.
+///
+/// `std::process::Child` has no timed wait, so this polls; 20 ms is short
+/// enough that a normal sub-second compile is not measurably delayed.
+fn wait_compile_in_slot(
+    process_handle: &RunningProcess,
+    my_id: u64,
+    limit: Duration,
+) -> CompileWait {
+    let start = Instant::now();
+    loop {
+        {
+            let mut guard = match process_handle.lock() {
+                Ok(g) => g,
+                Err(_) => return CompileWait::Cancelled,
+            };
+            match guard.as_mut() {
+                Some((id, child)) if *id == my_id => match child.try_wait() {
+                    Ok(Some(status)) => return CompileWait::Done(status),
+                    Ok(None) => {
+                        if start.elapsed() >= limit {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return CompileWait::TimedOut;
+                        }
+                    }
+                    Err(_) => return CompileWait::Cancelled,
+                },
+                // Someone took our child: Stop, or a newer run.
+                _ => return CompileWait::Cancelled,
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Compiler diagnostics beyond this are truncated. One bad `std::` type error
+/// can emit megabytes of template backtrace; the panel only needs the head.
+const MAX_DIAGNOSTIC_BYTES: usize = 256 * 1024;
+
+/// The result of one compiler invocation.
+enum CompileAttempt {
+    /// Compiled and linked. Carries any warnings the compiler printed.
+    Success { warnings: String },
+    /// The compiler rejected the program.
+    Failed { diagnostics: String, code: Option<i32> },
+    /// Ran past `COMPILE_TIMEOUT` and was killed.
+    TimedOut,
+    /// The student pressed Stop.
+    Cancelled,
+    /// The compiler binary itself could not be started.
+    SpawnError(String),
+}
+
+/// Run one planned compile, publishing the compiler under `my_id` so a Stop
+/// pressed mid-compile reaches it.
+fn run_compile_attempt(
+    spec: &crate::toolchain::CompileSpec,
+    process_handle: &RunningProcess,
+    my_id: u64,
+) -> CompileAttempt {
+    let mut command = Command::new(&spec.compiler);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::toolchain::compile_env(&mut command);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let output = command.output();
 
-    match output {
-        Ok(o) => {
-            if !o.status.success() {
-                emit_line(app, "stderr", "[Compilation Error]\n");
-                emit_line(app, "stderr", &String::from_utf8_lossy(&o.stderr));
-                emit_done_with_output(app, o.status.code(), 0, "", "");
-                return None;
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return CompileAttempt::SpawnError(e.to_string()),
+    };
+
+    // Drain the pipes on threads. A compiler that fills the 64 KB stderr pipe
+    // buffer while we sit polling would deadlock: it blocks on write, we block
+    // waiting for it to exit. Template-heavy C++ produces that much output
+    // routinely.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let t_out = thread::spawn(move || read_capped(&mut out_pipe, MAX_DIAGNOSTIC_BYTES));
+    let t_err = thread::spawn(move || read_capped(&mut err_pipe, MAX_DIAGNOSTIC_BYTES));
+
+    // Publish the compiler under this run's generation so Stop can kill it.
+    {
+        let mut guard = match process_handle.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                let _ = child.kill();
+                return CompileAttempt::Cancelled;
             }
-            Some(())
+        };
+        *guard = Some((my_id, child));
+    }
+
+    let wait = wait_compile_in_slot(process_handle, my_id, COMPILE_TIMEOUT);
+
+    // Take the compiler back out of the slot so the program can take its place.
+    // If Stop already took it, this is a no-op.
+    if let Ok(mut guard) = process_handle.lock() {
+        let ours = matches!(guard.as_ref(), Some((id, _)) if *id == my_id);
+        if ours {
+            *guard = None;
         }
-        Err(e) => {
-            emit_line(app, "stderr", &format!("Failed to run '{}': {}. Is it installed?\n", compiler, e));
-            emit_done_with_output(app, None, 0, "", "");
-            None
-        }
+    }
+
+    let compile_out = join_bounded(t_out, Duration::from_secs(5)).unwrap_or_default();
+    let compile_err = join_bounded(t_err, Duration::from_secs(5)).unwrap_or_default();
+    let combined = format!("{}{}", compile_err, compile_out);
+
+    match wait {
+        CompileWait::Done(status) if status.success() => CompileAttempt::Success { warnings: combined },
+        CompileWait::Done(status) => CompileAttempt::Failed {
+            diagnostics: combined,
+            code: status.code(),
+        },
+        CompileWait::TimedOut => CompileAttempt::TimedOut,
+        CompileWait::Cancelled => CompileAttempt::Cancelled,
     }
 }
 
-fn build_and_run_c(dir: &Path, filename: &str, app: &AppHandle) -> Option<(String, Vec<String>)> {
-    let src = dir.join(filename);
-    let out_name = if cfg!(windows) { "a.exe" } else { "a.out" };
-    let out = dir.join(out_name);
-    compile_cmd("gcc", &src, &out, &["-lm"], app)?;
-    Some((out.to_string_lossy().to_string(), vec![]))
+/// Compile the active file together with its sibling translation units and
+/// return the executable to run.
+///
+/// Everything here exists because of a specific failure of the previous
+/// one-liner (`g++ file.cpp -o a.exe`):
+///
+/// * `a.exe` was written INTO the workspace, so it entered the submission zip
+///   and had to be special-cased in the integrity monitor. Output now lives in
+///   a per-workspace build directory outside the workspace entirely.
+/// * A second source file was never compiled, so any multi-file assignment
+///   failed to link with what looks like the student's own error.
+/// * The compiler was invoked as bare `g++`, so on Windows — where nothing puts
+///   a compiler on PATH — every C++ Run failed. Discovery now finds the pinned
+///   portable toolchain by path.
+/// * The compile ran with the workspace as an argument path. A Korean Windows
+///   username makes that path non-ASCII and MinGW's driver is not reliably
+///   unicode-clean; the compile now runs WITH THE SOURCE DIRECTORY AS CWD and
+///   passes plain relative filenames, so the unicode part of the path is
+///   resolved by the OS rather than parsed by the compiler.
+fn build_native(
+    dir: &Path,
+    filename: &str,
+    cpp: bool,
+    app: &AppHandle,
+    process_handle: &RunningProcess,
+    my_id: u64,
+) -> Option<NativeBuild> {
+    let cfg = crate::setup::load_config();
+    let (explicit, standard) = if cpp {
+        (
+            cfg.cpp_compiler_path.clone(),
+            crate::toolchain::normalize_standard(cfg.cpp_standard.as_deref().unwrap_or("")),
+        )
+    } else {
+        (
+            cfg.c_compiler_path.clone(),
+            crate::toolchain::normalize_c_standard(cfg.c_standard.as_deref().unwrap_or("")),
+        )
+    };
+
+    let compiler = match crate::toolchain::find_compiler(explicit.as_deref(), cpp) {
+        Some(c) => c,
+        None => {
+            let lang = if cpp { "C++" } else { "C" };
+            emit_line(app, "stderr", &format!(
+                "[{} 컴파일러를 찾을 수 없습니다]\n\
+                 설치 스크립트(install-windows.ps1 / install-mac.sh / install-linux.sh)를 \
+                 다시 실행하면 컴파일러가 설치됩니다.\n\
+                 이미 설치되어 있다면 하단 상태바의 'C++' 항목에서 경로를 직접 지정하세요.\n",
+                lang
+            ));
+            emit_done_with_output(app, None, 0, "", "");
+            return None;
+        }
+    };
+
+    // A header is not a program. Compiling one succeeds (GCC quietly builds a
+    // precompiled header) and produces no executable, so without this guard the
+    // student got "compiled but no executable was produced" — technically true
+    // and completely unhelpful.
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(ext.as_str(), "h" | "hpp" | "hh" | "hxx" | "inc") {
+        emit_line(app, "stderr", &format!(
+            "[{} 은 헤더 파일이라 단독 실행할 수 없습니다]\n\
+             main 함수가 있는 .cpp 파일을 열고 Run 하세요. 같은 폴더의 파일은 자동으로 함께 컴파일됩니다.\n",
+            filename
+        ));
+        emit_done_with_output(app, None, 0, "", "");
+        return None;
+    }
+
+    let src_abs = dir.join(filename);
+    let build_dir = crate::toolchain::build_dir_for_workspace(dir);
+    if let Err(e) = std::fs::create_dir_all(&build_dir) {
+        emit_line(app, "stderr", &format!("빌드 폴더를 만들지 못했습니다 ({}): {}\n", build_dir.display(), e));
+        emit_done_with_output(app, None, 0, "", "");
+        return None;
+    }
+
+    // Remove the previous binary so a failed link can never leave the OLD
+    // program runnable — a student who fixes a syntax error, re-runs, and sees
+    // the previous build's output would be debugging a ghost. If the file is
+    // locked (a previous run still exiting, or an antivirus scanning it), fall
+    // back to a fresh name rather than failing the whole Run.
+    let mut exe = build_dir.join(crate::toolchain::exe_name_for(&src_abs));
+    if exe.exists() && std::fs::remove_file(&exe).is_err() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let alt = format!(
+            "{}_{}{}",
+            exe.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "program".into()),
+            stamp,
+            if cfg!(windows) { ".exe" } else { "" }
+        );
+        exe = build_dir.join(alt);
+    }
+
+    let spec = crate::toolchain::plan_compile(dir, filename, cpp, &compiler, &standard, &exe);
+
+    if spec.units.len() > 1 {
+        let extra: Vec<&str> = spec.units.iter().skip(1).map(|s| s.as_str()).collect();
+        emit_line(app, "system", &format!(
+            "$ Compiling {} (+{} linked: {})\n",
+            spec.units.first().map(|s| s.as_str()).unwrap_or(filename),
+            extra.len(),
+            extra.join(", ")
+        ));
+    } else {
+        emit_line(app, "system", &format!("$ Compiling {}\n", spec.units.first().map(|s| s.as_str()).unwrap_or(filename)));
+    }
+
+    let compile_start = Instant::now();
+    let mut attempt = run_compile_attempt(&spec, process_handle, my_id);
+
+    // Auto-linking every sibling is right for the assignment layout it exists
+    // for (main.cpp + utils.cpp + utils.h), but a scratch file that happens to
+    // define the same helper turns into "multiple definition of ...". That is a
+    // link error the student did not cause and cannot act on mid-exam, so fall
+    // back to the file they actually asked to run and say so.
+    if spec.units.len() > 1 {
+        if let CompileAttempt::Failed { ref diagnostics, .. } = attempt {
+            if diagnostics.contains("multiple definition of") {
+                emit_line(app, "system",
+                    "\n같은 폴더의 다른 파일과 함수가 중복되어, 현재 파일만 단독 컴파일합니다.\n");
+                let solo = crate::toolchain::plan_compile_units(
+                    dir, filename, cpp, &compiler, &standard, &exe, 1,
+                );
+                attempt = run_compile_attempt(&solo, process_handle, my_id);
+            }
+        }
+    }
+
+    match attempt {
+        CompileAttempt::SpawnError(e) => {
+            emit_line(app, "stderr", &format!("컴파일러를 실행하지 못했습니다 ({}): {}\n", compiler, e));
+            emit_done_with_output(app, None, 0, "", "");
+            return None;
+        }
+        CompileAttempt::TimedOut => {
+            emit_line(app, "stderr", &format!(
+                "[컴파일 시간 초과 — {}초]\n무한 템플릿 재귀나 지나치게 큰 소스가 아닌지 확인하세요.\n",
+                COMPILE_TIMEOUT.as_secs()
+            ));
+            emit_done_with_output(app, None, compile_start.elapsed().as_millis() as u64, "", "");
+            return None;
+        }
+        // Stop already took our compiler child and the frontend already reset
+        // itself. Emitting run-done here would fire a second completion for a
+        // run that never started — the misattributed-run-done class of bug the
+        // generation checks exist to prevent.
+        CompileAttempt::Cancelled => {
+            take_cancelled(my_id);
+            return None;
+        }
+        CompileAttempt::Failed { diagnostics, code } => {
+            emit_line(app, "stderr", "[Compilation Error]\n");
+            if !diagnostics.is_empty() {
+                emit_line(app, "stderr", &diagnostics);
+            }
+            // Two link failures are common enough to deserve a plain-language hint.
+            if diagnostics.contains("undefined reference to `main'")
+                || diagnostics.contains("undefined reference to 'main'")
+                || diagnostics.contains("WinMain")
+                || diagnostics.contains("_main")
+            {
+                emit_line(app, "system", "\n힌트: main 함수가 있는 파일을 선택한 뒤 Run 하세요.\n");
+            } else if diagnostics.contains("Permission denied")
+                || diagnostics.contains("cannot open output file")
+            {
+                emit_line(app, "system", "\n힌트: 이전 실행이 아직 종료되지 않았습니다. Stop 후 다시 Run 하세요.\n");
+            }
+            emit_done_with_output(app, code, compile_start.elapsed().as_millis() as u64, "", "");
+            return None;
+        }
+        CompileAttempt::Success { warnings } => {
+            // Warnings on a SUCCESSFUL compile still matter to a student, so
+            // show them — but clearly labelled so they are not mistaken for the
+            // program's own output.
+            if !warnings.trim().is_empty() {
+                emit_line(app, "stderr", &format!("[Compiler Warnings]\n{}\n", warnings.trim_end()));
+            }
+        }
+    }
+
+    // A Stop that landed between the compiler exiting and this line must still
+    // stop the program from starting.
+    if take_cancelled(my_id) {
+        return None;
+    }
+
+    if !exe.exists() {
+        emit_line(app, "stderr", "컴파일은 성공했다고 보고됐지만 실행 파일이 생성되지 않았습니다.\n");
+        emit_done_with_output(app, None, compile_start.elapsed().as_millis() as u64, "", "");
+        return None;
+    }
+
+    emit_line(app, "system", &format!("$ Compiled in {} ms\n", compile_start.elapsed().as_millis()));
+
+    Some(NativeBuild {
+        exe,
+        bin_dir: crate::toolchain::compiler_bin_dir(&compiler),
+    })
 }
 
-fn build_and_run_cpp(dir: &Path, filename: &str, app: &AppHandle) -> Option<(String, Vec<String>)> {
-    let src = dir.join(filename);
-    let out_name = if cfg!(windows) { "a.exe" } else { "a.out" };
-    let out = dir.join(out_name);
-    compile_cmd("g++", &src, &out, &["-std=c++17"], app)?;
-    Some((out.to_string_lossy().to_string(), vec![]))
+/// Read a pipe to EOF with a hard byte cap, decoding lossily.
+fn read_capped<R: std::io::Read>(pipe: &mut Option<R>, cap: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    if let Some(p) = pipe.as_mut() {
+        let mut chunk = [0u8; 16384];
+        loop {
+            match p.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() < cap {
+                        let room = cap - buf.len();
+                        buf.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    // Keep draining past the cap so the writer never blocks.
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+fn build_and_run_c(
+    dir: &Path,
+    filename: &str,
+    app: &AppHandle,
+    process_handle: &RunningProcess,
+    my_id: u64,
+) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
+    let b = build_native(dir, filename, false, app, process_handle, my_id)?;
+    Some((b.exe.to_string_lossy().to_string(), vec![], b.bin_dir))
+}
+
+fn build_and_run_cpp(
+    dir: &Path,
+    filename: &str,
+    app: &AppHandle,
+    process_handle: &RunningProcess,
+    my_id: u64,
+) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
+    let b = build_native(dir, filename, true, app, process_handle, my_id)?;
+    Some((b.exe.to_string_lossy().to_string(), vec![], b.bin_dir))
 }
 
 fn build_and_run_java(dir: &Path, filename: &str, app: &AppHandle) -> Option<(String, Vec<String>)> {
@@ -985,4 +1519,229 @@ fn build_and_run_java(dir: &Path, filename: &str, app: &AppHandle) -> Option<(St
     let basename = filename.rsplit('/').next().unwrap_or(filename);
     let class_name = basename.trim_end_matches(".java");
     Some(("java".to_string(), vec!["-cp".to_string(), dir_str, class_name.to_string()]))
+}
+
+/// Tests for the standard-input plumbing.
+///
+/// These exist because the first version of this feature closed stdin before
+/// `child.wait()` rather than after it. That is a one-line ordering mistake
+/// that compiles, type-checks, passes every static check — and hands the
+/// program an immediate EOF, so `std::cin >> n` reads nothing and an exam
+/// answer prints a confident wrong result. Only running a real child process
+/// catches it.
+#[cfg(test)]
+mod stdin_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Build a tiny program that echoes what it reads, and hand back its path.
+    /// Returns None when the machine has no C++ compiler (CI on a bare runner).
+    fn build_echo_program(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        crate::toolchain::clear_compiler_cache();
+        let compiler = crate::toolchain::find_compiler(None, true)?;
+        std::fs::create_dir_all(dir).ok()?;
+        let src = dir.join("echo.cpp");
+        std::fs::write(
+            &src,
+            "#include <iostream>\n#include <string>\n\
+             int main(){ std::string line; long long n=0;\n\
+             while (std::getline(std::cin, line)) { ++n; std::cout << \"got:\" << line << std::endl; }\n\
+             std::cout << \"eof:\" << n << std::endl; return 0; }\n",
+        )
+        .ok()?;
+        let exe = dir.join(if cfg!(windows) { "echo.exe" } else { "echo" });
+        let spec = crate::toolchain::plan_compile(
+            dir,
+            "echo.cpp",
+            true,
+            &compiler,
+            crate::toolchain::DEFAULT_CPP_STANDARD,
+            &exe,
+        );
+        let (ok, diag) = spec.run();
+        assert!(ok, "test fixture failed to compile: {}", diag);
+        Some(exe)
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "mint-stdin-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn stdin_survives_until_the_program_exits() {
+        let dir = scratch("survives");
+        let exe = match build_echo_program(&dir) {
+            Some(e) => e,
+            None => {
+                eprintln!("SKIP stdin_survives_until_the_program_exits: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn echo program");
+
+        let mut out = child.stdout.take().unwrap();
+        let handle: RunningStdin = new_running_stdin();
+        *handle.lock().unwrap() = Some((1, child.stdin.take().unwrap()));
+
+        // Deliver two lines with a pause between them. If stdin were closed at
+        // start-up the program would already be at EOF and the second write
+        // would report "not delivered".
+        assert!(write_stdin(&handle, "alpha\n").unwrap(), "first line must be delivered");
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            write_stdin(&handle, "beta\n").unwrap(),
+            "stdin must still be open while the program runs"
+        );
+
+        // EOF is what ends a `while (getline(...))` loop.
+        assert!(close_stdin(&handle), "close_stdin should report it closed something");
+
+        let status = child.wait().expect("wait");
+        let mut text = String::new();
+        out.read_to_string(&mut text).unwrap();
+
+        assert!(text.contains("got:alpha"), "output was: {}", text);
+        assert!(text.contains("got:beta"), "output was: {}", text);
+        assert!(text.contains("eof:2"), "program must see EXACTLY two lines: {}", text);
+        assert!(status.success());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_multi_line_paste_arrives_in_order() {
+        let dir = scratch("paste");
+        let exe = match build_echo_program(&dir) {
+            Some(e) => e,
+            None => {
+                eprintln!("SKIP a_multi_line_paste_arrives_in_order: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let mut out = child.stdout.take().unwrap();
+        let handle: RunningStdin = new_running_stdin();
+        *handle.lock().unwrap() = Some((7, child.stdin.take().unwrap()));
+
+        // The UI sends a pasted block as ONE call precisely so ordering cannot
+        // be interleaved by the student typing while it is being consumed.
+        assert!(write_stdin(&handle, "1\n2\n3\n").unwrap());
+        close_stdin(&handle);
+        child.wait().unwrap();
+
+        let mut text = String::new();
+        out.read_to_string(&mut text).unwrap();
+        let got: Vec<&str> = text.lines().filter(|l| l.starts_with("got:")).collect();
+        assert_eq!(got, vec!["got:1", "got:2", "got:3"], "full output: {}", text);
+    }
+
+    #[test]
+    fn writing_after_the_program_exits_reports_undelivered_not_an_error() {
+        let dir = scratch("gone");
+        let exe = match build_echo_program(&dir) {
+            Some(e) => e,
+            None => {
+                eprintln!("SKIP writing_after_the_program_exits_reports_undelivered_not_an_error: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let handle: RunningStdin = new_running_stdin();
+        *handle.lock().unwrap() = Some((9, child.stdin.take().unwrap()));
+
+        close_stdin(&handle);
+        child.wait().unwrap();
+
+        // Typing into a program that has finished is an ordinary thing to do by
+        // accident; it must read as "not delivered", never as a failure the
+        // student has to interpret.
+        assert_eq!(write_stdin(&handle, "late\n").unwrap(), false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_run_means_nothing_is_delivered() {
+        let handle: RunningStdin = new_running_stdin();
+        assert_eq!(write_stdin(&handle, "x\n").unwrap(), false);
+        assert!(!close_stdin(&handle));
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_close_the_current_runs_stdin() {
+        let handle: RunningStdin = new_running_stdin();
+        let dir = scratch("gen");
+        let exe = match build_echo_program(&dir) {
+            Some(e) => e,
+            None => {
+                eprintln!("SKIP a_stale_generation_cannot_close_the_current_runs_stdin: no C++ compiler");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        let mut child = Command::new(&exe)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        *handle.lock().unwrap() = Some((42, child.stdin.take().unwrap()));
+
+        // A straggler thread from run 41 must not close run 42's stdin.
+        clear_stdin_generation(&handle, 41);
+        assert!(
+            write_stdin(&handle, "still open\n").unwrap(),
+            "a stale generation must not have closed the current stdin"
+        );
+
+        clear_stdin_generation(&handle, 42);
+        assert_eq!(write_stdin(&handle, "now closed\n").unwrap(), false);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_request_is_recorded_and_consumed_once() {
+        let gen = RUN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        note_stop_request();
+        assert!(take_cancelled(gen), "the stop must be visible to the run it targets");
+        assert!(!take_cancelled(gen), "a cancellation must only fire once");
+    }
 }

@@ -34,8 +34,23 @@ Korean, because that is who sits the exams it was built for.
 Syntax highlighting for Python, JavaScript, TypeScript, Java, C and
 C++, and Jupyter notebooks open as cells, each keeping its own output. A file tree
 with drag and drop, folders, renaming and import. Code runs from the editor with
-its output in a panel beside it, and Python can be pointed at the system
-interpreter or a chosen virtual environment.
+its output in a panel beside it.
+
+### Running
+
+Python can be pointed at the system interpreter or a chosen virtual environment,
+and C and C++ at any installed compiler; both are shown in the status bar and
+changed from there. The Windows installer brings its own pinned GCC, so a C++
+answer compiles on a machine that has never had a compiler.
+
+Running a C or C++ file compiles it together with the other source files beside
+it, so `main.cpp` + `utils.cpp` + `utils.h` builds with no project
+configuration, while a second file with its own `main` stays a separate program.
+Binaries are written outside the workspace and never reach the submission.
+
+Programs that read input get a console: an input line under the output panel
+feeds the running program, a pasted block arrives in order, and an EOF button
+ends a `while (std::cin >> x)` loop the way Ctrl+D does in a terminal.
 
 ### Recording
 
@@ -76,8 +91,9 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 irm https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/install-windows.ps1 | iex
 ```
 
-It installs a portable Python 3.12.13 build, Node, a JDK, FFmpeg, WebView2 and the
-IDE in one pass. Nothing collides with an existing Python: the portable build is
+It installs a portable Python 3.12.13 build, a portable GCC 15.3.0 (MinGW-w64,
+verified by SHA-256 and by compiling a probe), Node, a JDK, FFmpeg, WebView2 and
+the IDE in one pass. Nothing collides with an existing Python: the portable build is
 unpacked to `C:\ProgramData\MINT_Python\Python312` and used only by the IDE. A
 Korean-language Windows account is handled automatically, by enabling long paths and
 falling back to an ASCII path for the virtual environment.
@@ -91,7 +107,8 @@ curl -sL https://raw.githubusercontent.com/blueion0612/Mint_IDE_Student/main/ins
 
 It installs the Xcode command line tools, Homebrew, Python 3.12, Rust, Node, a JDK
 and FFmpeg, clones and builds, then copies the app to `/Applications`. Expect five to
-ten minutes and around 500 MB of downloads.
+ten minutes and around 500 MB of downloads. C and C++ use the command line tools'
+`clang++`, which the script verifies by compiling and running a probe.
 
 ## Usage
 
@@ -120,9 +137,10 @@ docs/figures/         the screenshot, the lifecycle figure and the script that d
 
 ## Requirements
 
-To run an installer, nothing: it brings its own toolchain. To build from source,
-Node.js 18 or newer, Rust 1.77.2 or newer, which is the minimum Tauri 2 supports,
-and FFmpeg, plus whichever language runtimes the exam needs available on the
+To run an installer, nothing: it brings its own toolchain — a portable Python, a
+portable GCC on Windows, Node, a JDK and FFmpeg. To build from source, Node.js 18
+or newer, Rust 1.77.2 or newer, which is the minimum Tauri 2 supports, and
+FFmpeg, plus whichever language runtimes the exam needs available on the
 machine.
 
 ```bash

@@ -50,12 +50,29 @@ $MINT_PY_URL     = "https://github.com/astral-sh/python-build-standalone/release
 $MINT_PY_ROOT    = "C:\ProgramData\MINT_Python\Python312"
 $MINT_PY_EXE     = "$MINT_PY_ROOT\python.exe"
 
+# Portable MinGW-w64 (WinLibs, GCC + UCRT runtime). Same reasoning as the
+# portable Python: pinned to one build so every student compiles with an
+# identical toolchain, unpacked to an ASCII path so a Korean username cannot
+# break it, and no installer/registry involvement so it cannot collide with a
+# compiler the student already has.
+#
+# Windows is the only platform that needs this. macOS gets clang from the Xcode
+# command line tools and Linux gets g++ from the distro, both of which the other
+# install scripts already ensure.
+$MINT_GCC_VERSION = "15.3.0"
+$MINT_GCC_TAG     = "15.3.0posix-14.0.0-ucrt-r1"
+$MINT_GCC_ASSET   = "winlibs-x86_64-posix-seh-gcc-15.3.0-mingw-w64ucrt-14.0.0-r1.7z"
+$MINT_GCC_URL     = "https://github.com/brechtsanders/winlibs_mingw/releases/download/$MINT_GCC_TAG/$MINT_GCC_ASSET"
+$MINT_GCC_SHA256  = "7bd06101e7a472b41506b13f79b2c56e3369da13a72165cbe8fd8a18b6e9d116"
+$MINT_GCC_ROOT    = "C:\ProgramData\MINT_MinGW"
+$MINT_GXX_EXE     = "$MINT_GCC_ROOT\mingw64\bin\g++.exe"
+
 # ─── 0. System policy: enable long paths (manifest alone is not enough) ───
 # Windows 10 1607+ requires BOTH a process manifest with longPathAware=true
 # AND HKLM\SYSTEM\CCS\Control\FileSystem\LongPathsEnabled=1. Otherwise
 # Korean usernames + nested workspace paths over 260 chars break workspace.rs
 # operations with ERROR_FILENAME_EXCED_RANGE. We already have admin here.
-Write-Host "[0/5] Enabling Windows long path support..." -ForegroundColor Yellow
+Write-Host "[0/6] Enabling Windows long path support..." -ForegroundColor Yellow
 try {
     Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
                      -Name "LongPathsEnabled" -Type DWord -Value 1 -ErrorAction Stop
@@ -67,7 +84,7 @@ try {
 Write-Host ""
 
 # ─── 1. Portable Python (extracted from Astral python-build-standalone) ───
-Write-Host "[1/5] Setting up portable Python $MINT_PY_VERSION..." -ForegroundColor Yellow
+Write-Host "[1/6] Setting up portable Python $MINT_PY_VERSION..." -ForegroundColor Yellow
 
 # Already extracted from a previous run? Skip download — but ONLY if it is the
 # pinned version AND tkinter loads. A prior release shipping e.g. 3.12.10 would
@@ -159,7 +176,101 @@ if (-not $pyReuse) {
 Write-Host ""
 
 # ─── 2. Other system deps via winget (Node, JDK, FFmpeg, WebView2) ───
-Write-Host "[2/5] Checking Node.js / JDK / FFmpeg / WebView2..." -ForegroundColor Yellow
+# ─── 2. Portable C/C++ toolchain (WinLibs MinGW-w64) ───
+# Without this every C++ Run failed with "Failed to run 'g++'": nothing on a
+# stock Windows install provides a compiler, and the IDE has no way to conjure
+# one. macOS and Linux get theirs from the CLT / distro packages.
+Write-Host "[2/6] Setting up portable C/C++ toolchain (GCC $MINT_GCC_VERSION)..." -ForegroundColor Yellow
+
+$gccReuse = $false
+if (Test-Path $MINT_GXX_EXE) {
+    $gccVer = & $MINT_GXX_EXE --version 2>&1 | Select-Object -First 1
+    if ("$gccVer" -match [regex]::Escape($MINT_GCC_VERSION)) {
+        Write-Host "  [OK] Already present: $gccVer" -ForegroundColor Green
+        $gccReuse = $true
+    } else {
+        Write-Host "  [..] Present but not pinned $MINT_GCC_VERSION (found '$gccVer') - re-extracting." -ForegroundColor Yellow
+    }
+}
+
+if (-not $gccReuse) {
+    if (-not (Test-Cmd "tar")) {
+        Write-Host "  [WARN] tar.exe not found (needs Windows 10 1803+). Skipping C/C++ toolchain." -ForegroundColor Yellow
+        Write-Host "         Python/Java will still work; C and C++ Run will not." -ForegroundColor Yellow
+        $script:hadWarnings = $true
+    } else {
+        $gccArchive = "$env:TEMP\mint-mingw-$MINT_GCC_VERSION.7z"
+        Write-Host "  Downloading MinGW-w64 GCC $MINT_GCC_VERSION (~102 MB) ..."
+        Write-Host "  $MINT_GCC_URL" -ForegroundColor DarkGray
+        $gccOk = $true
+        try {
+            Invoke-WebRequest -Uri $MINT_GCC_URL -OutFile $gccArchive -UseBasicParsing
+        } catch {
+            Write-Host "  [WARN] Download failed: $_" -ForegroundColor Yellow
+            $gccOk = $false
+        }
+
+        # Verify the pinned digest. A truncated or substituted archive would
+        # otherwise be extracted and produce a compiler that miscompiles or
+        # simply fails at link time, mid-exam.
+        if ($gccOk) {
+            $actual = (Get-FileHash $gccArchive -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $MINT_GCC_SHA256) {
+                Write-Host "  [WARN] SHA-256 mismatch - refusing to install this toolchain." -ForegroundColor Yellow
+                Write-Host "         expected $MINT_GCC_SHA256" -ForegroundColor DarkGray
+                Write-Host "         actual   $actual" -ForegroundColor DarkGray
+                $gccOk = $false
+            }
+        }
+
+        if ($gccOk) {
+            if (Test-Path $MINT_GCC_ROOT) { Remove-Item $MINT_GCC_ROOT -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Force -Path $MINT_GCC_ROOT | Out-Null
+            Write-Host "  Extracting to $MINT_GCC_ROOT (takes ~10 s) ..."
+            # Windows' bundled tar is bsdtar/libarchive, which reads 7-Zip.
+            & "$env:SystemRoot\System32\tar.exe" -xf $gccArchive -C $MINT_GCC_ROOT
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $MINT_GXX_EXE)) {
+                Write-Host "  [WARN] Extraction did not produce $MINT_GXX_EXE (tar exit $LASTEXITCODE)." -ForegroundColor Yellow
+                $gccOk = $false
+            }
+        }
+
+        Remove-Item $gccArchive -ErrorAction SilentlyContinue
+
+        if ($gccOk) {
+            # Prove it can actually build and run something before declaring
+            # success — an extracted-but-broken toolchain looks identical to a
+            # working one until the first Run of an exam.
+            $probeDir = "$env:TEMP\mint-gcc-probe"
+            if (Test-Path $probeDir) { Remove-Item $probeDir -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+            $probeSrc = "$probeDir\probe.cpp"
+            Set-Content -Path $probeSrc -Encoding utf8 -Value @'
+#include <iostream>
+#include <vector>
+#include <string>
+int main(){ std::vector<std::string> v{"MINT","GCC","OK"}; for(auto&s:v) std::cout<<s<<" "; std::cout<<std::endl; }
+'@
+            & $MINT_GXX_EXE -std=c++17 -O2 -static "$probeSrc" -o "$probeDir\probe.exe" 2>&1 | Out-Null
+            if ((Test-Path "$probeDir\probe.exe") -and ((& "$probeDir\probe.exe" 2>&1) -match "MINT GCC OK")) {
+                Write-Host "  [OK] GCC $MINT_GCC_VERSION installed and verified (compile + link + run)" -ForegroundColor Green
+            } else {
+                Write-Host "  [WARN] Toolchain extracted but the compile probe failed." -ForegroundColor Yellow
+                Write-Host "         C and C++ Run may not work. Python/Java are unaffected." -ForegroundColor Yellow
+                $script:hadWarnings = $true
+            }
+            Remove-Item $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "  [WARN] C/C++ toolchain not installed - C and C++ Run will not work." -ForegroundColor Yellow
+            Write-Host "         Re-run this installer, or point the IDE at an existing" -ForegroundColor Yellow
+            Write-Host "         compiler in Settings > C++ compiler." -ForegroundColor Yellow
+            $script:hadWarnings = $true
+        }
+    }
+}
+Write-Host ""
+
+Write-Host "[3/6] Checking Node.js / JDK / FFmpeg / WebView2..." -ForegroundColor Yellow
 
 # WebView2 Runtime — Tauri IDE renders into this. Without it, IDE first
 # launch shows a blank/black window and the student can't take the exam.
@@ -265,7 +376,7 @@ if (-not (Test-Cmd "winget")) {
 Write-Host ""
 
 # ─── 3. Download IDE installer ───
-Write-Host "[3/5] Downloading MINT Exam IDE..." -ForegroundColor Yellow
+Write-Host "[4/6] Downloading MINT Exam IDE..." -ForegroundColor Yellow
 
 # GitHub API rate limit (60/hr unauthenticated). A shared exam-room IP hits
 # this fast. Catch the 403 and tell the student what to do instead of dying
@@ -306,7 +417,7 @@ if ($exeAsset) {
     }
 
     Write-Host ""
-    Write-Host "[4/5] Running IDE installer (silent)..." -ForegroundColor Yellow
+    Write-Host "[5/6] Running IDE installer (silent)..." -ForegroundColor Yellow
     # /S = NSIS silent install (Tauri's NSIS bundler supports it). Without it the
     # student must click through the Next/Install/Finish wizard — an extra manual
     # step the one-liner install is supposed to avoid — and cancelling would still
@@ -353,6 +464,11 @@ if ($script:hadWarnings) {
     Write-Host "  Installation complete!" -ForegroundColor Cyan
 }
 Write-Host "  Python:    $MINT_PY_EXE" -ForegroundColor Gray
+if (Test-Path $MINT_GXX_EXE) {
+    Write-Host "  C/C++:     $MINT_GXX_EXE" -ForegroundColor Gray
+} else {
+    Write-Host "  C/C++:     (not installed - C/C++ Run unavailable)" -ForegroundColor Yellow
+}
 Write-Host "  Launch the IDE from Start Menu. First run opens the setup wizard." -ForegroundColor Gray
 Write-Host "==============================" -ForegroundColor Cyan
 Write-Host ""

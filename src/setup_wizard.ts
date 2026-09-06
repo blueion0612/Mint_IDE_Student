@@ -10,6 +10,12 @@ export interface SetupConfig {
   include_sample_code: boolean;
   config_version: number;
   custom_venv_path?: string | null;
+  // C/C++ settings. Optional so a config written by an older build still
+  // satisfies the type, matching the serde(default) on the Rust side.
+  cpp_compiler_path?: string | null;
+  cpp_standard?: string | null;
+  c_compiler_path?: string | null;
+  c_standard?: string | null;
 }
 
 const PROFILE_LABELS: Record<string, string> = {
@@ -98,6 +104,7 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
     let sampleCode = opts.initial.include_sample_code;
     let venvMode: "default" | "custom" = opts.initial.custom_venv_path ? "custom" : "default";
     let customVenvPath: string = opts.initial.custom_venv_path ?? "";
+    let cppStandard: string = opts.initial.cpp_standard ?? "c++17";
 
     overlay.innerHTML = `
       <div class="wizard-modal">
@@ -162,9 +169,26 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
             ` : ""}
           </section>
 
+          <section class="wiz-section">
+            <div class="wiz-section-title">4. C / C++ 환경</div>
+            <div class="wiz-section-hint" id="wiz-cpp-status">컴파일러 확인 중...</div>
+            <div class="wiz-cpp-row">
+              <label class="wiz-cpp-std">
+                표준
+                <select id="wiz-cpp-standard">
+                  ${["c++11", "c++14", "c++17", "c++20", "c++23"].map(v => `
+                    <option value="${v}" ${cppStandard === v ? "selected" : ""}>${v.toUpperCase()}</option>
+                  `).join("")}
+                </select>
+              </label>
+              <button class="wiz-mini-btn" id="wiz-cpp-verify" type="button">컴파일 테스트</button>
+            </div>
+            <pre id="wiz-cpp-result" class="wiz-progress-log hidden"></pre>
+          </section>
+
           ${opts.mode === "settings" ? `
             <section class="wiz-section">
-              <div class="wiz-section-title">4. Python 환경 (venv)</div>
+              <div class="wiz-section-title">5. Python 환경 (venv)</div>
               <div class="wiz-section-hint">현재: <code>${escapeHtml(opts.currentVenvPath ?? "")}</code></div>
               <label class="wiz-radio">
                 <input type="radio" name="venv-mode" value="default" ${!opts.initial.custom_venv_path ? "checked" : ""} />
@@ -185,13 +209,13 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
             </section>
 
             <section class="wiz-section">
-              <div class="wiz-section-title">5. 초기 설정</div>
+              <div class="wiz-section-title">6. 초기 설정</div>
               <button class="wiz-mini-btn" id="wiz-rerun-wizard">초기 설정 위자드 다시 열기</button>
             </section>
 
             ${opts.buildInfo ? `
               <section class="wiz-section">
-                <div class="wiz-section-title">6. 빌드 정보</div>
+                <div class="wiz-section-title">7. 빌드 정보</div>
                 <div class="wiz-build-info">
                   <div><span class="wiz-build-label">commit</span> <code>${escapeHtml(opts.buildInfo.commit_sha)}</code></div>
                   <div><span class="wiz-build-label">build</span> <code>${escapeHtml(opts.buildInfo.build_time)}</code></div>
@@ -226,6 +250,53 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
         else customGrid.classList.add("hidden");
       }
     }));
+
+    // ── C/C++ ────────────────────────────────────────────────────────────
+    const cppStatusEl = overlay.querySelector("#wiz-cpp-status") as HTMLElement;
+    const cppResultEl = overlay.querySelector("#wiz-cpp-result") as HTMLElement;
+    const cppStdSelect = overlay.querySelector("#wiz-cpp-standard") as HTMLSelectElement;
+    const cppVerifyBtn = overlay.querySelector("#wiz-cpp-verify") as HTMLButtonElement;
+
+    cppStdSelect?.addEventListener("change", () => { cppStandard = cppStdSelect.value; });
+
+    const refreshCppStatus = async () => {
+      if (!cppStatusEl) return;
+      try {
+        const c = await invoke<{ version: string; path: string } | null>("current_compiler");
+        if (c) {
+          cppStatusEl.textContent = `컴파일러: ${c.version}`;
+          cppStatusEl.title = c.path;
+          cppStatusEl.classList.remove("wiz-hint-warn");
+        } else {
+          cppStatusEl.textContent =
+            "C/C++ 컴파일러를 찾지 못했습니다. 설치 스크립트를 다시 실행하거나, 하단 상태바의 'C++' 항목에서 경로를 지정하세요.";
+          cppStatusEl.classList.add("wiz-hint-warn");
+        }
+      } catch {
+        cppStatusEl.textContent = "컴파일러 상태를 확인하지 못했습니다.";
+      }
+    };
+    void refreshCppStatus();
+
+    cppVerifyBtn?.addEventListener("click", async () => {
+      if (!cppResultEl) return;
+      cppVerifyBtn.disabled = true;
+      cppResultEl.classList.remove("hidden");
+      cppResultEl.textContent = "컴파일 · 링크 · 실행 · 표준입력을 검사하는 중...";
+      try {
+        const r = await invoke<{
+          ok: boolean; compiler: string; version: string; failed_stage: string; message: string; standard: string;
+        }>("verify_cpp_environment", { compilerPath: null, standard: cppStandard });
+        cppResultEl.textContent = r.ok
+          ? `[OK] ${r.version}\n${r.compiler}\n표준: ${r.standard}\n${r.message}`
+          : `[실패: ${r.failed_stage}]\n${r.message}`;
+      } catch (e) {
+        cppResultEl.textContent = `검사를 실행하지 못했습니다: ${e}`;
+      } finally {
+        cppVerifyBtn.disabled = false;
+        void refreshCppStatus();
+      }
+    });
 
     const recCheck = overlay.querySelector("#wiz-recording") as HTMLInputElement;
     recCheck.addEventListener("change", () => { recording = recCheck.checked; });
@@ -336,6 +407,13 @@ function openModal(opts: ModalOptions): Promise<SetupConfig> {
         include_sample_code: sampleCode,
         config_version: 2,
         custom_venv_path: venvMode === "custom" && customVenvPath ? customVenvPath : null,
+        // Carry the C/C++ settings through. The compiler PATH is chosen from
+        // the status bar rather than here, so preserve whatever is stored
+        // instead of overwriting it with a default.
+        cpp_compiler_path: opts.initial.cpp_compiler_path ?? null,
+        cpp_standard: cppStandard,
+        c_compiler_path: opts.initial.c_compiler_path ?? null,
+        c_standard: opts.initial.c_standard ?? null,
       };
 
       const packages = await invoke<string[]>("package_list_for_profile", {

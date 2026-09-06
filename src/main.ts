@@ -154,6 +154,7 @@ async function initializeApp(): Promise<void> {
   buildStatusBar();
   setupLogPanel();
   setupOutputPanel();
+  setupStdinConsole();
   setupSidebarResize();
   listenForBackendEvents();
 
@@ -306,6 +307,16 @@ async function createSampleFiles(): Promise<void> {
   await invoke("ws_write_file", { path: "test_import.py", content: DEFAULT_IMPORT_TEST });
   await invoke("ws_write_file", { path: "test_popup.py", content: DEFAULT_POPUP_TEST });
   await invoke("ws_write_file", { path: "test_notebook.ipynb", content: DEFAULT_NOTEBOOK });
+  // C++ samples mirror the Python ones: something to Run immediately, a program
+  // that READS INPUT (the shape of almost every exam problem), and a two-file
+  // project proving that a header plus a second .cpp links without any build
+  // configuration.
+  await invoke("ws_write_file", { path: "main.cpp", content: DEFAULT_MAIN_CPP });
+  await invoke("ws_write_file", { path: "test_input.cpp", content: DEFAULT_INPUT_CPP });
+  await invoke("ws_create_dir", { path: "cpp_project" });
+  await invoke("ws_write_file", { path: "cpp_project/main.cpp", content: DEFAULT_PROJECT_MAIN_CPP });
+  await invoke("ws_write_file", { path: "cpp_project/stats.h", content: DEFAULT_PROJECT_STATS_H });
+  await invoke("ws_write_file", { path: "cpp_project/stats.cpp", content: DEFAULT_PROJECT_STATS_CPP });
   await refreshFileTree();
 }
 
@@ -1300,6 +1311,7 @@ async function runCurrentFile(): Promise<void> {
   panel.classList.add("expanded");
 
   document.getElementById("output-content")!.textContent = "";
+  showStdinRow();
   // Clear previous error highlights
   pendingErrorLines.length = 0;
   if (editorView) clearErrors(editorView);
@@ -1329,7 +1341,130 @@ function stopCurrentRun(): void {
   invoke<boolean>("stop_code").catch(() => { /* ignore */ });
 }
 
+// ===== stdin console =====
+//
+// The child's stdin is a pipe, so a program that reads input blocks until this
+// row feeds it. Before the pipe existed the inherited handle produced instant
+// EOF and `cin >> n` / `input()` silently returned nothing — an exam answer
+// that read its input printed a confident wrong result.
+
+/// True once EOF has been sent for the current run; further sends are pointless.
+let stdinClosed = false;
+
+function stdinRow(): HTMLElement | null {
+  return document.getElementById("stdin-row");
+}
+
+function showStdinRow(): void {
+  const row = stdinRow();
+  if (!row) return;
+  stdinClosed = false;
+  row.hidden = false;
+  const input = document.getElementById("stdin-input") as HTMLInputElement | null;
+  const send = document.getElementById("stdin-send") as HTMLButtonElement | null;
+  const eof = document.getElementById("stdin-eof") as HTMLButtonElement | null;
+  if (input) {
+    input.disabled = false;
+    input.value = "";
+  }
+  if (send) send.disabled = false;
+  if (eof) eof.disabled = false;
+}
+
+function hideStdinRow(): void {
+  const row = stdinRow();
+  if (!row) return;
+  row.hidden = true;
+  const input = document.getElementById("stdin-input") as HTMLInputElement | null;
+  if (input) input.value = "";
+}
+
+/// Send one chunk. `text` already carries its trailing newline when the student
+/// pressed Enter; a multi-line paste is sent whole so the program sees the lines
+/// in the order they were typed.
+async function sendStdin(text: string): Promise<void> {
+  if (!isRunning || stdinClosed) return;
+  try {
+    const delivered = await invoke<boolean>("send_stdin", { text });
+    if (delivered) {
+      appendOutput(text, "stdin");
+    } else {
+      // The program already stopped reading (finished, or never read at all).
+      appendOutput("[프로그램이 입력을 더 받지 않습니다]\n", "system");
+      stdinClosed = true;
+    }
+  } catch (e) {
+    appendOutput(`[stdin 전송 실패: ${e}]\n`, "error");
+  }
+}
+
+async function sendStdinEof(): Promise<void> {
+  if (!isRunning || stdinClosed) return;
+  stdinClosed = true;
+  const input = document.getElementById("stdin-input") as HTMLInputElement | null;
+  const send = document.getElementById("stdin-send") as HTMLButtonElement | null;
+  const eof = document.getElementById("stdin-eof") as HTMLButtonElement | null;
+  if (input) input.disabled = true;
+  if (send) send.disabled = true;
+  if (eof) eof.disabled = true;
+  try {
+    await invoke<boolean>("close_stdin");
+    appendOutput("[EOF]\n", "system");
+  } catch (e) {
+    appendOutput(`[EOF 전송 실패: ${e}]\n`, "error");
+  }
+}
+
+function setupStdinConsole(): void {
+  const input = document.getElementById("stdin-input") as HTMLInputElement | null;
+  const send = document.getElementById("stdin-send");
+  const eof = document.getElementById("stdin-eof");
+  if (!input) return;
+
+  const submitCurrent = () => {
+    const value = input.value;
+    input.value = "";
+    void sendStdin(value + "\n");
+  };
+
+  input.addEventListener("keydown", (e) => {
+    // Keystrokes here must NOT reach the document-level shortcuts: Ctrl+R
+    // would re-run the program while the student is halfway through typing its
+    // input, and Ctrl+S would save. The ONE exception is the emergency stop,
+    // which has to work from anywhere — that is the entire point of it.
+    const emergencyStop =
+      (e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "C" || e.key === "c");
+    if (!emergencyStop) e.stopPropagation();
+
+    // Ctrl+D is the terminal habit for EOF; support it alongside the button.
+    if ((e.ctrlKey || e.metaKey) && (e.key === "d" || e.key === "D")) {
+      e.preventDefault();
+      void sendStdinEof();
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitCurrent();
+    }
+  });
+
+  // A pasted block of test input is the normal way to drive these programs.
+  // Send it as one chunk rather than making the student press Enter per line.
+  input.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text") ?? "";
+    if (!text.includes("\n")) return; // single line: let it land in the box
+    e.preventDefault();
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const payload = normalized.endsWith("\n") ? normalized : normalized + "\n";
+    void sendStdin(payload);
+  });
+
+  send?.addEventListener("click", submitCurrent);
+  eof?.addEventListener("click", () => void sendStdinEof());
+}
+
 function resetRunButton(): void {
+  hideStdinRow();
   isRunning = false;
   const btn = document.getElementById("btn-run") as HTMLButtonElement;
   btn.innerHTML = "&#9654; Run";
@@ -1345,27 +1480,72 @@ function resetRunButton(): void {
 // Patterns: 'File "x.py", line 5' / 'main.c:5:' / 'Main.java:5:'
 const pendingErrorLines: number[] = [];
 
+/// Cap on highlighted lines. One bad template argument can produce hundreds of
+/// diagnostics; painting them all turns the gutter into noise.
+const MAX_ERROR_LINES = 40;
+
+/// Basename of a path, for comparing a diagnostic's file against the open one.
+function baseName(path: string): string {
+  const parts = path.split(/[/\\]/);
+  return parts[parts.length - 1] || path;
+}
+
+/// Parse compiler / interpreter diagnostics and highlight the offending lines
+/// IN THE FILE THEY BELONG TO.
+///
+/// The file check is what multi-file C++ made necessary. Compiling `main.cpp`
+/// together with `stats.cpp` means a diagnostic can name either, and the old
+/// "first number after a colon" rule painted `stats.cpp:12` onto line 12 of
+/// whatever happened to be open — pointing the student at innocent code.
+///
+/// Compiles run with the source directory as CWD, so GCC and Clang emit
+/// relative names (`stats.cpp:12:5: error: ...`); a Windows drive letter never
+/// appears and cannot be mistaken for a line number.
 function highlightErrorLine(text: string): void {
   if (!editorView) return;
+  const activeBase = activeFilePath ? baseName(activeFilePath) : null;
+  if (!activeBase) return;
 
-  let lineNum: number | null = null;
+  let added = false;
 
-  // Python: File "xxx", line N
-  const pyMatch = text.match(/line (\d+)/);
-  if (pyMatch) lineNum = parseInt(pyMatch[1]);
+  for (const raw of text.split("\n")) {
+    const line = raw.trimEnd();
+    if (!line) continue;
 
-  // C/C++/Java: filename:N: or filename:N:N:
-  if (!lineNum) {
-    const cMatch = text.match(/:\s*(\d+)\s*:/);
-    if (cMatch) lineNum = parseInt(cMatch[1]);
-  }
+    let file: string | null = null;
+    let lineNum: number | null = null;
 
-  if (lineNum && lineNum >= 1 && lineNum <= editorView.state.doc.lines) {
-    if (!pendingErrorLines.includes(lineNum)) {
-      pendingErrorLines.push(lineNum);
-      markErrorLines(editorView, [...pendingErrorLines]);
+    // GCC / Clang / javac:  file:LINE:COL: error|warning|note: message
+    //                       file:LINE: error: message
+    const cc = line.match(
+      /^\s*(\S[^:]*\.(?:c|cc|cpp|cxx|c\+\+|cp|h|hh|hpp|hxx|java|js|ts)):(\d+)(?::(\d+))?:\s*(?:fatal\s+)?(error|warning|note)\b/i,
+    );
+    if (cc) {
+      file = cc[1];
+      lineNum = parseInt(cc[2], 10);
     }
+
+    // Python traceback:  File "path", line N
+    if (!file) {
+      const py = line.match(/File\s+"([^"]+)",\s+line\s+(\d+)/);
+      if (py) {
+        file = py[1];
+        lineNum = parseInt(py[2], 10);
+      }
+    }
+
+    if (file === null || lineNum === null) continue;
+    // Only paint diagnostics that belong to the file on screen.
+    if (baseName(file) !== activeBase) continue;
+    if (!(lineNum >= 1 && lineNum <= editorView.state.doc.lines)) continue;
+    if (pendingErrorLines.includes(lineNum)) continue;
+    if (pendingErrorLines.length >= MAX_ERROR_LINES) break;
+
+    pendingErrorLines.push(lineNum);
+    added = true;
   }
+
+  if (added) markErrorLines(editorView, [...pendingErrorLines]);
 }
 
 // ===== Screen Recording (auto-start) =====
@@ -1717,10 +1897,10 @@ function setupOutputPanel(): void {
 }
 
 const MAX_OUTPUT_NODES = 5000;
-let pendingOutput: { text: string; type: "stdout" | "error" | "system" }[] = [];
+let pendingOutput: { text: string; type: "stdout" | "error" | "system" | "stdin" }[] = [];
 let pendingFlushHandle: number | null = null;
 
-function appendOutput(text: string, type: "stdout" | "error" | "system"): void {
+function appendOutput(text: string, type: "stdout" | "error" | "system" | "stdin"): void {
   pendingOutput.push({ text, type });
   if (pendingFlushHandle !== null) return;
   pendingFlushHandle = requestAnimationFrame(flushPendingOutput);
@@ -1741,6 +1921,10 @@ function flushPendingOutput(): void {
     const span = document.createElement("span");
     if (type === "error") span.className = "output-error";
     if (type === "system") span.className = "output-system";
+    // A piped child has no terminal echo, so what the student typed would be
+    // invisible. Echo it in its own colour instead of leaving them guessing
+    // which numbers they already sent.
+    if (type === "stdin") span.className = "out-stdin";
     span.textContent = text;
     frag.appendChild(span);
   }
@@ -1833,9 +2017,183 @@ function buildStatusBar(): void {
     <div class="status-item" id="status-clipboard">Clipboard: Idle</div>
     <div class="status-item" style="margin-left:auto" id="status-warnings">Warnings: 0</div>
     <div class="status-item status-python" id="status-python" title="Click to change Python interpreter">Python: System</div>
+    <div class="status-item status-compiler" id="status-compiler" title="Click to change the C/C++ compiler">C++: ...</div>
   `;
   document.getElementById("status-python")!.addEventListener("click", showPythonSelector);
+  document.getElementById("status-compiler")!.addEventListener("click", showCompilerSelector);
   loadPythonList();
+  loadCompilerStatus();
+}
+
+// ===== C/C++ compiler =====
+//
+// Python had a visible interpreter and a way to change it; C++ had neither, so
+// "why does Run do nothing" had no answer a student could reach. This mirrors
+// the Python item exactly.
+
+interface CompilerInfo {
+  path: string;
+  version: string;
+  kind: string;
+  is_mint: boolean;
+}
+
+let compilerList: CompilerInfo[] = [];
+let selectedCompilerPath: string | null = null;
+
+/// Short label for the status bar: "g++ 15.3.0" rather than the full banner.
+function compilerLabel(info: CompilerInfo | null): string {
+  if (!info) return "C++: 없음";
+  const m = info.version.match(/(\d+\.\d+(?:\.\d+)?)/);
+  const name = info.kind === "clang" ? "clang++" : "g++";
+  return `C++: ${name}${m ? " " + m[1] : ""}`;
+}
+
+async function loadCompilerStatus(): Promise<void> {
+  const el = document.getElementById("status-compiler");
+  if (!el) return;
+  try {
+    const cfg = await invoke<{ cpp_compiler_path: string | null }>("read_setup_config");
+    selectedCompilerPath = cfg.cpp_compiler_path ?? null;
+  } catch { /* fall through to auto-discovery */ }
+  try {
+    const current = await invoke<CompilerInfo | null>("current_compiler");
+    el.textContent = compilerLabel(current);
+    el.title = current
+      ? `${current.version}\n${current.path}\n(클릭하면 컴파일러를 바꿀 수 있습니다)`
+      : "C/C++ 컴파일러를 찾지 못했습니다. 클릭해서 경로를 지정하거나 설치 스크립트를 다시 실행하세요.";
+    // A missing compiler is not an error until the student runs C++, but it IS
+    // worth flagging before an exam rather than at the first Run.
+    el.classList.toggle("status-warn", !current);
+  } catch {
+    el.textContent = "C++: ?";
+  }
+}
+
+async function persistCompilerChoice(path: string | null): Promise<void> {
+  try {
+    const cfg = await invoke<Record<string, unknown>>("read_setup_config");
+    cfg.cpp_compiler_path = path;
+    // The C driver sits beside the C++ one in every toolchain we discover, so
+    // pointing one at a toolchain points both — a student should not have to
+    // configure C and C++ separately.
+    cfg.c_compiler_path = path ? path.replace(/g\+\+(\.exe)?$/i, "gcc$1").replace(/clang\+\+(\.exe)?$/i, "clang$1") : null;
+    await invoke("write_setup_config", { config: cfg });
+  } catch (e) {
+    appendOutput(`컴파일러 설정을 저장하지 못했습니다: ${e}\n`, "error");
+  }
+}
+
+async function showCompilerSelector(): Promise<void> {
+  document.getElementById("compiler-selector")?.remove();
+
+  const anchor = document.getElementById("status-compiler")!;
+  const rect = anchor.getBoundingClientRect();
+
+  const popup = document.createElement("div");
+  popup.id = "compiler-selector";
+  popup.className = "python-selector-popup";
+  popup.style.left = `${Math.max(8, rect.left - 160)}px`;
+  popup.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+
+  const loading = document.createElement("div");
+  loading.className = "py-option";
+  loading.textContent = "검색 중...";
+  popup.appendChild(loading);
+  document.body.appendChild(popup);
+
+  try {
+    compilerList = await invoke<CompilerInfo[]>("detect_compilers", { cpp: true });
+  } catch {
+    compilerList = [];
+  }
+  popup.innerHTML = "";
+
+  const autoItem = document.createElement("div");
+  autoItem.className = `py-option${selectedCompilerPath === null ? " active" : ""}`;
+  autoItem.textContent = "자동 선택 (권장)";
+  autoItem.addEventListener("click", async () => {
+    selectedCompilerPath = null;
+    popup.remove();
+    await persistCompilerChoice(null);
+    await loadCompilerStatus();
+  });
+  popup.appendChild(autoItem);
+
+  if (compilerList.length === 0) {
+    const none = document.createElement("div");
+    none.className = "py-option";
+    none.textContent = "설치된 컴파일러를 찾지 못했습니다";
+    popup.appendChild(none);
+  }
+
+  for (const c of compilerList) {
+    const item = document.createElement("div");
+    item.className = `py-option${selectedCompilerPath === c.path ? " active" : ""}`;
+    const tag = c.is_mint ? " (MINT 기본)" : "";
+    item.innerHTML =
+      `<span>${escapeHtml(c.version)}${escapeHtml(tag)}</span>` +
+      `<span class="py-path">${escapeHtml(c.path)}</span>`;
+    item.addEventListener("click", async () => {
+      selectedCompilerPath = c.path;
+      popup.remove();
+      await persistCompilerChoice(c.path);
+      await loadCompilerStatus();
+    });
+    popup.appendChild(item);
+  }
+
+  const verifyItem = document.createElement("div");
+  verifyItem.className = "py-option py-browse";
+  verifyItem.textContent = "지금 테스트 (컴파일 + 실행 + 입력)";
+  verifyItem.addEventListener("click", async () => {
+    popup.remove();
+    const panel = document.getElementById("output-panel")!;
+    panel.classList.remove("collapsed");
+    panel.classList.add("expanded");
+    appendOutput("\n$ C++ 환경 검사 중...\n", "system");
+    try {
+      const r = await invoke<{ ok: boolean; compiler: string; version: string; failed_stage: string; message: string }>(
+        "verify_cpp_environment",
+        { compilerPath: selectedCompilerPath, standard: null },
+      );
+      if (r.ok) {
+        appendOutput(`[OK] ${r.version}\n${r.compiler}\n${r.message}\n`, "system");
+      } else {
+        appendOutput(`[FAIL: ${r.failed_stage}] ${r.message}\n`, "error");
+      }
+    } catch (e) {
+      appendOutput(`검사 실패: ${e}\n`, "error");
+    }
+    await loadCompilerStatus();
+  });
+  popup.appendChild(verifyItem);
+
+  const browseItem = document.createElement("div");
+  browseItem.className = "py-option py-browse";
+  browseItem.textContent = "직접 선택...";
+  browseItem.addEventListener("click", async () => {
+    popup.remove();
+    const picked = await open({
+      title: "C++ 컴파일러 실행 파일 선택 (g++ / clang++)",
+      multiple: false,
+      directory: false,
+    });
+    if (!picked) return;
+    const path = typeof picked === "string" ? picked : String(picked);
+    selectedCompilerPath = path;
+    await persistCompilerChoice(path);
+    await loadCompilerStatus();
+  });
+  popup.appendChild(browseItem);
+
+  const close = (e: MouseEvent) => {
+    if (!popup.contains(e.target as Node)) {
+      popup.remove();
+      document.removeEventListener("click", close);
+    }
+  };
+  setTimeout(() => document.addEventListener("click", close), 0);
 }
 
 interface PythonInfo { path: string; version: string; label: string; }
@@ -2054,6 +2412,11 @@ function formatEventType(type: string): string {
     cut: "CUT",
     terminal_stdout: "STDOUT",
     terminal_stderr: "STDERR",
+    // What a student fed their program is part of the record: an answer that
+    // hardcodes the expected input reads very differently from one that parses
+    // it, and the grader can only tell them apart if the input is logged.
+    stdin_input: "STDIN",
+    stdin_eof: "STDIN-EOF",
     tamper_detected: "TAMPER",
     tamper_new_file: "TAMPER-NEW",
     tamper_deleted: "TAMPER-DEL",
@@ -2189,6 +2552,105 @@ except Exception:
     print("Requests: network unavailable or not installed")
 
 print("\\n=== TESTS COMPLETE ===")
+`;
+
+const DEFAULT_MAIN_CPP = `// MINT Exam IDE — C++ 시작 파일
+// Run(Ctrl+R)을 누르면 컴파일 후 바로 실행됩니다.
+#include <iostream>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+int main() {
+    std::cout << "Hello, MINT C++!" << std::endl;
+
+    std::vector<int> scores = {88, 95, 72, 61, 100};
+    std::sort(scores.begin(), scores.end());
+
+    std::cout << "정렬 결과:";
+    for (int s : scores) std::cout << " " << s;
+    std::cout << std::endl;
+
+    return 0;
+}
+`;
+
+const DEFAULT_INPUT_CPP = `// 표준입력(stdin) 테스트
+//
+// Run 하면 아래 Output 패널에 입력창이 나타납니다.
+// 1) "3" 입력 후 Enter
+// 2) "10 20 30" 입력 후 Enter
+// 여러 줄을 한 번에 붙여넣어도 됩니다.
+#include <iostream>
+#include <vector>
+
+int main() {
+    int n;
+    if (!(std::cin >> n)) {
+        std::cout << "입력이 없습니다." << std::endl;
+        return 0;
+    }
+
+    std::vector<long long> v(n);
+    long long sum = 0;
+    for (int i = 0; i < n; ++i) {
+        std::cin >> v[i];
+        sum += v[i];
+    }
+
+    std::cout << "개수: " << n << std::endl;
+    std::cout << "합계: " << sum << std::endl;
+    std::cout << "평균: " << (n ? (double)sum / n : 0.0) << std::endl;
+    return 0;
+}
+`;
+
+const DEFAULT_PROJECT_MAIN_CPP = `// 여러 파일로 나뉜 프로젝트 예제
+//
+// 이 파일을 Run 하면 같은 폴더의 stats.cpp가 자동으로 함께 컴파일됩니다.
+// 별도의 Makefile이나 빌드 설정은 필요 없습니다.
+#include <iostream>
+#include <vector>
+#include "stats.h"
+
+int main() {
+    std::vector<double> data;
+    double x;
+    std::cout << "숫자를 입력하세요 (끝내려면 EOF 버튼):" << std::endl;
+    while (std::cin >> x) data.push_back(x);
+
+    if (data.empty()) {
+        std::cout << "입력된 숫자가 없습니다." << std::endl;
+        return 0;
+    }
+
+    std::cout << "개수:   " << data.size() << std::endl;
+    std::cout << "평균:   " << mean(data) << std::endl;
+    std::cout << "최댓값: " << maxOf(data) << std::endl;
+    return 0;
+}
+`;
+
+const DEFAULT_PROJECT_STATS_H = `#pragma once
+#include <vector>
+
+double mean(const std::vector<double>& v);
+double maxOf(const std::vector<double>& v);
+`;
+
+const DEFAULT_PROJECT_STATS_CPP = `#include "stats.h"
+#include <algorithm>
+#include <numeric>
+
+double mean(const std::vector<double>& v) {
+    if (v.empty()) return 0.0;
+    return std::accumulate(v.begin(), v.end(), 0.0) / (double)v.size();
+}
+
+double maxOf(const std::vector<double>& v) {
+    if (v.empty()) return 0.0;
+    return *std::max_element(v.begin(), v.end());
+}
 `;
 
 const DEFAULT_MATH_HELPER = `def add(a, b):

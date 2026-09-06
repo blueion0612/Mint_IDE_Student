@@ -11,6 +11,25 @@ pub struct SetupConfig {
     pub config_version: u32,
     #[serde(default)]
     pub custom_venv_path: Option<String>,
+
+    // ── C / C++ ──────────────────────────────────────────────────────────
+    // All `serde(default)`: a config written by an older build must still
+    // deserialize. A hard-required field here would send `load_config` down the
+    // `SetupConfig::default()` path and silently discard the student's venv
+    // choice — the same shape of bug BOM-prefixed config files caused in
+    // v5.0.1.
+    /// Explicit C++ compiler chosen in settings. `None` = auto-discover.
+    #[serde(default)]
+    pub cpp_compiler_path: Option<String>,
+    /// e.g. "c++17". `None` = the exam default.
+    #[serde(default)]
+    pub cpp_standard: Option<String>,
+    /// Explicit C compiler chosen in settings. `None` = auto-discover.
+    #[serde(default)]
+    pub c_compiler_path: Option<String>,
+    /// e.g. "c17". `None` = the exam default.
+    #[serde(default)]
+    pub c_standard: Option<String>,
 }
 
 impl Default for SetupConfig {
@@ -23,6 +42,10 @@ impl Default for SetupConfig {
             include_sample_code: true,
             config_version: 2,
             custom_venv_path: None,
+            cpp_compiler_path: None,
+            cpp_standard: None,
+            c_compiler_path: None,
+            c_standard: None,
         }
     }
 }

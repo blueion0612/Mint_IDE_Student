@@ -74,6 +74,32 @@ if ! have_jdk21; then
     echo "  [FAIL] JDK 21을 확인할 수 없습니다. 'brew install openjdk@21' 후 다시 시도하세요."
     exit 1
 fi
+# The C++ toolchain on macOS is the Xcode command line tools' clang++, which
+# step 1 already guaranteed. Verify it end to end rather than assuming: a CLT
+# install that was interrupted, or one left stale by a macOS upgrade, leaves a
+# clang++ that exists but cannot find its SDK — and the student only discovers
+# that at the first Run.
+if command -v clang++ &>/dev/null; then
+    CPP_PROBE="$(mktemp -d)"
+    cat > "$CPP_PROBE/probe.cpp" <<'CPPEOF'
+#include <iostream>
+#include <vector>
+#include <string>
+int main(){ std::vector<std::string> v{"MINT","CPP","OK"}; for(auto&s:v) std::cout<<s<<" "; std::cout<<std::endl; }
+CPPEOF
+    if clang++ -std=c++17 -O2 "$CPP_PROBE/probe.cpp" -o "$CPP_PROBE/probe" 2>/dev/null \
+       && "$CPP_PROBE/probe" 2>/dev/null | grep -q "MINT CPP OK"; then
+        echo "  [OK] C++: $(clang++ --version 2>&1 | head -1)"
+    else
+        echo "  [WARN] clang++ is present but the compile probe failed."
+        echo "         'xcode-select --install' 후 다시 시도하세요. C++ 실행이 안 될 수 있습니다."
+    fi
+    rm -rf "$CPP_PROBE"
+else
+    echo "  [WARN] clang++를 찾을 수 없습니다 — C/C++ 실행이 안 됩니다."
+    echo "         'xcode-select --install'로 명령줄 도구를 설치하세요."
+fi
+
 echo "[3/6] Tools: OK"
 
 # ─── 4. Source clone (idempotent — wipe + reclone for clean retry) ───

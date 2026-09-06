@@ -1547,3 +1547,134 @@ body {
   color: var(--accent);
   border-color: var(--accent);
 }
+
+/* ===== stdin console =====
+   Shown only while a program is running. A piped child gets no terminal echo,
+   so whatever the student types would otherwise vanish; the row echoes it into
+   the output panel as a distinct line. */
+#stdin-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-secondary);
+  flex: 0 0 auto;
+}
+
+#stdin-row[hidden] {
+  display: none !important;
+}
+
+#stdin-label {
+  flex: 0 0 auto;
+  font-family: "Cascadia Code", "Fira Code", monospace;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--success);
+}
+
+#stdin-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-family: "Cascadia Code", "Fira Code", monospace;
+  font-size: 12px;
+  outline: none;
+}
+
+#stdin-input:focus {
+  border-color: var(--accent);
+}
+
+#stdin-input:disabled {
+  opacity: 0.5;
+}
+
+#stdin-row button {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+#stdin-row button:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg-primary);
+}
+
+#stdin-row button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Echoed input inside the output panel. Dimmer than program output so a
+   student can tell at a glance what they typed from what the program printed. */
+.out-stdin {
+  color: var(--success);
+  opacity: 0.85;
+}
+
+/* ===== compiler status + selector =====
+   Mirrors the Python interpreter item, so both languages are configured the
+   same way and neither is a second-class citizen. */
+.status-compiler {
+  cursor: pointer;
+}
+
+.status-compiler:hover {
+  color: var(--accent);
+}
+
+/* A status item whose subject is missing or misconfigured — currently only the
+   compiler, which can legitimately be absent until the installer has run. */
+.status-item.status-warn {
+  color: var(--warning);
+}
+
+/* ===== wizard: C/C++ section ===== */
+.wiz-cpp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.wiz-cpp-std {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.wiz-cpp-std select {
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+/* A hint that is reporting a problem rather than explaining an option. */
+.wiz-section-hint.wiz-hint-warn {
+  color: var(--warning);
+}
+
+/* The existing `.hidden` rules in this file are all element-scoped, so a new
+   element using the same class was not actually hidden. Scope this one too
+   rather than introducing a global rule that could surprise existing markup. */
+.wiz-progress-log.hidden {
+  display: none;
+}

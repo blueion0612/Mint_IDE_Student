@@ -2,6 +2,7 @@ mod monitor;
 mod recorder;
 mod runner;
 mod setup;
+mod toolchain;
 mod workspace;
 
 use monitor::{ActivityEvent, ActivityLog, KnownWrites, new_known_writes, mark_known_write, mark_known_write_hash, content_fingerprint};
@@ -56,6 +57,7 @@ fn run_code(
     ws: State<WorkspaceState>,
     kw: State<KnownWrites>,
     process: State<runner::RunningProcess>,
+    stdin_state: State<runner::RunningStdin>,
     language: String,
     code: String,
     filename: String,
@@ -91,6 +93,7 @@ fn run_code(
         python_path.as_deref(),
         app_handle,
         (*process).clone(),
+        (*stdin_state).clone(),
         (*kw).clone(),
     );
 
@@ -179,6 +182,11 @@ fn run_notebook_blocking(
     // focus monitor's window-exemption.
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
+    // Notebook cells have no input box (the .py/.c/.cpp runner does), so give
+    // them an empty stdin rather than the inherited one. A GUI process has no
+    // console, so the inherited handle is invalid: `input()` in a cell failed
+    // with an OS-level error instead of the plain EOFError a student can read.
+    command.stdin(std::process::Stdio::null());
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     NOTEBOOK_CHILD_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
 
@@ -300,18 +308,112 @@ fn stop_notebook() -> bool {
 }
 
 #[tauri::command]
-fn stop_code(process: State<runner::RunningProcess>) -> bool {
+fn stop_code(process: State<runner::RunningProcess>, stdin_state: State<runner::RunningStdin>) -> bool {
+    // Close stdin first. A program parked in `cin >>` / `input()` is woken by
+    // the EOF and can exit cleanly; without it the kill below is the only way
+    // out and a graceful shutdown path is lost.
+    runner::close_stdin(&stdin_state);
+    // Record the stop against the current run generation BEFORE touching the
+    // slot. A compiled language has a brief window where no child is in the
+    // slot (the compiler has exited, the program is not yet spawned); without
+    // this the Stop would be swallowed and the program would start anyway.
+    runner::note_stop_request();
     // Take the child OUT of the shared handle immediately, under the lock.
     // The slot is now free for a fresh Run — even if it arrives during the
     // background kill that follows. Without this synchronous take, the kill
     // thread races with the next run and may SIGKILL the new child.
     let child = match process.lock().ok().and_then(|mut g| g.take().map(|(_, c)| c)) {
         Some(c) => c,
+        // Nothing to kill, but the stop was still recorded above — a run that is
+        // mid-compile will honour it.
         None => return false,
     };
     // taskkill /F /T can take 100ms+. Do it off the IPC thread.
     std::thread::spawn(move || runner::stop_taken_child(child));
     true
+}
+
+/// Send a chunk to the running program's standard input.
+///
+/// The frontend appends the newline for a normal "Enter"; a paste of several
+/// lines arrives as one call so ordering is preserved even if the student
+/// pastes faster than the program consumes.
+#[tauri::command]
+fn send_stdin(
+    app_handle: tauri::AppHandle,
+    state: State<AppState>,
+    stdin_state: State<runner::RunningStdin>,
+    text: String,
+) -> Result<bool, String> {
+    let delivered = runner::write_stdin(&stdin_state, &text)?;
+    if delivered {
+        // Input a student typed is part of the exam record: an answer that
+        // hardcodes the expected input reads very differently from one that
+        // parses it, and the grader can only see that if the input is logged.
+        let preview: String = text.chars().take(200).collect();
+        let event = ActivityEvent::new(
+            "stdin_input",
+            &format!("stdin: {}", preview.trim_end()),
+            Some(text.len() as u32),
+            None,
+        );
+        state.activity_log.lock().unwrap().add_event(event.clone());
+        let _ = app_handle.emit("activity-event", &event);
+    }
+    Ok(delivered)
+}
+
+/// Close standard input, signalling EOF.
+///
+/// `while (std::cin >> x)` and `while (getline(std::cin, line))` end only at
+/// EOF, so this is what lets a student finish an input-loop program at all.
+#[tauri::command]
+fn close_stdin(
+    app_handle: tauri::AppHandle,
+    state: State<AppState>,
+    stdin_state: State<runner::RunningStdin>,
+) -> bool {
+    let closed = runner::close_stdin(&stdin_state);
+    if closed {
+        let event = ActivityEvent::new("stdin_eof", "stdin closed (EOF)", None, None);
+        state.activity_log.lock().unwrap().add_event(event.clone());
+        let _ = app_handle.emit("activity-event", &event);
+    }
+    closed
+}
+
+/// Every C++ compiler on this machine, for the settings selector.
+#[tauri::command(async)]
+fn detect_compilers(cpp: Option<bool>) -> Vec<toolchain::CompilerInfo> {
+    toolchain::detect_compilers(cpp.unwrap_or(true))
+}
+
+/// Compile, link and run a probe that also reads stdin. Mirrors
+/// `verify_exam_environment` for Python: the point is to fail in the wizard,
+/// where it can be fixed, rather than on the first Run of an exam.
+#[tauri::command(async)]
+fn verify_cpp_environment(compiler_path: Option<String>, standard: Option<String>) -> toolchain::CppVerifyResult {
+    // A settings change may have installed or switched toolchains; discovery is
+    // cached for the process lifetime, so drop it before verifying.
+    toolchain::clear_compiler_cache();
+    toolchain::verify_cpp(
+        compiler_path.as_deref(),
+        standard.as_deref().unwrap_or(toolchain::DEFAULT_CPP_STANDARD),
+    )
+}
+
+/// The compiler a Run would actually use right now, for the status bar.
+#[tauri::command(async)]
+fn current_compiler() -> Option<toolchain::CompilerInfo> {
+    let cfg = setup::load_config();
+    let path = toolchain::find_compiler(cfg.cpp_compiler_path.as_deref(), true)?;
+    let version = toolchain::probe_version(&path).unwrap_or_default();
+    Some(toolchain::CompilerInfo {
+        kind: if version.to_ascii_lowercase().contains("clang") { "clang".into() } else { "gcc".into() },
+        is_mint: false,
+        path,
+        version,
+    })
 }
 
 // ===== Screen Recording =====
@@ -1237,6 +1339,14 @@ fn init_workspace(
     sb: State<monitor::SharedBaseline>,
     session_name: String,
 ) -> Result<String, String> {
+    // Sweep stale build directories once per session, off the startup path: a
+    // semester of exams would otherwise leave one build tree per workspace,
+    // each holding statically-linked binaries, in a directory no student ever
+    // sees. Threaded so a slow disk cannot delay the window appearing.
+    std::thread::spawn(|| {
+        toolchain::prune_old_build_dirs(toolchain::BUILD_DIR_MAX_AGE);
+    });
+
     let base = setup::workspaces_dir();
 
     let workspace = Workspace::init(&base, &session_name)?;
@@ -2055,6 +2165,7 @@ pub fn run() {
         .manage(new_known_writes())
         .manage(monitor::new_shared_baseline())
         .manage(runner::new_running_process())
+        .manage(runner::new_running_stdin())
         .invoke_handler(tauri::generate_handler![
             get_activity_log,
             clear_activity_log,
@@ -2064,6 +2175,11 @@ pub fn run() {
             run_code_sync,
             stop_code,
             stop_notebook,
+            send_stdin,
+            close_stdin,
+            detect_compilers,
+            verify_cpp_environment,
+            current_compiler,
             allow_exit,
             start_recording,
             stop_recording,
@@ -2136,6 +2252,9 @@ pub fn run() {
                         if let Ok(mut r) = rec.lock() {
                             let _ = r.stop();
                         }
+                    }
+                    if let Some(sin) = app_handle.try_state::<runner::RunningStdin>() {
+                        runner::close_stdin(&sin);
                     }
                     if let Some(proc) = app_handle.try_state::<runner::RunningProcess>() {
                         if let Some(child) =

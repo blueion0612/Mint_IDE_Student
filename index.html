@@ -36,6 +36,19 @@
               </div>
             </div>
             <pre id="output-content"></pre>
+            <div id="stdin-row" hidden>
+              <span id="stdin-label">stdin</span>
+              <input
+                id="stdin-input"
+                type="text"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                placeholder="입력값을 입력하고 Enter — 입력을 끝내려면 EOF"
+              />
+              <button id="stdin-send" title="Send (Enter)">Send</button>
+              <button id="stdin-eof" title="Send EOF (Ctrl+D)">EOF</button>
+            </div>
           </div>
         </div>
       </div>

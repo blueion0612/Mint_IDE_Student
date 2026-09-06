@@ -2353,6 +2353,83 @@ mod real_compiler_tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "9 5 1");
     }
 
+    /// Pull a `const NAME = ` + backtick-string out of the frontend source.
+    ///
+    /// The samples live in `src/main.ts` because they sit beside the Python
+    /// ones; this reaches across to them rather than duplicating the text,
+    /// which would drift.
+    fn sample_from_main_ts(name: &str) -> Option<String> {
+        let main_ts = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("src").join("main.ts");
+        let src = std::fs::read_to_string(main_ts).ok()?;
+        let needle = format!("const {} = `", name);
+        let start = src.find(&needle)? + needle.len();
+        let rest = &src[start..];
+        let end = rest.find("`;")?;
+        Some(rest[..end].to_string())
+    }
+
+    #[test]
+    fn the_cpp_sample_files_compile_and_run() {
+        let c = match cxx() {
+            Some(c) => c,
+            None => {
+                eprintln!("SKIP the_cpp_sample_files_compile_and_run: no C++ compiler");
+                return;
+            }
+        };
+        // These are the first C++ a student ever sees. A sample that does not
+        // compile is worse than no sample: it looks like the IDE is broken.
+        let main_cpp = match sample_from_main_ts("DEFAULT_MAIN_CPP") {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP the_cpp_sample_files_compile_and_run: could not read src/main.ts");
+                return;
+            }
+        };
+        let input_cpp = sample_from_main_ts("DEFAULT_INPUT_CPP").expect("DEFAULT_INPUT_CPP");
+        let proj_main = sample_from_main_ts("DEFAULT_PROJECT_MAIN_CPP").expect("DEFAULT_PROJECT_MAIN_CPP");
+        let proj_h = sample_from_main_ts("DEFAULT_PROJECT_STATS_H").expect("DEFAULT_PROJECT_STATS_H");
+        let proj_cpp = sample_from_main_ts("DEFAULT_PROJECT_STATS_CPP").expect("DEFAULT_PROJECT_STATS_CPP");
+
+        let ws = Ws::new("samples");
+        ws.write("main.cpp", &main_cpp);
+        ws.write("test_input.cpp", &input_cpp);
+        ws.write("cpp_project/main.cpp", &proj_main);
+        ws.write("cpp_project/stats.h", &proj_h);
+        ws.write("cpp_project/stats.cpp", &proj_cpp);
+
+        // main.cpp: runs with no input.
+        let (out, err, code) = compile_and_run(&ws, "main.cpp", &c, "");
+        assert_eq!(code, Some(0), "sample main.cpp exited {:?}: {}", code, err);
+        assert!(out.contains("Hello, MINT C++!"), "sample main.cpp said: {:?}", out);
+
+        // test_input.cpp: the one that teaches the input box.
+        let (out2, err2, code2) = compile_and_run(&ws, "test_input.cpp", &c, "3\n10 20 30\n");
+        assert_eq!(code2, Some(0), "sample test_input.cpp exited {:?}: {}", code2, err2);
+        assert!(out2.contains("60"), "sample test_input.cpp said: {:?}", out2);
+
+        // cpp_project: the multi-file sample must link with no configuration.
+        let exe = ws.path().join(if cfg!(windows) { "proj.exe" } else { "proj" });
+        let spec = plan_compile(ws.path(), "cpp_project/main.cpp", true, &c, DEFAULT_CPP_STANDARD, &exe);
+        assert_eq!(spec.units.len(), 2, "stats.cpp should be linked automatically: {:?}", spec.units);
+        let (ok, diag) = spec.run();
+        assert!(ok, "sample cpp_project failed to build: {}", diag);
+
+        let mut cmd = Command::new(&exe);
+        cmd.current_dir(ws.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = quiet(&mut cmd).spawn().unwrap();
+        {
+            let mut sin = child.stdin.take().unwrap();
+            sin.write_all("1\n2\n3\n".as_bytes()).unwrap();
+        }
+        let done = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&done.stdout);
+        assert!(text.contains("평균"), "sample cpp_project said: {:?}", text);
+    }
+
     #[test]
     fn compile_error_is_reported_not_run() {
         let c = match cxx() {

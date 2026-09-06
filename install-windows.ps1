@@ -200,7 +200,7 @@ if (-not $gccReuse) {
         $script:hadWarnings = $true
     } else {
         $gccArchive = "$env:TEMP\mint-mingw-$MINT_GCC_VERSION.7z"
-        Write-Host "  Downloading MinGW-w64 GCC $MINT_GCC_VERSION (~102 MB) ..."
+        Write-Host "  Downloading MinGW-w64 GCC $MINT_GCC_VERSION (~102 MB download, ~900 MB installed) ..."
         Write-Host "  $MINT_GCC_URL" -ForegroundColor DarkGray
         $gccOk = $true
         try {

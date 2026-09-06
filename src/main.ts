@@ -555,7 +555,9 @@ async function toggleDir(path: string): Promise<void> {
 function iconForExt(name: string): string {
   const ext = name.split(".").pop()?.toLowerCase() || "";
   const map: Record<string, string> = {
-    py: "Py", js: "JS", ts: "TS", java: "Jv", c: "C", cpp: "C+", h: "H",
+    py: "Py", js: "JS", ts: "TS", java: "Jv", c: "C",
+    cpp: "C+", cc: "C+", cxx: "C+", "c++": "C+", cp: "C+",
+    h: "H", hh: "H", hxx: "H",
     hpp: "H+", json: "{}", txt: "Tx", md: "Md", ipynb: "Nb",
     png: "Ig", jpg: "Ig", jpeg: "Ig", gif: "Ig", svg: "Ig", webp: "Ig", bmp: "Ig",
     csv: "Cs", xml: "Xm", html: "Ht", css: "Ss",
@@ -1166,7 +1168,11 @@ async function importExternalFile(destDir: string): Promise<void> {
       if (destDir) expandedDirs.add(destDir);
       // Auto-open imported text files
       const ext = result.dest_path.split(".").pop()?.toLowerCase() || "";
-      const textExts = ["py", "js", "ts", "java", "c", "cpp", "h", "hpp", "txt", "json", "md", "csv", "xml", "html", "css"];
+      const textExts = [
+        "py", "js", "ts", "java",
+        "c", "cpp", "cc", "cxx", "c++", "cp", "h", "hpp", "hh", "hxx",
+        "txt", "json", "md", "csv", "xml", "html", "css",
+      ];
       if (textExts.includes(ext)) {
         await openFileByPath(result.dest_path);
       }
@@ -2712,7 +2718,8 @@ function langFromExtension(name: string): SupportedLanguage | null {
   const ext = name.split(".").pop()?.toLowerCase();
   const map: Record<string, SupportedLanguage> = {
     py: "python", js: "javascript", ts: "typescript", java: "java",
-    c: "c", cpp: "cpp", cc: "cpp", cxx: "cpp", h: "c", hpp: "cpp",
+    c: "c", cpp: "cpp", cc: "cpp", cxx: "cpp", "c++": "cpp", cp: "cpp",
+    h: "c", hpp: "cpp", hh: "cpp", hxx: "cpp",
     ipynb: "python",
   };
   return ext ? map[ext] ?? null : null;

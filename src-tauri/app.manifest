@@ -1,4 +1,22 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  KEEP THIS FILE PURE ASCII, COMMENTS INCLUDED.
+
+  It is embedded as a Win32 resource by the resource compiler, which reads the
+  generated .rc using the build machine's ANSI codepage. On a Korean (cp949)
+  Windows, a non-ASCII character here is written into the resource as cp949
+  bytes; Windows' side-by-side loader then reads the manifest as UTF-8, fails on
+  the invalid sequence, and refuses to start the process with
+
+      "The application has failed to start because its side-by-side
+       configuration is incorrect"                       (error 14001)
+
+  A UTF-8 build machine loses the same characters harmlessly (they become "?"),
+  which is why CI builds ran fine while every locally built binary on the Korean
+  dev machine would not launch - dev, release and NSIS-installed alike. That was
+  misdiagnosed for months as "this machine cannot run local builds"; it was two
+  Korean characters and an em-dash in these comments.
+-->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
       type="win32"
@@ -9,7 +27,7 @@
       <!-- Lets std::fs / std::path accept paths longer than 260 chars.
            Required on Windows because Korean usernames + nested workspace
            folder names routinely exceed MAX_PATH (e.g.
-           C:\Users\유현\Documents\MINT_Exam\Workspaces\<student>_<ts>\...). -->
+           C:\Users\<Korean name>\Documents\MINT_Exam\Workspaces\<student>_<ts>\...). -->
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
       <!-- Forces the process ANSI codepage to UTF-8 (Win10 1903+).
            Without this, Python subprocesses spawned via Command::new on a
@@ -33,7 +51,7 @@
     </application>
   </compatibility>
   <!-- tauri-build's official guidance: when using tauri-plugin-dialog (we
-       do — file open/save) the manifest must declare Common-Controls v6,
+       do - file open/save) the manifest must declare Common-Controls v6,
        otherwise native MessageBox / controls render with the classic Win95
        look instead of themed XP/Vista+ controls. -->
   <dependency>

@@ -1394,11 +1394,16 @@ function hideStdinRow(): void {
 /// in the order they were typed.
 async function sendStdin(text: string): Promise<void> {
   if (!isRunning || stdinClosed) return;
+  // Echo FIRST, before the round trip to the backend.
+  //
+  // A terminal echoes what you type as you type it. Echoing on the reply
+  // instead put the student's input AFTER the program's response to it: type
+  // "10 20 30", see the answer, then see your own input printed underneath.
+  // The delivery result still decides whether anything more is said.
+  appendOutput(text, "stdin");
   try {
     const delivered = await invoke<boolean>("send_stdin", { text });
-    if (delivered) {
-      appendOutput(text, "stdin");
-    } else if (!stdinWarned) {
+    if (!delivered && !stdinWarned) {
       // Not delivered means the program finished, closed its end, or has
       // stopped consuming what it was already sent. Say so ONCE — and leave the
       // box usable, because a program that is merely behind on reading may
